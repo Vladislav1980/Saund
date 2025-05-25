@@ -134,7 +134,7 @@ def trade():
             qty = get_qty(sym, price, order_usdt)
             cost = qty * price
 
-            # ПОКУПКА
+            # BUY
             if not already_in_position and last["ema9"] > last["ema21"] and bid_strength > 1.0 and last["vol"] > df["vol"].rolling(20).mean().iloc[-1] * 1.2 and last["rsi"] > 50:
                 if qty < min_qty:
                     log(f"[{sym}] ❌ qty={qty:.4f} < minQty {min_qty} — отмена")
@@ -151,7 +151,7 @@ def trade():
                 state["count"] += 1
                 log(f"✅ BUY {sym} по {price:.4f}, qty={qty}", True)
 
-            # ПРОДАЖА
+            # SELL
             new_positions = []
             for pos in state["positions"]:
                 sell_price = price
