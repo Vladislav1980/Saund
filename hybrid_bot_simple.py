@@ -27,10 +27,23 @@ SYMBOLS = [
     "AVAXUSDT", "DOGEUSDT", "EOSUSDT", "POLUSDT"
 ]
 
-DECIMALS = {
-    "BTCUSDT": 5, "ETHUSDT": 4, "SOLUSDT": 3, "COMPUSDT": 3, "NEARUSDT": 2, "TONUSDT": 2,
-    "TRXUSDT": 0, "XRPUSDT": 1, "ADAUSDT": 1, "BCHUSDT": 3, "LTCUSDT": 3, "ZILUSDT": 0,
-    "AVAXUSDT": 2, "DOGEUSDT": 0, "EOSUSDT": 1, "POLUSDT": 0
+LIMITS = {
+    "BTCUSDT": {"min_qty": 0.00001, "qty_step": 0.00001, "min_amt": 5},
+    "ETHUSDT": {"min_qty": 0.0001, "qty_step": 0.0001, "min_amt": 5},
+    "SOLUSDT": {"min_qty": 0.001, "qty_step": 0.001, "min_amt": 5},
+    "COMPUSDT": {"min_qty": 0.01, "qty_step": 0.01, "min_amt": 5},
+    "NEARUSDT": {"min_qty": 0.1, "qty_step": 0.1, "min_amt": 5},
+    "TONUSDT": {"min_qty": 0.1, "qty_step": 0.1, "min_amt": 5},
+    "TRXUSDT": {"min_qty": 1, "qty_step": 1, "min_amt": 5},
+    "XRPUSDT": {"min_qty": 1, "qty_step": 1, "min_amt": 5},
+    "ADAUSDT": {"min_qty": 1, "qty_step": 1, "min_amt": 5},
+    "BCHUSDT": {"min_qty": 0.001, "qty_step": 0.001, "min_amt": 5},
+    "LTCUSDT": {"min_qty": 0.001, "qty_step": 0.001, "min_amt": 5},
+    "ZILUSDT": {"min_qty": 1, "qty_step": 1, "min_amt": 5},
+    "AVAXUSDT": {"min_qty": 0.01, "qty_step": 0.01, "min_amt": 5},
+    "DOGEUSDT": {"min_qty": 1, "qty_step": 1, "min_amt": 5},
+    "EOSUSDT": {"min_qty": 1, "qty_step": 1, "min_amt": 5},
+    "POLUSDT": {"min_qty": 1, "qty_step": 1, "min_amt": 5},
 }
 
 STATE = {s: {"positions": [], "pnl": 0, "count": 0} for s in SYMBOLS}
@@ -38,7 +51,6 @@ LAST_REPORT_DATE = None
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s",
                     handlers=[logging.FileHandler("bot.log", encoding="utf-8"), logging.StreamHandler()])
-
 def send_tg(msg):
     try:
         requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage", data={"chat_id": CHAT_ID, "text": msg})
@@ -78,23 +90,11 @@ def get_orderbook(sym):
     except:
         return 0, 0
 
-def get_instrument_limits(sym):
+def get_qty(sym, price, usdt_amount):
     try:
-        info = session.get_instruments_info(category="spot", symbol=sym)
-        filters = info["result"]["list"][0]
-        lot_filter = filters.get("lotSizeFilter", {})
-        qty_step = float(lot_filter.get("qtyStep", 0.000001))
-        min_qty = float(lot_filter.get("minQty", 0.0))
-        min_order_amt = float(filters.get("minOrderAmt", 5.0))
-        return min_qty, qty_step, min_order_amt
-    except Exception as e:
-        log(f"[{sym}] ❌ Ошибка получения лимитов: {e}")
-        return 0, 0.000001, 5.0
-
-def get_qty(sym, price, usdt_amount, min_qty, qty_step):
-    try:
+        limits = LIMITS[sym]
         raw_qty = usdt_amount / price
-        decimals = abs(int(f"{qty_step:e}".split("e")[-1]))
+        decimals = abs(int(f"{limits['qty_step']:e}".split("e")[-1]))
         qty = round(raw_qty, decimals)
         return qty
     except:
@@ -138,17 +138,21 @@ def trade():
 
             sig, atr = signal(df, sym)
             price = df["c"].iloc[-1]
-
-            min_qty, qty_step, min_order_amt = get_instrument_limits(sym)
+            limits = LIMITS[sym]
 
             balance_per_coin = usdt / len(SYMBOLS)
-            max_possible_orders = max(1, int(balance_per_coin / min_order_amt))
+            max_possible_orders = max(1, int(balance_per_coin / limits["min_amt"]))
             num_orders = min(random.randint(5, 15), max_possible_orders)
-            order_usdt = balance_per_coin / num_orders
-            qty = get_qty(sym, price, order_usdt, min_qty, qty_step)
+            order_usdt = max(limits["min_amt"], balance_per_coin / num_orders)
+            qty = get_qty(sym, price, order_usdt)
 
-            if order_usdt < min_order_amt or qty < min_qty:
-                log(f"[{sym}] Ордер слишком мал (qty={qty}, usdt={order_usdt:.2f}) | minQty={min_qty}, minAmt={min_order_amt}")
+            if qty < limits["min_qty"]:
+                log(f"[{sym}] ❌ Кол-во {qty} < minQty {limits['min_qty']}")
+                continue
+
+            actual_usdt = qty * price
+            if actual_usdt < limits["min_amt"]:
+                log(f"[{sym}] ❌ Сумма {actual_usdt:.2f} < minAmt {limits['min_amt']} — отмена")
                 continue
 
             state = STATE[sym]
