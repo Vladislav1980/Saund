@@ -35,6 +35,7 @@ DECIMALS = {
 
 STATE = {s: {"positions": [], "pnl": 0, "count": 0} for s in SYMBOLS}
 LAST_REPORT_DATE = None
+MIN_ORDER_USDT = 5.0
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s",
                     handlers=[logging.FileHandler("bot.log", encoding="utf-8"), logging.StreamHandler()])
@@ -135,16 +136,15 @@ def trade():
 
             sig, atr = signal(df, sym)
             price = df["c"].iloc[-1]
-            MIN_ORDER_USDT = 5.0
-balance_per_coin = usdt / len(SYMBOLS)
-max_possible_orders = max(1, int(balance_per_coin / MIN_ORDER_USDT))
-num_orders = min(random.randint(5, 15), max_possible_orders)
-order_usdt = balance_per_coin / num_orders
-qty = get_qty(sym, price, order_usdt)
+            balance_per_coin = usdt / len(SYMBOLS)
+            max_possible_orders = max(1, int(balance_per_coin / MIN_ORDER_USDT))
+            num_orders = min(random.randint(5, 15), max_possible_orders)
+            order_usdt = balance_per_coin / num_orders
+            qty = get_qty(sym, price, order_usdt)
 
-if order_usdt < MIN_ORDER_USDT or qty == 0:
-    log(f"[{sym}] Ордер слишком мал (qty={qty}, usdt={order_usdt:.2f})")
-    continue
+            if order_usdt < MIN_ORDER_USDT or qty == 0:
+                log(f"[{sym}] Ордер слишком мал (qty={qty}, usdt={order_usdt:.2f})")
+                continue
 
             state = STATE[sym]
 
