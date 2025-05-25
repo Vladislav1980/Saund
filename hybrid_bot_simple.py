@@ -35,7 +35,6 @@ DECIMALS = {
 
 STATE = {s: {"positions": [], "pnl": 0, "count": 0} for s in SYMBOLS}
 LAST_REPORT_DATE = None
-MIN_ORDER_USDT = 5.0
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s",
                     handlers=[logging.FileHandler("bot.log", encoding="utf-8"), logging.StreamHandler()])
@@ -79,17 +78,23 @@ def get_orderbook(sym):
     except:
         return 0, 0
 
-def get_qty(sym, price, usdt_amount):
+def get_instrument_limits(sym):
     try:
         info = session.get_instruments_info(category="spot", symbol=sym)
         filters = info["result"]["list"][0]
-        qty_step = filters.get("lotSizeFilter", {}).get("qtyStep")
-        if qty_step:
-            exponent = int(f"{float(qty_step):e}".split("e")[-1])
-            decimals = abs(exponent)
-            qty = round(usdt_amount / price, decimals)
-        else:
-            qty = round(usdt_amount / price, DECIMALS[sym])
+        qty_step = float(filters["lotSizeFilter"]["qtyStep"])
+        min_qty = float(filters["lotSizeFilter"]["minQty"])
+        min_order_amt = float(filters["minOrderAmt"])
+        return min_qty, qty_step, min_order_amt
+    except Exception as e:
+        log(f"[{sym}] ❌ Ошибка получения лимитов: {e}")
+        return 0, 0.000001, 5.0
+
+def get_qty(sym, price, usdt_amount, min_qty, qty_step):
+    try:
+        raw_qty = usdt_amount / price
+        decimals = abs(int(f"{qty_step:e}".split("e")[-1]))
+        qty = round(raw_qty, decimals)
         return qty
     except:
         return 0
@@ -101,19 +106,15 @@ def log_trade(sym, side, price, qty, pnl):
 def signal(df, sym):
     if df.empty or len(df) < 21:
         return "none", 0
-
     df["ema9"] = EMAIndicator(df["c"], 9).ema_indicator()
     df["ema21"] = EMAIndicator(df["c"], 21).ema_indicator()
     df["rsi"] = RSIIndicator(df["c"], 14).rsi()
     df["atr"] = AverageTrueRange(df["h"], df["l"], df["c"], 14).average_true_range()
-
     last = df.iloc[-1]
     vol_spike = last["vol"] > df["vol"].rolling(20).mean().iloc[-1] * 1.2
     bid, ask = get_orderbook(sym)
     bid_strength = bid / (ask + 1e-9)
-
     log(f"[{sym}] EMA9: {last['ema9']:.4f}, EMA21: {last['ema21']:.4f}, RSI: {last['rsi']:.2f}, ATR: {last['atr']:.4f}")
-
     if last["ema9"] > last["ema21"] and bid_strength > 1.0 and vol_spike and last["rsi"] > 50:
         return "buy", last["atr"]
     if last["ema9"] < last["ema21"] or bid_strength < 0.85:
@@ -136,14 +137,17 @@ def trade():
 
             sig, atr = signal(df, sym)
             price = df["c"].iloc[-1]
+
+            min_qty, qty_step, min_order_amt = get_instrument_limits(sym)
+
             balance_per_coin = usdt / len(SYMBOLS)
-            max_possible_orders = max(1, int(balance_per_coin / MIN_ORDER_USDT))
+            max_possible_orders = max(1, int(balance_per_coin / min_order_amt))
             num_orders = min(random.randint(5, 15), max_possible_orders)
             order_usdt = balance_per_coin / num_orders
-            qty = get_qty(sym, price, order_usdt)
+            qty = get_qty(sym, price, order_usdt, min_qty, qty_step)
 
-            if order_usdt < MIN_ORDER_USDT or qty == 0:
-                log(f"[{sym}] Ордер слишком мал (qty={qty}, usdt={order_usdt:.2f})")
+            if order_usdt < min_order_amt or qty < min_qty:
+                log(f"[{sym}] Ордер слишком мал (qty={qty}, usdt={order_usdt:.2f}) | minQty={min_qty}, minAmt={min_order_amt}")
                 continue
 
             state = STATE[sym]
