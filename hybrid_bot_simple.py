@@ -82,9 +82,10 @@ def get_instrument_limits(sym):
     try:
         info = session.get_instruments_info(category="spot", symbol=sym)
         filters = info["result"]["list"][0]
-        qty_step = float(filters["lotSizeFilter"]["qtyStep"])
-        min_qty = float(filters["lotSizeFilter"]["minQty"])
-        min_order_amt = float(filters["minOrderAmt"])
+        lot_filter = filters.get("lotSizeFilter", {})
+        qty_step = float(lot_filter.get("qtyStep", 0.000001))
+        min_qty = float(lot_filter.get("minQty", 0.0))
+        min_order_amt = float(filters.get("minOrderAmt", 5.0))
         return min_qty, qty_step, min_order_amt
     except Exception as e:
         log(f"[{sym}] ❌ Ошибка получения лимитов: {e}")
