@@ -102,8 +102,15 @@ def trade():
     usdt = get_balance()
     now = datetime.datetime.now()
     min_amt = 25 if usdt > 300 else 5
+    min_required_balance = len(SYMBOLS) * min_amt * 2
+    allow_buying = usdt >= min_required_balance
 
     log(f"🔁 Мониторинг монет... Баланс: {usdt:.2f} USDT, мин. ордер: {min_amt} USDT")
+
+    if not allow_buying:
+        log(f"💤 Баланс {usdt:.2f} < {min_required_balance} — только продажи.")
+    else:
+        log(f"✅ Баланс {usdt:.2f} ≥ {min_required_balance} — полная торговля.")
 
     for sym in SYMBOLS:
         try:
@@ -134,8 +141,8 @@ def trade():
             qty = get_qty(sym, price, order_usdt)
             cost = qty * price
 
-            # BUY
-            if not already_in_position and last["ema9"] > last["ema21"] and bid_strength > 1.0 and last["vol"] > df["vol"].rolling(20).mean().iloc[-1] * 1.2 and last["rsi"] > 50:
+            # ПОКУПКА
+            if allow_buying and not already_in_position and last["ema9"] > last["ema21"] and bid_strength > 1.0 and last["vol"] > df["vol"].rolling(20).mean().iloc[-1] * 1.2 and last["rsi"] > 50:
                 if qty < min_qty:
                     log(f"[{sym}] ❌ qty={qty:.4f} < minQty {min_qty} — отмена")
                     continue
@@ -151,7 +158,7 @@ def trade():
                 state["count"] += 1
                 log(f"✅ BUY {sym} по {price:.4f}, qty={qty}", True)
 
-            # SELL
+            # ПРОДАЖА
             new_positions = []
             for pos in state["positions"]:
                 sell_price = price
