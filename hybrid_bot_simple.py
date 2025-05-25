@@ -84,7 +84,8 @@ def get_qty(sym, price, usdt_amount):
         filters = info["result"]["list"][0]
         qty_step = filters.get("lotSizeFilter", {}).get("qtyStep")
         if qty_step:
-            decimals = abs(int(round(float(f"{float(qty_step):e}".split("e")[-1])))
+            exponent = int(f"{float(qty_step):e}".split("e")[-1])
+            decimals = abs(exponent)
             qty = round(usdt_amount / price, decimals)
         else:
             qty = round(usdt_amount / price, DECIMALS[sym])
@@ -98,7 +99,7 @@ def log_trade(sym, side, price, qty, pnl):
 
 def signal(df, sym):
     if df.empty or len(df) < 21:
-        return "none"
+        return "none", 0
 
     df["ema9"] = EMAIndicator(df["c"], 9).ema_indicator()
     df["ema21"] = EMAIndicator(df["c"], 21).ema_indicator()
@@ -153,7 +154,6 @@ def trade():
                 log(f"✅ BUY {sym} по {price:.4f}, qty={qty}, TP={tp:.4f}", True)
                 log_trade(sym, "BUY", price, qty, 0)
 
-            # Проверка открытых позиций
             new_positions = []
             for pos in state["positions"]:
                 sell_price = price
