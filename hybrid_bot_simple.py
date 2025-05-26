@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 import random
 
 load_dotenv()
+
 API_KEY = os.getenv("BYBIT_API_KEY")
 API_SECRET = os.getenv("BYBIT_API_SECRET")
 TG_TOKEN = os.getenv("TG_TOKEN")
@@ -25,30 +26,16 @@ SYMBOLS = [
     "AVAXUSDT", "DOGEUSDT", "EOSUSDT", "POLUSDT"
 ]
 
-LIMITS = {
-    "BTCUSDT": {"min_qty": 0.00001, "qty_step": 0.00001},
-    "ETHUSDT": {"min_qty": 0.0001, "qty_step": 0.0001},
-    "SOLUSDT": {"min_qty": 0.001, "qty_step": 0.001},
-    "COMPUSDT": {"min_qty": 0.01, "qty_step": 0.01},
-    "NEARUSDT": {"min_qty": 0.1, "qty_step": 0.1},
-    "TONUSDT": {"min_qty": 0.1, "qty_step": 0.1},
-    "TRXUSDT": {"min_qty": 1, "qty_step": 1},
-    "XRPUSDT": {"min_qty": 1, "qty_step": 1},
-    "ADAUSDT": {"min_qty": 1, "qty_step": 1},
-    "BCHUSDT": {"min_qty": 0.001, "qty_step": 0.001},
-    "LTCUSDT": {"min_qty": 0.001, "qty_step": 0.001},
-    "ZILUSDT": {"min_qty": 1, "qty_step": 1},
-    "AVAXUSDT": {"min_qty": 0.01, "qty_step": 0.01},
-    "DOGEUSDT": {"min_qty": 1, "qty_step": 1},
-    "EOSUSDT": {"min_qty": 1, "qty_step": 1},
-    "POLUSDT": {"min_qty": 1, "qty_step": 1},
-}
-
-STATE = {s: {"positions": [], "pnl": 0, "count": 0} for s in SYMBOLS}
+DECIMALS = {s: 4 for s in SYMBOLS}
+STATE = {s: {"positions": [], "pnl": 0, "count": 0, "bought": 0, "sold": 0, "last_sell": None, "reentries": 0} for s in SYMBOLS}
 LAST_REPORT_DATE = None
+AGGRESSIVE_MODE = False
+MIN_BALANCE = 1000
+MIN_ORDER_USDT = 25
+MIN_RESERVE_USDT = 500
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s",
-    handlers=[logging.FileHandler("bot.log", encoding="utf-8"), logging.StreamHandler()])
+                    handlers=[logging.FileHandler("bot.log", encoding="utf-8"), logging.StreamHandler()])
 
 def send_tg(msg):
     try:
@@ -59,7 +46,7 @@ def send_tg(msg):
 def log(msg, force_tg=False):
     logging.info(msg)
     print(msg)
-    if force_tg or any(k in msg for k in ["BUY", "SELL", "Ошибка", "Бот запущен", "📊"]):
+    if force_tg or any(msg.startswith(k) for k in ["✅ BUY", "🚫 SELL", "⚠️ SIGNAL SELL", "📈 PARTIAL", "🔼 PARTIAL", "Ошибка", "📊", "Бот запущен"]):
         send_tg(msg)
 
 def get_balance():
@@ -91,95 +78,160 @@ def get_orderbook(sym):
 
 def get_qty(sym, price, usdt_amount):
     try:
-        step = LIMITS[sym]["qty_step"]
-        raw_qty = usdt_amount / price
-        decimals = abs(int(f"{step:e}".split("e")[-1]))
-        return round(raw_qty, decimals)
+        qty = round(usdt_amount / price, DECIMALS[sym])
+        return qty
     except:
         return 0
+
+def log_trade(sym, side, price, qty, pnl):
+    with open("trades.csv", "a") as f:
+        f.write(f"{datetime.datetime.now()},{sym},{side},{price},{qty},{pnl}\n")
+
+def signal(df, sym):
+    if df.empty or len(df) < 21:
+        return "none", 0
+    df["ema9"] = EMAIndicator(df["c"], 9).ema_indicator()
+    df["ema21"] = EMAIndicator(df["c"], 21).ema_indicator()
+    df["rsi"] = RSIIndicator(df["c"], 14).rsi()
+    df["atr"] = AverageTrueRange(df["h"], df["l"], df["c"], 14).average_true_range()
+    last = df.iloc[-1]
+    atr_now = last["atr"]
+    atr_avg = df["atr"].rolling(20).mean().iloc[-1]
+
+    if atr_now < atr_avg * 0.5:
+        return "none", atr_now
+
+    vol_avg = df["vol"].rolling(20).mean().iloc[-1]
+    bid, ask = get_orderbook(sym)
+    bid_strength = bid / (ask + 1e-9)
+
+    if last["ema9"] > last["ema21"] and bid_strength > 1.0 and last["vol"] > vol_avg * 1.2 and last["rsi"] > 50:
+        return "strong_buy", atr_now
+    if last["ema9"] > last["ema21"] and bid_strength > 0.92 and last["vol"] > vol_avg * 1.05 and last["rsi"] > 45:
+        return "weak_buy", atr_now
+    if last["ema9"] < last["ema21"] or bid_strength < 0.85:
+        return "sell", atr_now
+    return "none", atr_now
 def trade():
-    global LAST_REPORT_DATE
+    global LAST_REPORT_DATE, AGGRESSIVE_MODE
     usdt = get_balance()
     now = datetime.datetime.now()
-    min_amt = 25 if usdt > 300 else 5
-    min_required_balance = len(SYMBOLS) * min_amt * 2
-    allow_buying = usdt >= 900  # верхний лимит
-    allow_min_buying = usdt >= 500  # нижний лимит
+    active_positions = sum(len(state["positions"]) for state in STATE.values())
+    total_pnl = sum(v["pnl"] for v in STATE.values())
+    SELL_ONLY = usdt < MIN_BALANCE
 
-    log(f"🔁 Мониторинг монет... Баланс: {usdt:.2f} USDT, мин. ордер: {min_amt} USDT")
+    if active_positions == 0 and total_pnl < 20:
+        AGGRESSIVE_MODE = True
+        log("⚠️ Агрессивный режим: нет активных позиций и низкий доход")
+    else:
+        AGGRESSIVE_MODE = False
+
+    log(f"💰 Баланс: {usdt:.2f} USDT")
 
     for sym in SYMBOLS:
         try:
             log(f"[{sym}] 🔍 Проверка")
             df = get_kline(sym)
-            if df.empty or len(df) < 21:
+            if df.empty:
+                log(f"[{sym}] ⚠ Нет данных свечей")
                 continue
 
-            df["ema9"] = EMAIndicator(df["c"], 9).ema_indicator()
-            df["ema21"] = EMAIndicator(df["c"], 21).ema_indicator()
-            df["rsi"] = RSIIndicator(df["c"], 14).rsi()
-            df["atr"] = AverageTrueRange(df["h"], df["l"], df["c"], 14).average_true_range()
-            last = df.iloc[-1]
-            bid, ask = get_orderbook(sym)
-            bid_strength = bid / (ask + 1e-9)
+            sig, atr = signal(df, sym)
+            log(f"[{sym}] 📶 Сигнал: {sig.upper()} | ATR: {atr:.4f}", force_tg=False)
 
-            price = last["c"]
-            atr = last["atr"]
-            step = LIMITS[sym]["qty_step"]
-            min_qty = LIMITS[sym]["min_qty"]
+            price = df["c"].iloc[-1]
             state = STATE[sym]
-            already_in_position = len(state["positions"]) > 0
 
-            balance_per_coin = usdt / len(SYMBOLS)
-            order_usdt = min(max(min_amt, balance_per_coin / 2), usdt)
-            qty = get_qty(sym, price, order_usdt)
-            cost = qty * price
-
-            ## 🟢 Условия на покупку
-            buy_conditions = (
-                not already_in_position and
-                last["ema9"] > last["ema21"] and
-                bid_strength > 1.0 and
-                last["vol"] > df["vol"].rolling(20).mean().iloc[-1] * 1.2 and
-                last["rsi"] > 50
+            allow_reentry = (
+                state["last_sell"]
+                and (now - state["last_sell"]).seconds < 600
+                and state["reentries"] < 2
             )
 
-            if allow_min_buying and buy_conditions:
-                if qty < min_qty:
-                    log(f"[{sym}] ❌ qty={qty:.4f} < minQty {min_qty} — отмена")
+            if sig in ("strong_buy", "weak_buy") and not SELL_ONLY:
+                if state["positions"] and not allow_reentry:
+                    log(f"[{sym}] ⛔ Пропуск покупки: уже есть позиция")
                     continue
-                if cost < min_amt:
-                    log(f"[{sym}] ❌ Сумма {cost:.2f} < minAmt {min_amt} — отмена")
+                order_usdt = max(MIN_ORDER_USDT, usdt / len(SYMBOLS) / 3)
+                if sig == "weak_buy":
+                    order_usdt *= 0.5
+                if usdt - order_usdt < MIN_RESERVE_USDT:
+                    log(f"[{sym}] ⏸ Недостаточно средств для покупки с резервом")
                     continue
-                if usdt - cost < 500:
-                    log(f"[{sym}] 💸 Покупка нарушит резерв — отмена (остаток < 500)")
+                qty = get_qty(sym, price, order_usdt)
+                if qty == 0:
+                    log(f"[{sym}] ❌ Кол-во {qty} — слишком мало")
                     continue
-
                 session.place_order(category="spot", symbol=sym, side="Buy", orderType="Market", qty=str(qty))
-                state["positions"].append({"buy_price": price, "qty": qty, "atr": atr})
+                tp1 = price + atr
+                tp2 = price + atr * 1.5
+                tp3 = price + atr * 2.5
+                state["positions"].append({"buy_price": price, "qty": qty, "tp1": tp1, "tp2": tp2, "tp3": tp3})
                 state["count"] += 1
-                log(f"✅ BUY {sym} по {price:.4f}, qty={qty}", True)
+                state["bought"] += order_usdt
+                if allow_reentry:
+                    state["reentries"] += 1
+                log(f"✅ BUY {sym} по {price:.4f}, qty={qty}, TP1={tp1:.4f}, TP2={tp2:.4f}", True)
+                log_trade(sym, "BUY", price, qty, 0)
+            elif sig == "none":
+                log(f"[{sym}] ❌ Сигнал 'none' — нет условий для входа")
 
-            ## 🔴 Проверка на продажу
             new_positions = []
             for pos in state["positions"]:
-                sell_price = price
-                trigger_price = pos["buy_price"] + pos["atr"]
-                if sell_price >= trigger_price:
-                    session.place_order(category="spot", symbol=sym, side="Sell", orderType="Market", qty=str(pos["qty"]))
-                    pnl = (sell_price - pos["buy_price"]) * pos["qty"]
-                    state["pnl"] += pnl
-                    log(f"🚫 SELL {sym} по {sell_price:.4f} | PnL: {pnl:.4f}", True)
-                else:
+                b = pos["buy_price"]
+                q = pos["qty"]
+                tp1, tp2, tp3 = pos["tp1"], pos["tp2"], pos["tp3"]
+                sl = b - atr * 1.5
+                pnl = (price - b) * q
+                commission = price * q * 0.001
+                net_pnl = pnl - commission
+                sold = False
+
+                if price <= sl or price >= tp3:
+                    session.place_order(category="spot", symbol=sym, side="Sell", orderType="Market", qty=str(q))
+                    state["sold"] += price * q
+                    state["pnl"] += net_pnl
+                    log(f"🚫 SELL {sym} по {price:.4f} | PnL: {net_pnl:.4f}", True)
+                    log_trade(sym, "SELL", price, q, net_pnl)
+                    state["last_sell"] = now
+                    state["reentries"] = 0
+                    sold = True
+                elif price >= tp2:
+                    half = round(q * 0.5, DECIMALS[sym])
+                    session.place_order(category="spot", symbol=sym, side="Sell", orderType="Market", qty=str(half))
+                    state["sold"] += price * half
+                    state["pnl"] += (price - b) * half - price * half * 0.001
+                    pos["qty"] -= half
+                    log(f"📈 PARTIAL SELL-TP2 {sym} по {price:.4f}", True)
+                elif price >= tp1:
+                    third = round(q * 0.3, DECIMALS[sym])
+                    session.place_order(category="spot", symbol=sym, side="Sell", orderType="Market", qty=str(third))
+                    state["sold"] += price * third
+                    state["pnl"] += (price - b) * third - price * third * 0.001
+                    pos["qty"] -= third
+                    log(f"🔼 PARTIAL SELL-TP1 {sym} по {price:.4f}", True)
+                elif sig == "sell" and pnl > 0:
+                    session.place_order(category="spot", symbol=sym, side="Sell", orderType="Market", qty=str(q))
+                    state["sold"] += price * q
+                    state["pnl"] += net_pnl
+                    log(f"⚠️ SIGNAL SELL {sym} по {price:.4f} | PnL: {net_pnl:.4f}", True)
+                    log_trade(sym, "SELL", price, q, net_pnl)
+                    state["last_sell"] = now
+                    state["reentries"] = 0
+                    sold = True
+
+                if not sold and pos["qty"] >= 0.0001:
                     new_positions.append(pos)
             state["positions"] = new_positions
 
         except Exception as e:
-            log(f"[{sym}] 🛑 Ошибка: {e}", True)
+            log(f"🛑 Ошибка в {sym}: {e}", True)
 
     if now.hour == 22 and now.minute >= 30 and LAST_REPORT_DATE != now.date():
-        report = "\n".join([f"{s}: PnL {v['pnl']:.2f}, Сделок {v['count']}" for s, v in STATE.items()])
-        log("📊 Отчёт за день:\n" + report, True)
+        report = f"\n📊 Дневной отчёт {now.date()}:\nUSDT: {usdt:.2f}\n"
+        for s, v in STATE.items():
+            report += f"{s}: сделок={v['count']}, куплено={v['bought']:.2f}, продано={v['sold']:.2f}, PnL={v['pnl']:.2f}\n"
+        log(report, True)
         LAST_REPORT_DATE = now.date()
 
 if __name__ == "__main__":
