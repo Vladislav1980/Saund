@@ -1,62 +1,45 @@
-import os
-import time
-import logging
-import datetime
-import requests
-import pandas as pd
+# Блок импортов и инициализация
+import os, time, logging, datetime, requests, pandas as pd, random
 from pybit.unified_trading import HTTP
 from ta.trend import EMAIndicator
 from ta.momentum import RSIIndicator
 from ta.volatility import AverageTrueRange
 from dotenv import load_dotenv
-import random
 
 load_dotenv()
-
-API_KEY = os.getenv("BYBIT_API_KEY")
-API_SECRET = os.getenv("BYBIT_API_SECRET")
-TG_TOKEN = os.getenv("TG_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
-
+API_KEY, API_SECRET = os.getenv("BYBIT_API_KEY"), os.getenv("BYBIT_API_SECRET")
+TG_TOKEN, CHAT_ID = os.getenv("TG_TOKEN"), os.getenv("CHAT_ID")
 session = HTTP(api_key=API_KEY, api_secret=API_SECRET, recv_window=15000)
 
 SYMBOLS = [
-    "BTCUSDT", "ETHUSDT", "SOLUSDT", "COMPUSDT", "NEARUSDT", "TONUSDT",
-    "TRXUSDT", "XRPUSDT", "ADAUSDT", "BCHUSDT", "LTCUSDT", "ZILUSDT",
-    "AVAXUSDT", "DOGEUSDT", "EOSUSDT", "POLUSDT"
+    "BTCUSDT", "ETHUSDT", "SOLUSDT", "COMPUSDT", "NEARUSDT", "TONUSDT", "TRXUSDT",
+    "XRPUSDT", "ADAUSDT", "BCHUSDT", "LTCUSDT", "ZILUSDT", "AVAXUSDT", "DOGEUSDT",
+    "EOSUSDT", "POLUSDT"
 ]
-
 DECIMALS = {s: 4 for s in SYMBOLS}
 STATE = {s: {"positions": [], "pnl": 0, "count": 0, "bought": 0, "sold": 0, "last_sell": None, "reentries": 0} for s in SYMBOLS}
-LAST_REPORT_DATE = None
-AGGRESSIVE_MODE = False
-MIN_BALANCE = 1000
-MIN_ORDER_USDT = 25
-MIN_RESERVE_USDT = 500
+LAST_REPORT_DATE, AGGRESSIVE_MODE = None, False
+MIN_BALANCE, MIN_ORDER_USDT, MIN_RESERVE_USDT = 1000, 25, 500
+TRAIL_MULTIPLIER = 1.5
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s",
-                    handlers=[logging.FileHandler("bot.log", encoding="utf-8"), logging.StreamHandler()])
+    handlers=[logging.FileHandler("bot.log", encoding="utf-8"), logging.StreamHandler()])
 
 def send_tg(msg):
-    try:
-        requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage", data={"chat_id": CHAT_ID, "text": msg})
-    except Exception as e:
-        logging.error(f"[Telegram Error] {e}")
+    try: requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage", data={"chat_id": CHAT_ID, "text": msg})
+    except Exception as e: logging.error(f"[Telegram Error] {e}")
 
 def log(msg, force_tg=False):
     logging.info(msg)
     print(msg)
-    if force_tg or any(msg.startswith(k) for k in ["✅ BUY", "🚫 SELL", "⚠️ SIGNAL SELL", "📈 PARTIAL", "🔼 PARTIAL", "Ошибка", "📊", "Бот запущен"]):
+    if force_tg or any(msg.startswith(k) for k in ["✅ BUY", "🚫 SELL", "⚠️ SIGNAL SELL", "📈 PARTIAL", "🔼 PARTIAL", "Ошибка", "📊", "🚀"]):
         send_tg(msg)
 
 def get_balance():
     try:
         coins = session.get_wallet_balance(accountType="UNIFIED")["result"]["list"][0]["coin"]
-        for c in coins:
-            if c["coin"] == "USDT":
-                return float(c["walletBalance"] or 0)
-    except:
-        return 0
+        return float(next(c["walletBalance"] for c in coins if c["coin"] == "USDT"))
+    except: return 0
 
 def get_kline(sym):
     try:
@@ -64,8 +47,7 @@ def get_kline(sym):
         df = pd.DataFrame(r["result"]["list"], columns=["ts", "o", "h", "l", "c", "vol", "turn"])
         df[["o", "h", "l", "c", "vol"]] = df[["o", "h", "l", "c", "vol"]].astype(float)
         return df
-    except:
-        return pd.DataFrame()
+    except: return pd.DataFrame()
 
 def get_orderbook(sym):
     try:
@@ -73,15 +55,15 @@ def get_orderbook(sym):
         bid = sum(float(b[1]) for b in ob["b"][:5])
         ask = sum(float(a[1]) for a in ob["a"][:5])
         return bid, ask
-    except:
-        return 0, 0
+    except: return 0, 0
 
 def get_qty(sym, price, usdt_amount):
     try:
-        qty = round(usdt_amount / price, DECIMALS[sym])
-        return qty
-    except:
-        return 0
+        step = 0.00001
+        raw_qty = usdt_amount / price
+        decimals = abs(int(f"{step:e}".split("e")[-1]))
+        return round(raw_qty, decimals)
+    except: return 0
 
 def log_trade(sym, side, price, qty, pnl):
     with open("trades.csv", "a") as f:
@@ -96,22 +78,16 @@ def signal(df, sym):
     df["atr"] = AverageTrueRange(df["h"], df["l"], df["c"], 14).average_true_range()
     last = df.iloc[-1]
     atr_now = last["atr"]
-    atr_avg = df["atr"].rolling(20).mean().iloc[-1]
-
-    if atr_now < atr_avg * 0.5:
-        return "none", atr_now
-
     vol_avg = df["vol"].rolling(20).mean().iloc[-1]
     bid, ask = get_orderbook(sym)
     bid_strength = bid / (ask + 1e-9)
 
-    if last["ema9"] > last["ema21"] and bid_strength > 1.0 and last["vol"] > vol_avg * 1.2 and last["rsi"] > 50:
-        return "strong_buy", atr_now
-    if last["ema9"] > last["ema21"] and bid_strength > 0.92 and last["vol"] > vol_avg * 1.05 and last["rsi"] > 45:
-        return "weak_buy", atr_now
+    if last["ema9"] > last["ema21"] and bid_strength > 0.95 and last["vol"] > vol_avg * 1.05 and last["rsi"] > 45:
+        return "buy", atr_now
     if last["ema9"] < last["ema21"] or bid_strength < 0.85:
         return "sell", atr_now
     return "none", atr_now
+
 def trade():
     global LAST_REPORT_DATE, AGGRESSIVE_MODE
     usdt = get_balance()
@@ -138,23 +114,14 @@ def trade():
 
             sig, atr = signal(df, sym)
             log(f"[{sym}] 📶 Сигнал: {sig.upper()} | ATR: {atr:.4f}", force_tg=False)
-
             price = df["c"].iloc[-1]
             state = STATE[sym]
 
-            allow_reentry = (
-                state["last_sell"]
-                and (now - state["last_sell"]).seconds < 600
-                and state["reentries"] < 2
-            )
-
-            if sig in ("strong_buy", "weak_buy") and not SELL_ONLY:
-                if state["positions"] and not allow_reentry:
+            if sig == "buy" and not SELL_ONLY:
+                if state["positions"]:
                     log(f"[{sym}] ⛔ Пропуск покупки: уже есть позиция")
                     continue
                 order_usdt = max(MIN_ORDER_USDT, usdt / len(SYMBOLS) / 3)
-                if sig == "weak_buy":
-                    order_usdt *= 0.5
                 if usdt - order_usdt < MIN_RESERVE_USDT:
                     log(f"[{sym}] ⏸ Недостаточно средств для покупки с резервом")
                     continue
@@ -163,65 +130,34 @@ def trade():
                     log(f"[{sym}] ❌ Кол-во {qty} — слишком мало")
                     continue
                 session.place_order(category="spot", symbol=sym, side="Buy", orderType="Market", qty=str(qty))
-                tp1 = price + atr
-                tp2 = price + atr * 1.5
-                tp3 = price + atr * 2.5
-                state["positions"].append({"buy_price": price, "qty": qty, "tp1": tp1, "tp2": tp2, "tp3": tp3})
+                tp = price + atr * TRAIL_MULTIPLIER
+                state["positions"].append({"buy_price": price, "qty": qty, "tp": tp, "trail_atr": atr})
                 state["count"] += 1
                 state["bought"] += order_usdt
-                if allow_reentry:
-                    state["reentries"] += 1
-                log(f"✅ BUY {sym} по {price:.4f}, qty={qty}, TP1={tp1:.4f}, TP2={tp2:.4f}", True)
+                log(f"✅ BUY {sym} по {price:.4f}, qty={qty}, TP={tp:.4f}", True)
                 log_trade(sym, "BUY", price, qty, 0)
-            elif sig == "none":
-                log(f"[{sym}] ❌ Сигнал 'none' — нет условий для входа")
 
             new_positions = []
             for pos in state["positions"]:
                 b = pos["buy_price"]
                 q = pos["qty"]
-                tp1, tp2, tp3 = pos["tp1"], pos["tp2"], pos["tp3"]
-                sl = b - atr * 1.5
+                tp = pos["tp"]
+                atr = pos["trail_atr"]
                 pnl = (price - b) * q
-                commission = price * q * 0.001
-                net_pnl = pnl - commission
-                sold = False
+                net_pnl = pnl - price * q * 0.001
 
-                if price <= sl or price >= tp3:
+                if price >= tp or (sig == "sell" and pnl > 0):
                     session.place_order(category="spot", symbol=sym, side="Sell", orderType="Market", qty=str(q))
                     state["sold"] += price * q
                     state["pnl"] += net_pnl
                     log(f"🚫 SELL {sym} по {price:.4f} | PnL: {net_pnl:.4f}", True)
                     log_trade(sym, "SELL", price, q, net_pnl)
-                    state["last_sell"] = now
-                    state["reentries"] = 0
-                    sold = True
-                elif price >= tp2:
-                    half = round(q * 0.5, DECIMALS[sym])
-                    session.place_order(category="spot", symbol=sym, side="Sell", orderType="Market", qty=str(half))
-                    state["sold"] += price * half
-                    state["pnl"] += (price - b) * half - price * half * 0.001
-                    pos["qty"] -= half
-                    log(f"📈 PARTIAL SELL-TP2 {sym} по {price:.4f}", True)
-                elif price >= tp1:
-                    third = round(q * 0.3, DECIMALS[sym])
-                    session.place_order(category="spot", symbol=sym, side="Sell", orderType="Market", qty=str(third))
-                    state["sold"] += price * third
-                    state["pnl"] += (price - b) * third - price * third * 0.001
-                    pos["qty"] -= third
-                    log(f"🔼 PARTIAL SELL-TP1 {sym} по {price:.4f}", True)
-                elif sig == "sell" and pnl > 0:
-                    session.place_order(category="spot", symbol=sym, side="Sell", orderType="Market", qty=str(q))
-                    state["sold"] += price * q
-                    state["pnl"] += net_pnl
-                    log(f"⚠️ SIGNAL SELL {sym} по {price:.4f} | PnL: {net_pnl:.4f}", True)
-                    log_trade(sym, "SELL", price, q, net_pnl)
-                    state["last_sell"] = now
-                    state["reentries"] = 0
-                    sold = True
-
-                if not sold and pos["qty"] >= 0.0001:
+                else:
+                    new_tp = max(tp, price + TRAIL_MULTIPLIER * atr)
+                    pos["tp"] = new_tp
+                    log(f"[{sym}] 🧭 Продажа не выполнена: TP не достигнут или нет сигнала (TP: {tp:.4f})")
                     new_positions.append(pos)
+
             state["positions"] = new_positions
 
         except Exception as e:
