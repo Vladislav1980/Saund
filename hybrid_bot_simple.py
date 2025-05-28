@@ -76,9 +76,12 @@ def signal(df):
     df["atr"] = AverageTrueRange(df["h"], df["l"], df["c"], 14).average_true_range()
     macd = MACD(df["c"])
     df["macd"], df["macd_signal"] = macd.macd(), macd.macd_signal()
+
     last = df.iloc[-1]
-    vol_spike = last["vol"] > df["vol"].rolling(20).mean().iloc[-1] * 1.2
-    if last["ema9"] > last["ema21"] and last["rsi"] > 50 and last["macd"] > last["macd_signal"] and vol_spike:
+    vol_mean = df["vol"].rolling(20).mean().iloc[-1]
+    vol_spike = last["vol"] > vol_mean * 1.1  # стало мягче
+
+    if last["ema9"] > last["ema21"] and last["rsi"] > 45 and last["macd"] > last["macd_signal"] and vol_spike:
         return "buy", last["atr"]
     elif last["ema9"] < last["ema21"] and last["rsi"] < 45 and last["macd"] < last["macd_signal"]:
         return "sell", last["atr"]
