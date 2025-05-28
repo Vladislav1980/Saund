@@ -6,6 +6,7 @@ from ta.trend import EMAIndicator, MACD
 from ta.momentum import RSIIndicator
 from ta.volatility import AverageTrueRange
 
+# === НАСТРОЙКИ ===
 load_dotenv()
 API_KEY = os.getenv("BYBIT_API_KEY")
 API_SECRET = os.getenv("BYBIT_API_SECRET")
@@ -25,7 +26,7 @@ SYMBOLS = [
 ]
 
 session = HTTP(api_key=API_KEY, api_secret=API_SECRET, recv_window=15000)
-STATE = {s: {"positions": [], "pnl": 0.0, "count": 0, "avg_count": 0} for s in SYMBOLS}
+STATE = {s: {"positions": [], "pnl": 0.0, "count": 0, "avg_count": 0, "last_sell_price": 0.0} for s in SYMBOLS}
 LIMITS, LAST_REPORT_DATE = {}, None
 cycle_count = 0
 
@@ -67,7 +68,7 @@ def adjust_qty(qty, step):
     except:
         return qty
 
-def signal(df):
+def signal(df, sym):
     if df.empty or len(df) < 50:
         return "none", 0
     df["ema9"] = EMAIndicator(df["c"], 9).ema_indicator()
@@ -79,13 +80,24 @@ def signal(df):
 
     last = df.iloc[-1]
     vol_mean = df["vol"].rolling(20).mean().iloc[-1]
-    vol_spike = last["vol"] > vol_mean * 1.1  # стало мягче
+    vol_spike = last["vol"] > vol_mean * 1.1
 
-    if last["ema9"] > last["ema21"] and last["rsi"] > 45 and last["macd"] > last["macd_signal"] and vol_spike:
-        return "buy", last["atr"]
-    elif last["ema9"] < last["ema21"] and last["rsi"] < 45 and last["macd"] < last["macd_signal"]:
-        return "sell", last["atr"]
-    return "none", last["atr"]
+    buy_cond = (
+        last["ema9"] > last["ema21"] and
+        last["rsi"] > 45 and
+        last["macd"] > last["macd_signal"] and
+        vol_spike
+    )
+    sell_cond = (
+        last["ema9"] < last["ema21"] and
+        last["rsi"] < 45 and
+        last["macd"] < last["macd_signal"]
+    )
+
+    signal_type = "buy" if buy_cond else "sell" if sell_cond else "none"
+
+    log(f"[{sym}] 🔍 SIGNAL={signal_type.upper()} | EMA9={last['ema9']:.4f}, EMA21={last['ema21']:.4f}, RSI={last['rsi']:.1f}, MACD={last['macd']:.4f}, VOL={last['vol']:.2f}")
+    return signal_type, last["atr"]
 
 def get_kline(sym):
     r = session.get_kline(category="spot", symbol=sym, interval="1", limit=100)
@@ -134,7 +146,7 @@ def trade():
                 log(f"[{sym}] ❌ Пропущен: пустой график")
                 continue
 
-            sig, atr = signal(df)
+            sig, atr = signal(df, sym)
             price = df["c"].iloc[-1]
             state = STATE[sym]
             limits = LIMITS[sym]
@@ -151,11 +163,11 @@ def trade():
 
                 pnl = (price - b) * q - price * q * 0.001
                 if price >= tp and pnl >= price * q * MIN_PROFIT_PCT:
-                    q = adjust_qty(q, limits["qty_step"])
                     session.place_order(category="spot", symbol=sym, side="Sell", orderType="Market", qty=str(q))
                     log_trade(sym, "SELL", price, q, pnl)
                     state["pnl"] += pnl
                     coin_bal -= q
+                    state["last_sell_price"] = price
                 else:
                     p["tp"] = max(tp, price + TRAIL_MULTIPLIER * atr)
                     new_positions.append(p)
@@ -180,7 +192,11 @@ def trade():
                         log_trade(sym, "BUY (усреднение)", price, qty, 0)
 
             # НОВАЯ ПОКУПКА
+            last_pnl_price = state.get("last_sell_price", 0)
             if sig == "buy" and not state["positions"] and value < per_sym:
+                if abs(price - last_pnl_price) < price * 0.001:
+                    log(f"[{sym}] ⚠️ Покупка отклонена — цена совпадает с последней продажей ({price:.4f})")
+                    continue
                 usdt_to_use = per_sym - value
                 qty = get_qty(sym, price, usdt_to_use)
                 if qty and qty * price <= usdt:
@@ -191,7 +207,6 @@ def trade():
                     state["count"] += 1
                     log_trade(sym, "BUY", price, qty, 0)
 
-            # ПРОПУСК ПРОДАЖИ ПО СИГНАЛУ
             if not state["positions"] and sig == "sell":
                 log(f"[{sym}] ℹ️ Продажа пропущена: нет позиции")
 
@@ -210,6 +225,8 @@ def trade():
             rep += f"{s:<8} | Сделок: {v['count']} | PnL: {v['pnl']:.2f}\n"
         log(rep, True)
         LAST_REPORT_DATE = now.date()
+
+# 🔁 Запуск
 if __name__ == "__main__":
     log("🚀 Бот запущен", True)
     load_symbol_limits()
