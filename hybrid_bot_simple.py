@@ -1,9 +1,4 @@
-import os
-import time
-import math
-import logging
-import datetime
-import requests
+import os, time, math, logging, datetime, requests
 import pandas as pd
 from dotenv import load_dotenv
 from pybit.unified_trading import HTTP
@@ -11,7 +6,6 @@ from ta.trend import EMAIndicator, MACD
 from ta.momentum import RSIIndicator
 from ta.volatility import AverageTrueRange
 
-# === НАСТРОЙКИ ===
 load_dotenv()
 API_KEY = os.getenv("BYBIT_API_KEY")
 API_SECRET = os.getenv("BYBIT_API_SECRET")
@@ -23,7 +17,7 @@ RESERVE_BALANCE = 500
 TRAIL_MULTIPLIER = 1.5
 MAX_DRAWDOWN = 0.10
 MAX_AVERAGES = 3
-MIN_PROFIT_PCT = 0.001  # 0.1%
+MIN_PROFIT_PCT = 0.001
 
 SYMBOLS = [
     "COMPUSDT", "NEARUSDT", "TONUSDT", "TRXUSDT", "XRPUSDT",
@@ -54,6 +48,7 @@ def log_trade(sym, side, price, qty, pnl):
     log(f"{side} {sym} @ {price:.4f}, qty={qty}, PnL={pnl:.4f}", True)
     with open("trades.csv", "a") as f:
         f.write(f"{datetime.datetime.now()},{sym},{side},{price},{qty},{pnl}\n")
+
 def load_symbol_limits():
     data = session.get_instruments_info(category="spot")["result"]["list"]
     for item in data:
@@ -107,11 +102,8 @@ def get_coin_balance(sym):
 def get_qty(sym, price, usdt):
     if sym not in LIMITS:
         return 0
-    q = adjust_qty(usdt / price, LIMITS[sym]["qty_step"])
-    if q < LIMITS[sym]["min_qty"] or q * price < LIMITS[sym]["min_amt"]:
-        return 0
-    return q
-
+    q = usdt / price
+    return adjust_qty(q, LIMITS[sym]["qty_step"])
 def init_positions():
     for sym in SYMBOLS:
         df = get_kline(sym)
@@ -124,6 +116,7 @@ def init_positions():
             tp = price + TRAIL_MULTIPLIER * (df["h"] - df["l"]).mean()
             STATE[sym]["positions"].append({"buy_price": price, "qty": qty, "tp": tp})
             log(f"[{sym}] 🔄 Восстановлена позиция: qty={qty}, price={price:.4f}")
+
 def trade():
     global LAST_REPORT_DATE, cycle_count
     usdt = get_balance()
@@ -146,7 +139,7 @@ def trade():
             value = coin_bal * price
             new_positions = []
 
-            # === ПРОДАЖА: только по TP и достаточной прибыли
+            # ПРОДАЖА
             for p in state["positions"]:
                 b, q, tp = p["buy_price"], p["qty"], p["tp"]
                 q = adjust_qty(q, limits["qty_step"])
@@ -154,9 +147,8 @@ def trade():
                     continue
 
                 pnl = (price - b) * q - price * q * 0.001
-                required_profit = price * q * MIN_PROFIT_PCT
-
-                if price >= tp and pnl >= required_profit:
+                if price >= tp and pnl >= price * q * MIN_PROFIT_PCT:
+                    q = adjust_qty(q, limits["qty_step"])
                     session.place_order(category="spot", symbol=sym, side="Sell", orderType="Market", qty=str(q))
                     log_trade(sym, "SELL", price, q, pnl)
                     state["pnl"] += pnl
@@ -167,7 +159,7 @@ def trade():
 
             state["positions"] = new_positions
 
-            # === УСРЕДНЕНИЕ
+            # УСРЕДНЕНИЕ
             if sig == "buy" and state["positions"] and state["avg_count"] < MAX_AVERAGES:
                 total_qty = sum(p["qty"] for p in state["positions"])
                 avg_price = sum(p["qty"] * p["buy_price"] for p in state["positions"]) / total_qty
@@ -176,6 +168,7 @@ def trade():
                     usdt_to_use = per_sym - value
                     qty = get_qty(sym, price, usdt_to_use)
                     if qty and qty * price <= usdt:
+                        qty = adjust_qty(qty, limits["qty_step"])
                         session.place_order(category="spot", symbol=sym, side="Buy", orderType="Market", qty=str(qty))
                         tp = price + TRAIL_MULTIPLIER * atr
                         state["positions"].append({"buy_price": price, "qty": qty, "tp": tp})
@@ -183,20 +176,21 @@ def trade():
                         state["avg_count"] += 1
                         log_trade(sym, "BUY (усреднение)", price, qty, 0)
 
-            # === НОВАЯ ПОКУПКА
+            # НОВАЯ ПОКУПКА
             if sig == "buy" and not state["positions"] and value < per_sym:
                 usdt_to_use = per_sym - value
                 qty = get_qty(sym, price, usdt_to_use)
                 if qty and qty * price <= usdt:
+                    qty = adjust_qty(qty, limits["qty_step"])
                     session.place_order(category="spot", symbol=sym, side="Buy", orderType="Market", qty=str(qty))
                     tp = price + TRAIL_MULTIPLIER * atr
                     state["positions"].append({"buy_price": price, "qty": qty, "tp": tp})
                     state["count"] += 1
                     log_trade(sym, "BUY", price, qty, 0)
 
-            # === НЕ ПРОДАВАТЬ ПРОСТО ПО СИГНАЛУ (если нет позиции)
+            # ПРОПУСК ПРОДАЖИ ПО СИГНАЛУ
             if not state["positions"] and sig == "sell":
-                log(f"[{sym}] ℹ️ Продажа пропущена: нет позиции", tg=False)
+                log(f"[{sym}] ℹ️ Продажа пропущена: нет позиции")
 
         except Exception as e:
             log(f"[{sym}] ❌ Ошибка ({type(e).__name__}): {e}")
