@@ -177,4 +177,4 @@ if __name__ == "__main__":
             trade()
         except Exception as e:
             log(f"🛑 Глобальная ошибка: {e}", True)
-        time.sleep(60)
+        time.sleep(60)     
