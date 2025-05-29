@@ -1,4 +1,4 @@
-import os, time, math, logging, datetime, requests
+import os, time, math, logging, datetime, requests, json
 import pandas as pd
 from dotenv import load_dotenv
 from pybit.unified_trading import HTTP
@@ -16,19 +16,33 @@ CHAT_ID = os.getenv("CHAT_ID")
 TG_VERBOSE = True
 RESERVE_BALANCE = 500
 TRAIL_MULTIPLIER = 1.5
-MAX_DRAWDOWN = 0.10
-MAX_AVERAGES = 3
-
 MIN_PROFIT_PCT = 0.005
 MIN_ABSOLUTE_PNL = 3.00
 
+# === ГРУППЫ И ПАРАМЕТРЫ ===
 SYMBOLS = [
     "COMPUSDT", "NEARUSDT", "TONUSDT", "TRXUSDT", "XRPUSDT",
-    "ADAUSDT", "BCHUSDT", "LTCUSDT", "AVAXUSDT"
+    "ADAUSDT", "BCHUSDT", "LTCUSDT", "AVAXUSDT",
+    "PEPEUSDT", "WIFUSDT", "ARBUSDT", "SUIUSDT", "FILUSDT"
 ]
 
+AGGRESSIVE = ["PEPEUSDT", "WIFUSDT", "ARBUSDT", "SUIUSDT"]
+BALANCED = ["NEARUSDT", "TONUSDT", "XRPUSDT", "AVAXUSDT", "FILUSDT"]
+CONSERVATIVE = ["COMPUSDT", "TRXUSDT", "ADAUSDT", "BCHUSDT", "LTCUSDT"]
+
+STRATEGY_PARAMS = {
+    "aggressive": {"tp_mult": 3.0, "max_drawdown": 0.07, "max_avg": 2},
+    "balanced": {"tp_mult": 2.0, "max_drawdown": 0.10, "max_avg": 2},
+    "conservative": {"tp_mult": 1.5, "max_drawdown": 0.08, "max_avg": 1}
+}
+
+STATE_FILE = "state.json"
 session = HTTP(api_key=API_KEY, api_secret=API_SECRET, recv_window=15000)
-STATE = {s: {"positions": [], "pnl": 0.0, "count": 0, "avg_count": 0, "last_sell_price": 0.0} for s in SYMBOLS}
+
+STATE = {s: {
+    "positions": [], "pnl": 0.0, "count": 0,
+    "avg_count": 0, "last_sell_price": 0.0, "volume_total": 0.0
+} for s in SYMBOLS}
 LIMITS, LAST_REPORT_DATE = {}, None
 cycle_count = 0
 
@@ -37,6 +51,8 @@ logging.basicConfig(
     format="%(asctime)s | %(message)s",
     handlers=[logging.FileHandler("bot.log", encoding="utf-8"), logging.StreamHandler()]
 )
+
+# === УТИЛИТЫ ===
 
 def send_tg(msg):
     if TG_VERBOSE:
@@ -55,6 +71,7 @@ def log_trade(sym, side, price, qty, pnl):
     log(msg, True)
     with open("trades.csv", "a") as f:
         f.write(f"{datetime.datetime.now()},{sym},{side},{price},{qty},{usdt_value:.2f},{pnl:.4f}\n")
+    STATE[sym]["volume_total"] += usdt_value
 
 def load_symbol_limits():
     data = session.get_instruments_info(category="spot")["result"]["list"]
@@ -110,6 +127,33 @@ def get_qty(sym, price, usdt):
     q = adjust_qty(usdt / price, LIMITS[sym]["qty_step"])
     if q < LIMITS[sym]["min_qty"] or q * price < LIMITS[sym]["min_amt"]: return 0
     return q
+
+def save_state():
+    try:
+        with open(STATE_FILE, "w") as f:
+            json.dump(STATE, f, indent=2)
+        log("💾 Состояние сохранено.")
+    except Exception as e:
+        log(f"❌ Ошибка при сохранении STATE: {e}")
+
+def load_state_from_file():
+    global STATE
+    try:
+        with open(STATE_FILE, "r") as f:
+            saved = json.load(f)
+            for sym in SYMBOLS:
+                if sym in saved:
+                    STATE[sym].update(saved[sym])
+        log("📂 STATE восстановлен из файла.")
+    except FileNotFoundError:
+        log("🆕 STATE-файл не найден — начинаем с чистого.")
+    except Exception as e:
+        log(f"❌ Ошибка загрузки STATE: {e}")
+
+def get_group(sym):
+    if sym in AGGRESSIVE: return "aggressive"
+    if sym in BALANCED: return "balanced"
+    return "conservative"
 def init_positions():
     for sym in SYMBOLS:
         df = get_kline(sym)
@@ -131,6 +175,8 @@ def trade():
 
     for sym in SYMBOLS:
         try:
+            group = get_group(sym)
+            params = STRATEGY_PARAMS[group]
             df = get_kline(sym)
             if df.empty: continue
             sig, atr = signal(df)
@@ -156,22 +202,21 @@ def trade():
                     coin_bal -= q
                     state["last_sell_price"] = price
                 else:
-                    p["tp"] = max(tp, price + TRAIL_MULTIPLIER * atr)
+                    p["tp"] = max(tp, price + params["tp_mult"] * atr)
                     new_positions.append(p)
-                    log(f"[{sym}] 📉 TP не достигнут: цена={price:.4f}, TP={tp:.4f}, PnL={pnl:.4f}, нужно ≥ {min_required_profit:.4f}")
 
             state["positions"] = new_positions
 
-            if sig == "buy" and state["positions"] and state["avg_count"] < MAX_AVERAGES:
+            if sig == "buy" and state["positions"] and state["avg_count"] < params["max_avg"]:
                 total_qty = sum(p["qty"] for p in state["positions"])
                 avg_price = sum(p["qty"] * p["buy_price"] for p in state["positions"]) / total_qty
                 drawdown = (price - avg_price) / avg_price
-                if drawdown < 0 and abs(drawdown) <= MAX_DRAWDOWN and value < per_sym:
+                if drawdown < 0 and abs(drawdown) <= params["max_drawdown"] and value < per_sym:
                     usdt_to_use = per_sym - value
                     qty = get_qty(sym, price, usdt_to_use)
                     if qty and qty * price <= usdt:
                         session.place_order(category="spot", symbol=sym, side="Buy", orderType="Market", qty=str(qty))
-                        tp = price + TRAIL_MULTIPLIER * atr
+                        tp = price + params["tp_mult"] * atr
                         state["positions"].append({"buy_price": price, "qty": qty, "tp": tp})
                         state["count"] += 1
                         state["avg_count"] += 1
@@ -179,13 +224,13 @@ def trade():
 
             if sig == "buy" and not state["positions"] and value < per_sym:
                 if abs(price - state["last_sell_price"]) / price < 0.001:
-                    log(f"[{sym}] ⚠️ Покупка пропущена: цена почти как последняя продажа ({price:.4f})")
+                    log(f"[{sym}] ⚠️ Пропущена покупка: цена почти как последняя продажа ({price:.4f})", True)
                     continue
                 usdt_to_use = per_sym - value
                 qty = get_qty(sym, price, usdt_to_use)
                 if qty and qty * price <= usdt:
                     session.place_order(category="spot", symbol=sym, side="Buy", orderType="Market", qty=str(qty))
-                    tp = price + TRAIL_MULTIPLIER * atr
+                    tp = price + params["tp_mult"] * atr
                     state["positions"].append({"buy_price": price, "qty": qty, "tp": tp})
                     state["count"] += 1
                     log_trade(sym, "BUY", price, qty, 0)
@@ -193,7 +238,7 @@ def trade():
             if not state["positions"] and sig == "sell" and coin_bal * price >= limits["min_amt"]:
                 qty = adjust_qty(coin_bal, limits["qty_step"])
                 if qty > 0:
-                    log(f"[{sym}] ℹ️ Продажа пропущена: нет позиции")
+                    log(f"[{sym}] ℹ️ Продажа пропущена: нет открытой позиции")
 
         except Exception as e:
             log(f"[{sym}] ❌ Ошибка: {e}")
@@ -203,21 +248,50 @@ def trade():
         act = sum(len(v["positions"]) for v in STATE.values())
         log(f"⏳ Активных позиций: {act}")
 
+    # === ЕЖЕДНЕВНЫЙ ОТЧЁТ ===
     now = datetime.datetime.now()
     if now.hour == 22 and now.minute >= 30 and LAST_REPORT_DATE != now.date():
-        rep = f"📊 Отчёт {now.date()}:\nБаланс: {usdt:.2f} USDT\n"
-        for s, v in STATE.items():
-            rep += f"{s:<8} | Сделок: {v['count']} | PnL: {v['pnl']:.2f}\n"
-        log(rep, True)
+        rep_lines = [f"📊 Ежедневный отчёт за {now.strftime('%Y-%m-%d')}"]
+        rep_lines.append(f"💰 Баланс USDT: {usdt:.2f}")
+        total_pnl = 0
+        total_volume = 0
+        active_positions = 0
+
+        for sym in SYMBOLS:
+            state = STATE[sym]
+            pnl = state["pnl"]
+            deals = state["count"]
+            vol = state.get("volume_total", 0)
+            coin_bal = get_coin_balance(sym)
+            price = get_kline(sym)["c"].iloc[-1]
+            value = coin_bal * price
+            act = len(state["positions"])
+            drawdowns = []
+            for p in state["positions"]:
+                dd = (price - p["buy_price"]) / p["buy_price"]
+                drawdowns.append(dd)
+            avg_dd = sum(drawdowns) / len(drawdowns) if drawdowns else 0
+            active_positions += act
+            total_pnl += pnl
+            total_volume += vol
+            rep_lines.append(f"{sym:<10} | Сделок={deals:<3} | PnL={pnl:>7.2f} | Баланс={coin_bal:>7.3f} | $={value:>7.2f} | Активных={act} | 📉Просадка={avg_dd*100:>5.1f}%")
+
+        roi = (total_pnl / total_volume * 100) if total_volume else 0
+        rep_lines.append(f"\n📈 Общий PnL: {total_pnl:.2f} USDT")
+        rep_lines.append(f"📦 Активных позиций: {active_positions}")
+        rep_lines.append(f"📊 Доходность к обороту: {roi:.2f}%")
+        send_tg("\n".join(rep_lines))
         LAST_REPORT_DATE = now.date()
 
 if __name__ == "__main__":
     log("🚀 Бот запущен", True)
     load_symbol_limits()
+    load_state_from_file()
     init_positions()
     while True:
         try:
             trade()
+            save_state()
         except Exception as e:
-            log(f"🛑 Глобальная ошибка: {e}")
+            log(f"🛑 Глобальная ошибка: {type(e).__name__}: {e}")
         time.sleep(60)
