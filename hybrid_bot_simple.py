@@ -18,8 +18,8 @@ RESERVE_BALANCE = 500
 TRAIL_MULTIPLIER = 1.5
 MIN_PROFIT_PCT = 0.005
 MIN_ABSOLUTE_PNL = 3.00
+STOP_LOSS_PCT = -0.15
 
-# === ГРУППЫ И ПАРАМЕТРЫ ===
 SYMBOLS = [
     "COMPUSDT", "NEARUSDT", "TONUSDT", "TRXUSDT", "XRPUSDT",
     "ADAUSDT", "BCHUSDT", "LTCUSDT", "AVAXUSDT",
@@ -41,8 +41,10 @@ session = HTTP(api_key=API_KEY, api_secret=API_SECRET, recv_window=15000)
 
 STATE = {s: {
     "positions": [], "pnl": 0.0, "count": 0,
-    "avg_count": 0, "last_sell_price": 0.0, "volume_total": 0.0
+    "avg_count": 0, "last_sell_price": 0.0, "volume_total": 0.0,
+    "last_stoploss_time": 0
 } for s in SYMBOLS}
+
 LIMITS, LAST_REPORT_DATE = {}, None
 cycle_count = 0
 
@@ -51,8 +53,6 @@ logging.basicConfig(
     format="%(asctime)s | %(message)s",
     handlers=[logging.FileHandler("bot.log", encoding="utf-8"), logging.StreamHandler()]
 )
-
-# === УТИЛИТЫ ===
 
 def send_tg(msg):
     if TG_VERBOSE:
@@ -100,8 +100,7 @@ def signal(df):
     macd = MACD(df["c"])
     df["macd"], df["macd_signal"] = macd.macd(), macd.macd_signal()
     last = df.iloc[-1]
-    vol_spike = last["vol"] > df["vol"].rolling(20).mean().iloc[-1] * 1.2
-    if last["ema9"] > last["ema21"] and last["rsi"] > 50 and last["macd"] > last["macd_signal"] and vol_spike:
+    if last["ema9"] > last["ema21"] and last["rsi"] >= 40 and last["macd"] >= last["macd_signal"]:
         return "buy", last["atr"]
     elif last["ema9"] < last["ema21"] and last["rsi"] < 45 and last["macd"] < last["macd_signal"]:
         return "sell", last["atr"]
@@ -132,7 +131,6 @@ def save_state():
     try:
         with open(STATE_FILE, "w") as f:
             json.dump(STATE, f, indent=2)
-        log("💾 Состояние сохранено.")
     except Exception as e:
         log(f"❌ Ошибка при сохранении STATE: {e}")
 
@@ -194,20 +192,32 @@ def trade():
                 q = adjust_qty(q, limits["qty_step"])
                 if q <= 0 or coin_bal < q: continue
                 pnl = (price - b) * q - price * q * 0.001
+                pnl_pct = (price - b) / b
                 min_required_profit = max(price * q * MIN_PROFIT_PCT, MIN_ABSOLUTE_PNL)
+
+                if pnl_pct <= STOP_LOSS_PCT:
+                    session.place_order(category="spot", symbol=sym, side="Sell", orderType="Market", qty=str(q))
+                    log_trade(sym, "SELL (STOP-LOSS)", price, q, pnl)
+                    state["pnl"] += pnl
+                    state["last_stoploss_time"] = time.time()
+                    coin_bal -= q
+                    continue
+
                 if price >= tp and pnl >= min_required_profit:
                     session.place_order(category="spot", symbol=sym, side="Sell", orderType="Market", qty=str(q))
                     log_trade(sym, "SELL", price, q, pnl)
                     state["pnl"] += pnl
-                    coin_bal -= q
                     state["last_sell_price"] = price
+                    coin_bal -= q
                 else:
                     p["tp"] = max(tp, price + params["tp_mult"] * atr)
                     new_positions.append(p)
 
             state["positions"] = new_positions
 
-            if sig == "buy" and state["positions"] and state["avg_count"] < params["max_avg"]:
+            recently_stopped = time.time() - state.get("last_stoploss_time", 0) < 600
+
+            if sig == "buy" and not recently_stopped and state["positions"] and state["avg_count"] < params["max_avg"]:
                 total_qty = sum(p["qty"] for p in state["positions"])
                 avg_price = sum(p["qty"] * p["buy_price"] for p in state["positions"]) / total_qty
                 drawdown = (price - avg_price) / avg_price
@@ -222,9 +232,9 @@ def trade():
                         state["avg_count"] += 1
                         log_trade(sym, "BUY (усреднение)", price, qty, 0)
 
-            if sig == "buy" and not state["positions"] and value < per_sym:
+            if sig == "buy" and not recently_stopped and not state["positions"] and value < per_sym:
                 if abs(price - state["last_sell_price"]) / price < 0.001:
-                    log(f"[{sym}] ⚠️ Пропущена покупка: цена почти как последняя продажа ({price:.4f})", True)
+                    log(f"[{sym}] ⚠️ Покупка пропущена: цена почти как последняя продажа ({price:.4f})")
                     continue
                 usdt_to_use = per_sym - value
                 qty = get_qty(sym, price, usdt_to_use)
@@ -238,7 +248,7 @@ def trade():
             if not state["positions"] and sig == "sell" and coin_bal * price >= limits["min_amt"]:
                 qty = adjust_qty(coin_bal, limits["qty_step"])
                 if qty > 0:
-                    log(f"[{sym}] ℹ️ Продажа пропущена: нет открытой позиции")
+                    log(f"[{sym}] ℹ️ Продажа пропущена: нет позиции")
 
         except Exception as e:
             log(f"[{sym}] ❌ Ошибка: {e}")
@@ -248,7 +258,6 @@ def trade():
         act = sum(len(v["positions"]) for v in STATE.values())
         log(f"⏳ Активных позиций: {act}")
 
-    # === ЕЖЕДНЕВНЫЙ ОТЧЁТ ===
     now = datetime.datetime.now()
     if now.hour == 22 and now.minute >= 30 and LAST_REPORT_DATE != now.date():
         rep_lines = [f"📊 Ежедневный отчёт за {now.strftime('%Y-%m-%d')}"]
@@ -266,10 +275,7 @@ def trade():
             price = get_kline(sym)["c"].iloc[-1]
             value = coin_bal * price
             act = len(state["positions"])
-            drawdowns = []
-            for p in state["positions"]:
-                dd = (price - p["buy_price"]) / p["buy_price"]
-                drawdowns.append(dd)
+            drawdowns = [(price - p["buy_price"]) / p["buy_price"] for p in state["positions"]]
             avg_dd = sum(drawdowns) / len(drawdowns) if drawdowns else 0
             active_positions += act
             total_pnl += pnl
