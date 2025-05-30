@@ -6,8 +6,8 @@ from ta.trend import EMAIndicator, MACD
 from ta.momentum import RSIIndicator
 from ta.volatility import AverageTrueRange, BollingerBands
 
-# === НАСТРОЙКИ ===
 load_dotenv()
+
 API_KEY = os.getenv("BYBIT_API_KEY")
 API_SECRET = os.getenv("BYBIT_API_SECRET")
 TG_TOKEN = os.getenv("TG_TOKEN")
@@ -35,7 +35,6 @@ CYCLE_COUNT = 0
 
 session = HTTP(api_key=API_KEY, api_secret=API_SECRET, recv_window=15000)
 
-# === ЛОГГИРОВАНИЕ ===
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(message)s",
@@ -62,6 +61,7 @@ def adjust_qty(qty, step):
 def signal(df, sym=""):
     if df.empty or len(df) < 50:
         return "none", 0, "недостаточно данных"
+
     df["ema9"] = EMAIndicator(df["c"], 9).ema_indicator()
     df["ema21"] = EMAIndicator(df["c"], 21).ema_indicator()
     df["rsi"] = RSIIndicator(df["c"], 14).rsi()
@@ -71,19 +71,22 @@ def signal(df, sym=""):
     df["macd_signal"] = macd.macd_signal()
     bb = BollingerBands(df["c"])
     df["bb_lower"] = bb.bollinger_lband()
+
     last = df.iloc[-1]
     vol_mean = df["vol"].rolling(20).mean().iloc[-1]
     vol_spike = last["vol"] > vol_mean * 1.2
     recent_growth = df["c"].iloc[-1] / df["c"].iloc[-20] - 1
 
-    log(f"[{sym}] EMA9={last['ema9']:.4f} > EMA21={last['ema21']:.4f} | RSI={last['rsi']:.1f} | MACD={last['macd']:.4f}>{last['macd_signal']:.4f} | Volx={last['vol']/vol_mean:.2f} | Δ24ч={recent_growth*100:.2f}%")
+    log(f"[{sym}] INDICATORS → EMA9={last['ema9']:.4f}, EMA21={last['ema21']:.4f}, RSI={last['rsi']:.1f}, MACD={last['macd']:.4f}/{last['macd_signal']:.4f}, VolX={last['vol']/vol_mean:.2f}, Δ24ч={recent_growth*100:.2f}%")
 
     if recent_growth > 0.05:
         return "none", last["atr"], "🚫 рост >5%, поздно входить"
+
     if last["ema9"] > last["ema21"] and last["rsi"] > 55 and last["macd"] > last["macd_signal"] and vol_spike and last["c"] < last["bb_lower"]:
         return "buy", last["atr"], "💡 BUY сигнал (EMA, RSI, MACD, BB, объём)"
     elif last["ema9"] < last["ema21"] and last["rsi"] < 45 and last["macd"] < last["macd_signal"]:
         return "sell", last["atr"], "🔻 SELL сигнал"
+
     return "none", last["atr"], "нет сигнала"
 def get_kline(sym):
     try:
@@ -157,6 +160,7 @@ def init_positions():
             tp = price + TRAIL_MULTIPLIER * (df["h"] - df["l"]).mean()
             STATE[sym]["positions"].append({"buy_price": price, "qty": qty, "tp": tp})
             log(f"[{sym}] 🔄 Восстановлена позиция: qty={qty}, price={price:.4f}")
+
 def trade():
     global LAST_REPORT_DATE, CYCLE_COUNT
     usdt = get_balance()
@@ -176,6 +180,8 @@ def trade():
             if df.empty: continue
 
             sig, atr, reason = signal(df, sym)
+            log(f"[{sym}] 📡 Сигнал: {sig.upper()} | Причина: {reason}")
+
             price = df["c"].iloc[-1]
             state = STATE[sym]
             limits = LIMITS[sym]
@@ -184,7 +190,6 @@ def trade():
 
             new_positions = []
 
-            # === ПРОВЕРКА НА ПРОДАЖУ ===
             for p in state["positions"]:
                 b, q, tp = p["buy_price"], p["qty"], p["tp"]
                 q = adjust_qty(q, limits["qty_step"])
@@ -210,24 +215,22 @@ def trade():
 
             state["positions"] = new_positions
 
-            # === ПРОВЕРКА НА УСРЕДНЕНИЕ ===
             recently_stopped = time.time() - state.get("last_stoploss_time", 0) < 600
+
             if sig == "buy" and not recently_stopped and state["positions"] and state["avg_count"] < MAX_AVERAGES:
                 total_qty = sum(p["qty"] for p in state["positions"])
                 avg_price = sum(p["qty"] * p["buy_price"] for p in state["positions"]) / total_qty
                 drawdown = (price - avg_price) / avg_price
                 if drawdown < 0 and abs(drawdown) <= 0.10 and value < per_sym:
-                    usdt_to_use = per_sym - value
-                    qty = get_qty(sym, price, usdt_to_use)
+                    qty = get_qty(sym, price, per_sym - value)
                     if qty and qty * price <= usdt:
                         session.place_order(category="spot", symbol=sym, side="Buy", orderType="Market", qty=str(qty))
                         tp = price + TRAIL_MULTIPLIER * atr
                         state["positions"].append({"buy_price": price, "qty": qty, "tp": tp})
                         state["count"] += 1
                         state["avg_count"] += 1
-                        log_trade(sym, "BUY (усреднение)", price, qty, 0, "📉 Усреднение в просадке")
+                        log_trade(sym, "BUY (усреднение)", price, qty, 0, "📉 Усреднение")
 
-            # === ВХОД В СДЕЛКУ ===
             if sig == "buy" and not recently_stopped and not state["positions"] and value < per_sym:
                 if abs(price - state["last_sell_price"]) / price < 0.001:
                     log(f"[{sym}] ⚠️ Пропущена покупка: цена ≈ последней продаже")
@@ -240,16 +243,9 @@ def trade():
                     state["count"] += 1
                     log_trade(sym, "BUY", price, qty, 0, reason)
 
-            # === ПРОПУСК ПРОДАЖИ ===
-            if not state["positions"] and sig == "sell" and coin_bal * price >= limits["min_amt"]:
-                qty = adjust_qty(coin_bal, limits["qty_step"])
-                if qty > 0:
-                    log(f"[{sym}] ℹ️ SELL пропущен: нет активных позиций")
-
         except Exception as e:
-            log(f"[{sym}] ❌ Ошибка: {type(e).__name__}: {e}")
+            log(f"[{sym}] ❌ Ошибка: {type(e).__name__}: {e}", tg=True)
 
-    # === ЕЖЕДНЕВНЫЙ ОТЧЁТ ===
     CYCLE_COUNT += 1
     if CYCLE_COUNT % 3 == 0:
         act = sum(len(v["positions"]) for v in STATE.values())
@@ -268,15 +264,14 @@ def trade():
         LAST_REPORT_DATE = now.date()
 
     save_state()
+
 if __name__ == "__main__":
     log("🚀 Бот запущен", tg=True)
-
-    load_symbol_limits()       # Загружаем лимиты торговых пар
-    init_positions()           # Восстанавливаем позиции из кошелька
-
+    load_symbol_limits()
+    init_positions()
     while True:
         try:
-            trade()            # Основной цикл торговли
+            trade()
         except Exception as e:
-            log(f"🛑 Глобальная ошибка: {type(e).__name__}: {e}")
-        time.sleep(60)         # Пауза между циклами (1 минута)
+            log(f"🛑 Глобальная ошибка: {e}", tg=True)
+        time.sleep(60)
