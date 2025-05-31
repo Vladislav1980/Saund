@@ -25,6 +25,7 @@ DEFAULT_PARAMS = {
     "trail_multiplier": 1.5,
     "max_drawdown_sl": 0.06,
     "min_avg_drawdown": 0.03,
+    "trailing_stop_pct": 0.02,  # 2% откат от максимума — трейлинг
 }
 
 PARAMS_BY_SYMBOL = {
@@ -34,22 +35,15 @@ PARAMS_BY_SYMBOL = {
         "trail_multiplier": 1.4,
         "max_drawdown_sl": 0.05,
         "min_avg_drawdown": 0.03,
+        "trailing_stop_pct": 0.018,
     },
-    "TRXUSDT": {
-        "risk_pct": 0.02,
-        "tp_multiplier": 3.0,
-        "trail_multiplier": 1.3,
-        "max_drawdown_sl": 0.06,
-        "min_avg_drawdown": 0.025,
-    }
-    # Остальные можно добавить по желанию
+    # Добавляй другие монеты при желании
 }
 
-MIN_EXPECTED_PROFIT_USD = 3.0  # Минимальный ожидаемый доход после комиссии
+MIN_EXPECTED_PROFIT_USD = 3.0
 RESERVE_BALANCE = 500
 DAILY_LIMIT = -50
 MIN_TP_PCT = 0.007
-
 COOLDOWN_AVG_SECS = 600
 MAX_AVG_COUNT = 3
 MAX_POSITION_SIZE_USDT = 50
@@ -131,14 +125,21 @@ def signal(df, sym=None):
     df["macd"] = macd.macd()
     df["macd_signal"] = macd.macd_signal()
     df["atr"] = AverageTrueRange(df["h"], df["l"], df["c"]).average_true_range()
+    df["volume_change"] = df["vol"].pct_change().fillna(0)
+
     last = df.iloc[-1]
 
     if sym:
         log(f"[{sym}] INDICATORS → EMA9={last['ema9']:.4f}, EMA21={last['ema21']:.4f}, RSI={last['rsi']:.1f}, MACD={last['macd']:.4f}/{last['macd_signal']:.4f}, ATR={last['atr']:.4f}")
 
-    if last["ema9"] > last["ema21"] and last["macd"] > last["macd_signal"]:
+    # Фильтрация по объёму — не входить на слабой активности
+    if last["volume_change"] < -0.3:
+        return "none", last["atr"], "⛔️ Объём падает"
+
+    # Основные сигналы
+    if last["ema9"] > last["ema21"] and last["macd"] > last["macd_signal"] and last["rsi"] < 70:
         return "buy", last["atr"], "📈 BUY сигнал"
-    elif last["ema9"] < last["ema21"] and last["macd"] < last["macd_signal"]:
+    elif last["ema9"] < last["ema21"] and last["macd"] < last["macd_signal"] and last["rsi"] > 30:
         return "sell", last["atr"], "🔻 SELL сигнал"
     else:
         return "none", last["atr"], "нет сигнала"
@@ -156,25 +157,33 @@ def detect_market_phase(df):
     else:
         return "sideways"
 
+def calc_adaptive_tp(price, atr, qty, params):
+    fee = price * qty * 0.001
+    base_tp = price + params["tp_multiplier"] * atr
+    tp_dollar_min = (MIN_EXPECTED_PROFIT_USD + fee) / qty + price
+    return max(base_tp, tp_dollar_min)
+
+def calc_adaptive_qty(balance, atr, price, sym, risk_pct):
+    risk_usdt = balance * risk_pct
+    qty = risk_usdt / atr
+    step = LIMITS[sym]["qty_step"]
+    return adjust_qty(qty, step)
+
 def log_trade(sym, action, price, qty, pnl, reason):
     value = price * qty
     roi = (pnl / value * 100) if value > 0 else 0
     msg = f"{action} {sym} @ {price:.4f}, qty={qty}, USDT={value:.2f}, PnL={pnl:.4f}, ROI={roi:.2f}% | Причина: {reason}"
     log(msg, tg=True)
 
-def calc_adaptive_tp(price, atr, qty, params):
-    """Вычисление адаптивного TP с учётом комиссий и минимального дохода"""
-    fee = price * qty * 0.001  # 0.1% комиссия
-    base_tp = price + params["tp_multiplier"] * atr
-    tp_dollar_min = (MIN_EXPECTED_PROFIT_USD + fee) / qty + price
-    return max(base_tp, tp_dollar_min)
+def should_exit_by_rsi(df):
+    rsi = df["rsi"].iloc[-1]
+    return rsi >= 80
 
-def calc_adaptive_qty(balance, atr, price, sym, risk_pct):
-    """Рассчёт размера позиции по ATR и риску"""
-    risk_usdt = balance * risk_pct
-    qty = risk_usdt / atr
-    step = LIMITS[sym]["qty_step"]
-    return adjust_qty(qty, step)
+def should_exit_by_trailing(price, peak_price, params):
+    trailing_pct = params["trailing_stop_pct"]
+    if peak_price and price <= peak_price * (1 - trailing_pct):
+        return True
+    return False
 CYCLE_COUNT = 0
 LAST_REPORT_DATE = None
 
@@ -187,6 +196,7 @@ if os.path.exists("state.json"):
                 STATE = json.loads(content)
                 for sym in STATE:
                     for p in STATE[sym]["positions"]:
+                        p.setdefault("peak_price", p["buy_price"])  # для трейлинга
                         log(f"[{sym}] 🔄 Восстановлена позиция: qty={p['qty']}, price={p['buy_price']}")
             else:
                 STATE = {}
@@ -226,7 +236,7 @@ def trade():
             if df.empty: continue
             sig, atr, reason = signal(df, sym)
             phase = detect_market_phase(df)
-            log(f"[{sym}] 📊 Рыночная фаза: {phase}")
+            log(f"[{sym}] 📊 Фаза: {phase} | Сигнал: {sig} | {reason}")
 
             price = df["c"].iloc[-1]
             coin_bal = get_coin_balance(sym)
@@ -234,20 +244,22 @@ def trade():
             now = time.time()
             params = PARAMS_BY_SYMBOL.get(sym, DEFAULT_PARAMS)
 
-            # --- SELL логика ---
+            # --- SELL + Трейлинг + RSI выход ---
             new_positions = []
             for pos in state["positions"]:
                 b, q, tp = pos["buy_price"], pos["qty"], pos["tp"]
-                if coin_bal < q: continue
+                peak = pos.get("peak_price", b)
+                peak = max(peak, price)
                 pnl = (price - b) * q - price * q * 0.001
                 drawdown = (b - price) / b
 
-                if phase == "bear":
-                    tp = price + atr * 0.5
+                should_exit_rsi = should_exit_by_rsi(df)
+                should_exit_trail = should_exit_by_trailing(price, peak, params)
 
-                if price >= tp:
+                if price >= tp or should_exit_rsi or should_exit_trail:
+                    reason_exit = "🎯 TP" if price >= tp else ("📉 RSI>80" if should_exit_rsi else "📉 Трейлинг стоп")
                     session.place_order(category="spot", symbol=sym, side="Sell", orderType="Market", qty=str(q))
-                    log_trade(sym, "SELL", price, q, pnl, "🎯 TP достигнут")
+                    log_trade(sym, "SELL", price, q, pnl, reason_exit)
                     state["pnl"] += pnl
                     coin_bal -= q
                     state["avg_count"] = 0
@@ -259,16 +271,18 @@ def trade():
                     state["avg_count"] = 0
                 else:
                     pos["tp"] = calc_adaptive_tp(price, atr, q, params)
+                    pos["peak_price"] = peak
                     new_positions.append(pos)
+
             state["positions"] = new_positions
 
             # --- BUY логика ---
             if sig == "buy":
                 if phase == "bear":
-                    log(f"[{sym}] ❌ Игнорируем BUY — рынок в фазе BEAR")
+                    log(f"[{sym}] ❌ Игнор BUY — BEAR рынок")
                     continue
                 elif phase == "sideways":
-                    log(f"[{sym}] ⏸ Пауза — рынок флетовый")
+                    log(f"[{sym}] ⏸ Флет — вход нецелесообразен")
                     continue
 
                 if not state["positions"]:
@@ -278,13 +292,18 @@ def trade():
                         expected_profit = (tp - price) * qty - price * qty * 0.001
                         if expected_profit >= MIN_EXPECTED_PROFIT_USD:
                             session.place_order(category="spot", symbol=sym, side="Buy", orderType="Market", qty=str(qty))
-                            state["positions"].append({"buy_price": price, "qty": qty, "tp": tp})
+                            state["positions"].append({
+                                "buy_price": price,
+                                "qty": qty,
+                                "tp": tp,
+                                "peak_price": price
+                            })
                             state["count"] += 1
                             state["volume_total"] += qty * price
                             state["last_avg_time"] = now
                             log_trade(sym, "BUY", price, qty, 0, reason)
                         else:
-                            log(f"[{sym}] ❌ Пропуск BUY — ожидаемая прибыль < {MIN_EXPECTED_PROFIT_USD:.2f} USDT")
+                            log(f"[{sym}] ❌ TP < {MIN_EXPECTED_PROFIT_USD:.2f} USDT → Пропуск")
                     else:
                         log(f"[{sym}] ❌ Недостаточно средств или объём слишком мал")
 
@@ -303,11 +322,16 @@ def trade():
                             expected_profit = (tp - price) * qty - price * qty * 0.001
                             if expected_profit >= MIN_EXPECTED_PROFIT_USD:
                                 session.place_order(category="spot", symbol=sym, side="Buy", orderType="Market", qty=str(qty))
-                                state["positions"].append({"buy_price": price, "qty": qty, "tp": tp})
+                                state["positions"].append({
+                                    "buy_price": price,
+                                    "qty": qty,
+                                    "tp": tp,
+                                    "peak_price": price
+                                })
                                 state["avg_count"] += 1
                                 state["volume_total"] += qty * price
                                 state["last_avg_time"] = now
-                                log_trade(sym, "BUY AVG", price, qty, 0, f"📉 Усреднение при просадке ({drawdown:.2%})")
+                                log_trade(sym, "BUY AVG", price, qty, 0, f"📉 Усреднение ({drawdown:.2%})")
 
             if CYCLE_COUNT % 30 == 0:
                 cb = get_coin_balance(sym)
