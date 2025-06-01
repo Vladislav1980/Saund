@@ -141,9 +141,14 @@ def calc_adaptive_tp(price, atr, qty, params):
 def calc_adaptive_qty(balance, atr, price, sym, risk_pct):
     max_usdt = MAX_POSITION_SIZE_USDT
     risk_usdt = min(balance * risk_pct, max_usdt)
-    qty = risk_usdt / price  # ✅ расчёт по цене, не по ATR
+    qty = risk_usdt / price
     step = LIMITS[sym]["qty_step"]
-    return adjust_qty(qty, step)
+    adjusted_qty = adjust_qty(qty, step)
+
+    # Проверка суммы после округления
+    if adjusted_qty * price < LIMITS[sym]["min_amt"]:
+        return 0
+    return adjusted_qty
 
 def log_trade(sym, action, price, qty, pnl, reason):
     value = price * qty
@@ -158,6 +163,14 @@ def should_exit_by_rsi(df):
 def should_exit_by_trailing(price, peak_price, params):
     trailing_pct = params["trailing_stop_pct"]
     return peak_price and price <= peak_price * (1 - trailing_pct)
+
+def is_profitable_exit(pnl, price, qty, params):
+    """
+    Проверяет, достаточно ли прибыльна позиция для выхода,
+    учитывая комиссию и минимальный допустимый профит.
+    """
+    fee = price * qty * 0.001
+    return pnl >= params["min_profit_usd"] + fee
 
 STATE = {}
 if os.path.exists("state.json"):
@@ -231,8 +244,8 @@ def trade():
 
                 if (
                     price >= tp or
-                    (should_exit_by_rsi(df) and pnl >= params["min_profit_usd"]) or
-                    (should_exit_by_trailing(price, peak, params) and pnl >= params["min_profit_usd"])
+                    (should_exit_by_rsi(df) and is_profitable_exit(pnl, price, q, params)) or
+                    (should_exit_by_trailing(price, peak, params) and is_profitable_exit(pnl, price, q, params))
                 ):
                     if price >= tp:
                         reason_exit = "🎯 TP"
