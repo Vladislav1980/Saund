@@ -221,7 +221,7 @@ def trade():
 
             log(f"[{sym}] 📊 Фаза: {phase} | Сигнал: {sig} | Причина: {reason}")
 
-            # === SELL ===
+                        # === SELL ===
             new_positions = []
             for pos in state["positions"]:
                 b, q, tp = pos["buy_price"], pos["qty"], pos["tp"]
@@ -229,16 +229,28 @@ def trade():
                 pnl = (price - b) * q - price * q * 0.001
                 drawdown = (b - price) / b
 
-                if price >= tp or should_exit_by_rsi(df) or should_exit_by_trailing(price, peak, params):
-                    reason_exit = "🎯 TP" if price >= tp else ("📉 RSI>80" if should_exit_by_rsi(df) else "📉 Трейлинг стоп")
+                if (
+                    price >= tp or
+                    (should_exit_by_rsi(df) and pnl >= params["min_profit_usd"]) or
+                    (should_exit_by_trailing(price, peak, params) and pnl >= params["min_profit_usd"])
+                ):
+                    if price >= tp:
+                        reason_exit = "🎯 TP"
+                    elif should_exit_by_rsi(df):
+                        reason_exit = "📉 RSI>80"
+                    else:
+                        reason_exit = "📉 Трейлинг стоп"
+
                     session.place_order(category="spot", symbol=sym, side="Sell", orderType="Market", qty=str(q))
                     log_trade(sym, "SELL", price, q, pnl, reason_exit)
                     state["pnl"] += pnl
+                    coin_bal -= q
                     state["avg_count"] = 0
                 elif drawdown >= params["max_drawdown_sl"]:
                     session.place_order(category="spot", symbol=sym, side="Sell", orderType="Market", qty=str(q))
                     log_trade(sym, "STOP LOSS", price, q, pnl, f"🔻 SL: просадка {drawdown:.2%}")
                     state["pnl"] += pnl
+                    coin_bal -= q
                     state["avg_count"] = 0
                 else:
                     pos["tp"] = calc_adaptive_tp(price, atr, q, params)
