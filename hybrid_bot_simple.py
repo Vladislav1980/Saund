@@ -145,9 +145,16 @@ def calc_adaptive_qty(balance, atr, price, sym, risk_pct):
     step = LIMITS[sym]["qty_step"]
     adjusted_qty = adjust_qty(qty, step)
 
-    # Проверка суммы после округления
-    if adjusted_qty * price < LIMITS[sym]["min_amt"]:
+    # 🚫 Если qty после округления стал 0 — выход
+    if adjusted_qty == 0:
+        log(f"[{sym}] ❌ qty после округления = 0 — невозможна покупка")
         return 0
+
+    # 💰 Если объём ниже минимально допустимой суммы — выход
+    if adjusted_qty * price < LIMITS[sym]["min_amt"]:
+        log(f"[{sym}] ❌ Сумма {adjusted_qty * price:.2f} < min_amt {LIMITS[sym]['min_amt']:.2f}")
+        return 0
+
     return adjusted_qty
 
 def log_trade(sym, action, price, qty, pnl, reason):
@@ -272,7 +279,7 @@ def trade():
 
             state["positions"] = new_positions
 
-            # === BUY ===
+                        # === BUY ===
             if sig == "buy":
                 if phase == "bear":
                     log(f"[{sym}] ❌ Пропуск BUY — медвежий рынок")
@@ -287,6 +294,11 @@ def trade():
                     qty = calc_adaptive_qty(usdt, atr, price, sym, params["risk_pct"])
                     amt = qty * price
                     log(f"[{sym}] 💰 Попытка покупки qty={qty:.6f}, сумма={amt:.2f} USDT, мин={min_amt:.2f}")
+
+                    # 🔐 Проверка qty и amt после округления
+                    if qty == 0 or amt == 0:
+                        log(f"[{sym}] ❌ qty=0 или сумма=0 — пропуск покупки")
+                        continue
 
                     if qty and min_amt <= amt <= MAX_POSITION_SIZE_USDT:
                         tp = calc_adaptive_tp(price, atr, qty, params)
@@ -319,6 +331,12 @@ def trade():
                     ):
                         qty = calc_adaptive_qty(usdt / 2, atr, price, sym, params["risk_pct"])
                         amt = qty * price
+
+                        # 🔐 Проверка qty и amt после округления
+                        if qty == 0 or amt == 0:
+                            log(f"[{sym}] ❌ qty=0 или сумма=0 — пропуск усреднения")
+                            return
+
                         if qty and amt >= min_amt:
                             tp = calc_adaptive_tp(price, atr, qty, params)
                             profit = (tp - price) * qty - price * qty * 0.001
