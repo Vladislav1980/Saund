@@ -1,4 +1,3 @@
-
 import os, time, math, json, datetime, logging, requests
 import pandas as pd
 from dotenv import load_dotenv
@@ -290,5 +289,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
