@@ -13,13 +13,13 @@ TG_TOKEN = os.getenv("TG_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
 SYMBOLS = [
-    "COMPUSDT","NEARUSDT","TONUSDT","TRXUSDT","XRPUSDT",
-    "ADAUSDT","BCHUSDT","LTCUSDT","AVAXUSDT",
-    "WIFUSDT","ARBUSDT","SUIUSDT","FILUSDT"
+    "COMPUSDT", "NEARUSDT", "TONUSDT", "XRPUSDT",
+    "ADAUSDT", "BCHUSDT", "LTCUSDT", "AVAXUSDT",
+    "SUIUSDT", "FILUSDT"
 ]
 
 DEFAULT_PARAMS = {
-    "risk_pct": 0.01,
+    "risk_pct": 0.03,
     "tp_multiplier": 1.8,
     "trail_multiplier": 1.5,
     "max_drawdown_sl": 0.06,
@@ -31,9 +31,7 @@ DEFAULT_PARAMS = {
 RESERVE_BALANCE = 500
 DAILY_LIMIT = -50
 VOLUME_FILTER = 0.3
-COOLDOWN_AVG_SECS = 3600
-MAX_AVG_COUNT = 3
-MAX_POSITION_SIZE_USDT = 50
+MAX_POSITION_SIZE_USDT = 100
 
 session = HTTP(api_key=API_KEY, api_secret=API_SECRET, recv_window=15000)
 
@@ -165,8 +163,8 @@ def is_profitable_exit(pnl, price, qty, params): return pnl >= params["min_profi
 STATE = {}
 if os.path.exists("state.json"):
     try:
-        content = open("state.json", "r").read().strip()
-        STATE = json.loads(content) if content else {}
+        with open("state.json", "r") as f:
+            STATE = json.load(f)
         for sym in STATE:
             for p in STATE[sym]["positions"]:
                 p.setdefault("peak_price", p["buy_price"])
@@ -176,7 +174,7 @@ if os.path.exists("state.json"):
         STATE = {}
 
 for s in SYMBOLS:
-    STATE.setdefault(s, {"positions": [], "pnl": 0.0, "count": 0, "avg_count": 0, "volume_total": 0.0, "last_avg_time": 0})
+    STATE.setdefault(s, {"positions": [], "pnl": 0.0, "count": 0})
 
 def save_state():
     try:
@@ -216,19 +214,10 @@ def trade():
                 b, q, tp = pos["buy_price"], pos["qty"], pos["tp"]
                 peak = max(pos["peak_price"], price)
                 pnl = (price - b) * q - price * q * 0.001
-                drawdown = (b - price) / b
-                held = now - pos.get("time_open", now)
-
                 if price >= tp or (should_exit_by_rsi(df) and is_profitable_exit(pnl, price, q, params)) or \
-                        (should_exit_by_trailing(price, peak, params) and is_profitable_exit(pnl, price, q, params)):
+                   (should_exit_by_trailing(price, peak, params) and is_profitable_exit(pnl, price, q, params)):
                     session.place_order(category="spot", symbol=sym, side="Sell", orderType="Market", qty=str(q))
                     log_trade(sym, "SELL", price, q, pnl, "🟢 TP/RSI/трейл")
-                elif drawdown >= params["max_drawdown_sl"]:
-                    session.place_order(category="spot", symbol=sym, side="Sell", orderType="Market", qty=str(q))
-                    log_trade(sym, "STOP LOSS", price, q, pnl, "🔻 SL")
-                elif pnl / q / b > 0.02 or held > 12 * 3600 or (phase == "bear" and sig == "none" and pnl > 0):
-                    session.place_order(category="spot", symbol=sym, side="Sell", orderType="Market", qty=str(q))
-                    log_trade(sym, "SELL", price, q, pnl, "🔔 Принуд. выход")
                 else:
                     pos["tp"] = calc_adaptive_tp(price, atr, q, params)
                     pos["peak_price"] = peak
@@ -243,10 +232,8 @@ def trade():
                     profit = (tp - price) * qty - price * qty * 0.001
                     if profit >= params["min_profit_usd"]:
                         session.place_order(category="spot", symbol=sym, side="Buy", orderType="Market", qty=str(qty))
-                        state["positions"].append({"buy_price": price, "qty": qty, "tp": tp, "peak_price": price, "time_open": now})
+                        state["positions"].append({"buy_price": price, "qty": qty, "tp": tp, "peak_price": price})
                         state["count"] += 1
-                        state["volume_total"] += qty * price
-                        state["last_avg_time"] = now
                         log_trade(sym, "BUY", price, qty, 0, reason)
                     else:
                         log(f"[{sym}] ❌ Пропуск — прибыль < мин")
@@ -279,8 +266,8 @@ def daily_report():
         LAST_REPORT_DATE = now.date()
 
 def main():
-    send_tg("🚀 Бот запущен. Фильтр объёма 0.3, TP×1.8, мягкий выход включён.")
-    log("🚀 Бот запущен. Фильтр объёма 0.3, TP×1.8, мягкий выход включён.")
+    send_tg("🚀 Бот запущен. Объём фильтр 0.3, TP×1.8, риск 3%.")
+    log("🚀 Бот запущен. Объём фильтр 0.3, TP×1.8, риск 3%.")
     while True:
         try:
             trade()
@@ -291,5 +278,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
