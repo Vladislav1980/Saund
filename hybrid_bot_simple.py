@@ -1,4 +1,4 @@
-import os, time, math, json, datetime, logging, requests
+import os, time, math, json, datetime, logging, requests, sys
 import pandas as pd
 from dotenv import load_dotenv
 from ta.trend import EMAIndicator, MACD
@@ -6,41 +6,35 @@ from ta.momentum import RSIIndicator
 from ta.volatility import AverageTrueRange
 from pybit.unified_trading import HTTP
 
+# === Загрузка настроек и ключей ===
 load_dotenv()
-API_KEY = os.getenv("BYBIT_API_KEY")
-API_SECRET = os.getenv("BYBIT_API_SECRET")
-TG_TOKEN = os.getenv("TG_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
+API_KEY = os.getenv("BYBIT_API_KEY"); API_SECRET = os.getenv("BYBIT_API_SECRET")
+TG_TOKEN = os.getenv("TG_TOKEN"); CHAT_ID = os.getenv("CHAT_ID")
 
-SYMBOLS = [
-    "COMPUSDT", "NEARUSDT", "TONUSDT", "XRPUSDT",
-    "ADAUSDT", "BCHUSDT", "LTCUSDT", "AVAXUSDT",
-    "SUIUSDT", "FILUSDT"
-]
-
+# === Настройки параметров и символов ===
+SYMBOLS = ["COMPUSDT","NEARUSDT","TONUSDT","TRXUSDT","XRPUSDT",
+           "ADAUSDT","BCHUSDT","LTCUSDT","AVAXUSDT","SUIUSDT","FILUSDT"]
 DEFAULT_PARAMS = {
     "risk_pct": 0.03,
     "tp_multiplier": 1.8,
-    "trail_multiplier": 1.5,
-    "max_drawdown_sl": 0.06,
-    "min_avg_drawdown": 0.03,
     "trailing_stop_pct": 0.02,
-    "min_profit_usd": 5.0
+    "max_drawdown_sl": 0.06,
+    "min_profit_usd": 5.0,
+    "volume_filter": 0.25,
+    "avg_drop_pct": 0.07,
+    "avg_confirm_pct": 0.03
 }
-
 RESERVE_BALANCE = 500
-DAILY_LIMIT = -50
-VOLUME_FILTER = 0.3
-MAX_POSITION_SIZE_USDT = 100
+MAX_POS_USDT = 100
 
 session = HTTP(api_key=API_KEY, api_secret=API_SECRET, recv_window=15000)
 
+# === Логирование ===
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(message)s",
-    handlers=[logging.FileHandler("bot.log", encoding="utf-8"), logging.StreamHandler()]
+    handlers=[logging.FileHandler("bot.log", encoding="utf-8"), logging.StreamHandler(sys.stdout)]
 )
-
 def log(msg): logging.info(msg)
 def send_tg(msg):
     try:
@@ -49,239 +43,160 @@ def send_tg(msg):
     except Exception as e:
         log(f"Telegram error: {e}")
 
-def adjust_qty(qty, step):
-    try:
-        exponent = int(f"{float(step):e}".split("e")[-1])
-        return math.floor(qty * 10**abs(exponent)) / 10**abs(exponent)
-    except:
-        return qty
+# === Загрузка лимитов ===
+LIMITS = {}
+def load_limits():
+    for item in session.get_instruments_info(category="spot")["result"]["list"]:
+        sym = item.get("symbol")
+        if sym in SYMBOLS:
+            f = item.get("lotSizeFilter", {})
+            LIMITS[sym] = {
+                "qty_step": float(f.get("qtyStep",1)),
+                "min_amt": float(item.get("minOrderAmt",10))
+            }
 
-def get_balance():
+# === Балансы ===
+def get_balance(): 
     try:
-        wallets = session.get_wallet_balance(accountType="UNIFIED")["result"]["list"]
-        for w in wallets:
+        for w in session.get_wallet_balance(accountType="UNIFIED")["result"]["list"]:
             for c in w["coin"]:
-                if c["coin"] == "USDT":
-                    return float(c["walletBalance"])
-        return 0
+                if c["coin"]=="USDT": return float(c["walletBalance"])
     except Exception as e:
         log(f"❌ get_balance error: {e}")
-        return 0
+    return 0
 
 def get_coin_balance(sym):
-    coin = sym.replace("USDT","")
+    coin=sym.replace("USDT","")
     try:
-        wallets = session.get_wallet_balance(accountType="UNIFIED")["result"]["list"]
-        for w in wallets:
+        for w in session.get_wallet_balance(accountType="UNIFIED")["result"]["list"]:
             for c in w["coin"]:
-                if c["coin"] == coin:
-                    return float(c["walletBalance"])
-        return 0
-    except:
-        return 0
+                if c["coin"]==coin: return float(c["walletBalance"])
+    except: pass
+    return 0
 
-LIMITS = {}
-def load_symbol_limits():
-    try:
-        data = session.get_instruments_info(category="spot")["result"]["list"]
-        for item in data:
-            if item["symbol"] in SYMBOLS:
-                f = item.get("lotSizeFilter", {})
-                LIMITS[item["symbol"]] = {
-                    "min_qty": float(f.get("minOrderQty", 0.0)),
-                    "qty_step": float(f.get("qtyStep", 1.0)),
-                    "min_amt": float(item.get("minOrderAmt", 10.0))
-                }
-    except Exception as e:
-        log(f"❌ load_symbol_limits error: {e}")
-
+# === Работа с данными ===
 def get_kline(sym):
     try:
-        r = session.get_kline(category="spot", symbol=sym, interval="1", limit=100)
-        df = pd.DataFrame(r["result"]["list"], columns=["ts","o","h","l","c","vol","turn"])
-        df[["o","h","l","c","vol"]] = df[["o","h","l","c","vol"]].astype(float)
-        return df
-    except:
-        return pd.DataFrame()
+        r = session.get_kline(category="spot",symbol=sym,interval="1",limit=100)
+        df=pd.DataFrame(r["result"]["list"],columns=["ts","o","h","l","c","vol","turn"])
+        return df.astype({"o":"float","h":"float","l":"float","c":"float","vol":"float"})
+    except: return pd.DataFrame()
 
-def signal(df, sym=None):
-    df["ema9"] = EMAIndicator(df["c"], window=9).ema_indicator()
-    df["ema21"] = EMAIndicator(df["c"], window=21).ema_indicator()
-    df["rsi"] = RSIIndicator(df["c"]).rsi()
-    macd = MACD(df["c"])
-    df["macd"] = macd.macd()
-    df["macd_signal"] = macd.macd_signal()
-    df["atr"] = AverageTrueRange(df["h"], df["l"], df["c"]).average_true_range()
-    df["volume_change"] = df["vol"].pct_change().fillna(0)
-    last = df.iloc[-1]
-    if sym:
-        log(f"[{sym}] IND → EMA9={last['ema9']:.4f}, EMA21={last['ema21']:.4f}, RSI={last['rsi']:.1f}, MACD={last['macd']:.4f}/{last['macd_signal']:.4f}, ATR={last['atr']:.4f}")
-    if last["volume_change"] < -VOLUME_FILTER:
-        return "none", last["atr"], "⛔️ Объём упал сильно"
+def adjust_qty(qty, step):
+    exp=int(f"{step:e}".split("e")[-1])
+    return math.floor(qty * 10**abs(exp)) / 10**abs(exp)
+
+# === Сигналы ===
+def signal(df,sym):
+    df["ema9"]=EMAIndicator(df["c"],9).ema_indicator()
+    df["ema21"]=EMAIndicator(df["c"],21).ema_indicator()
+    df["rsi"]=RSIIndicator(df["c"]).rsi()
+    macd=MACD(df["c"])
+    df["macd"],df["macd_signal"]=macd.macd(),macd.macd_signal()
+    df["atr"]=AverageTrueRange(df["h"],df["l"],df["c"]).average_true_range()
+    df["vol_ch"]=df["vol"].pct_change().fillna(0)
+    last=df.iloc[-1]
+    log(f"[{sym}] EMA9={last['ema9']:.4f}, EMA21={last['ema21']:.4f}, RSI={last['rsi']:.1f}, MACD={last['macd']:.4f}/{last['macd_signal']:.4f}, volΔ={last['vol_ch']:.2f}, ATR={last['atr']:.4f}")
+    if last["vol_ch"] < -DEFAULT_PARAMS["volume_filter"]:
+        return "none", last["atr"], "volume drop"
     if last["ema9"] > last["ema21"] and last["macd"] > last["macd_signal"]:
-        return "buy", last["atr"], "📈 BUY сигнал (агрессивный)"
-    elif last["ema9"] < last["ema21"] and last["macd"] < last["macd_signal"]:
-        return "sell", last["atr"], "🔻 SELL сигнал"
-    else:
-        return "none", last["atr"], "нет сигнала"
+        return "buy", last["atr"], "buy signal"
+    if last["ema9"] < last["ema21"] and last["macd"] < last["macd_signal"]:
+        return "sell", last["atr"], "sell signal"
+    return "none", last["atr"], "no signal"
 
-def detect_market_phase(df):
-    if df["ema9"].iloc[-1] > df["ema21"].iloc[-1] and df["macd"].iloc[-1] > df["macd_signal"].iloc[-1]:
-        return "bull"
-    elif df["ema9"].iloc[-1] < df["ema21"].iloc[-1] and df["macd"].iloc[-1] < df["macd_signal"].iloc[-1]:
-        return "bear"
-    else:
-        return "sideways"
-
-def calc_adaptive_tp(price, atr, qty, params):
-    fee = price * qty * 0.001
-    base_tp = price + params["tp_multiplier"] * atr
-    tp_min = (params["min_profit_usd"] + fee) / qty + price
-    return max(base_tp, tp_min)
-
-def calc_adaptive_qty(balance, atr, price, sym, risk_pct):
-    risk_usdt = min(balance * risk_pct, MAX_POSITION_SIZE_USDT)
-    qty = risk_usdt / price
-    step = LIMITS[sym]["qty_step"]
-    adjusted = adjust_qty(qty, step)
-    if adjusted == 0 or adjusted * price < LIMITS[sym]["min_amt"]:
-        log(f"[{sym}] ❌ qty после округления = {adjusted} / сумма не подходит")
-        return 0
-    return adjusted
-
-def log_trade(sym, action, price, qty, pnl, reason):
-    val = price * qty
-    roi = (pnl / val * 100) if val > 0 else 0
-    msg = f"{action} {sym} @ {price:.4f}, qty={qty:.6f}, USDT={val:.2f}, PnL={pnl:.4f}, ROI={roi:.2f}% | {reason}"
-    log(msg)
-    send_tg(msg)
-
-def should_exit_by_rsi(df): return df["rsi"].iloc[-1] >= 80
-def should_exit_by_trailing(price, peak, params): return peak and price <= peak * (1 - params["trailing_stop_pct"])
-def is_profitable_exit(pnl, price, qty, params): return pnl >= params["min_profit_usd"] + price * qty * 0.001
-
+# === Состояние ===
 STATE = {}
 if os.path.exists("state.json"):
     try:
-        with open("state.json", "r") as f:
-            STATE = json.load(f)
-        for sym in STATE:
-            for p in STATE[sym]["positions"]:
-                p.setdefault("peak_price", p["buy_price"])
-                log(f"[{sym}] 🔄 Восстановлена позиция: qty={p['qty']}, price={p['buy_price']}")
-    except Exception as e:
-        log(f"❌ state.json error: {e}")
-        STATE = {}
-
+        STATE=json.load(open("state.json"))
+    except:
+        STATE={}
 for s in SYMBOLS:
-    STATE.setdefault(s, {"positions": [], "pnl": 0.0, "count": 0})
+    STATE.setdefault(s,{"positions":[], "last_buy_price":0})
 
 def save_state():
-    try:
-        with open("state.json", "w") as f:
-            json.dump(STATE, f, indent=2)
-    except Exception as e:
-        log(f"❌ save_state error: {e}")
+    json.dump(STATE, open("state.json","w"), indent=2)
 
-CYCLE_COUNT = 0
-LAST_REPORT_DATE = None
-
+# === Торговый цикл ===
 def trade():
-    global CYCLE_COUNT
-    usdt = get_balance()
-    log(f"💰 USDT Баланс: {usdt:.2f}")
-    if usdt < RESERVE_BALANCE or sum(STATE[s]["pnl"] for s in SYMBOLS) < DAILY_LIMIT:
+    bal=get_balance(); log(f"Balance USDT: {bal:.2f}")
+    if bal < RESERVE_BALANCE: 
+        log("🛑 Баланс ниже резерва.")
         return
-    CYCLE_COUNT += 1
-    load_symbol_limits()
-
+    load_limits()
     for sym in SYMBOLS:
-        try:
-            df = get_kline(sym)
-            if df.empty:
+        df=get_kline(sym)
+        if df.empty: continue
+        sig, atr, reason = signal(df,sym)
+        price=df["c"].iloc[-1]
+        state=STATE[sym]
+        # Продажа по балансу, если выгодно
+        coin_bal=get_coin_balance(sym)
+        if coin_bal>0:
+            est_pnl=(price - state.get("avg_price",price))*coin_bal - price*coin_bal*0.001
+            if est_pnl >= DEFAULT_PARAMS["min_profit_usd"]:
+                session.place_order(category="spot",symbol=sym,side="Sell",orderType="Market",qty=str(coin_bal))
+                msg=f"💸 SELL balance {sym}@{price:.4f}, qty={coin_bal}, PnL≈{est_pnl:.2f}"
+                log(msg); send_tg(msg)
+                state["positions"]=[]; state["last_buy_price"]=0
                 continue
-            sig, atr, reason = signal(df, sym)
-            phase = detect_market_phase(df)
-            price = df["c"].iloc[-1]
-            state = STATE[sym]
-            now = time.time()
-            params = DEFAULT_PARAMS
+        # Управление текущими позициями
+        new_pos=[]
+        for pos in state["positions"]:
+            b,q,tp,peak=pos["buy"],pos["qty"],pos["tp"],pos["peak"]
+            pnl=(price-b)*q - price*q*0.001
+            draw=(b-price)/b
+            peak=max(peak,price)
+            if price>=tp or price<=peak*(1-DEFAULT_PARAMS["trailing_stop_pct"]) or draw>=DEFAULT_PARAMS["max_drawdown_sl"] or sig=="sell":
+                session.place_order(category="spot",symbol=sym,side="Sell",orderType="Market",qty=str(q))
+                msg=f"💸 SELL {sym}@{price:.4f}, qty={q}, PnL={pnl:.2f}"
+                log(msg); send_tg(msg)
+            else:
+                pos["tp"]=max(tp, price+DEFAULT_PARAMS["tp_multiplier"]*atr)
+                pos["peak"]=peak
+                new_pos.append(pos)
+        state["positions"]=new_pos
 
-            log(f"[{sym}] 📊 Фаза: {phase} | Сигнал: {sig} | Причина: {reason}")
-
-            new_positions = []
-            for pos in state["positions"]:
-                b, q, tp = pos["buy_price"], pos["qty"], pos["tp"]
-                peak = max(pos["peak_price"], price)
-                pnl = (price - b) * q - price * q * 0.001
-                if price >= tp or (should_exit_by_rsi(df) and is_profitable_exit(pnl, price, q, params)) or \
-                   (should_exit_by_trailing(price, peak, params) and is_profitable_exit(pnl, price, q, params)):
-                    session.place_order(category="spot", symbol=sym, side="Sell", orderType="Market", qty=str(q))
-                    log_trade(sym, "SELL", price, q, pnl, "🟢 TP/RSI/трейл")
-                else:
-                    pos["tp"] = calc_adaptive_tp(price, atr, q, params)
-                    pos["peak_price"] = peak
-                    new_positions.append(pos)
-
-            state["positions"] = new_positions
-
-            if sig == "buy" and phase != "bear":
-                qty = calc_adaptive_qty(usdt, atr, price, sym, params["risk_pct"])
-                if qty:
-                    tp = calc_adaptive_tp(price, atr, qty, params)
-                    profit = (tp - price) * qty - price * qty * 0.001
-                    if profit >= params["min_profit_usd"]:
-                        session.place_order(category="spot", symbol=sym, side="Buy", orderType="Market", qty=str(qty))
-                        state["positions"].append({"buy_price": price, "qty": qty, "tp": tp, "peak_price": price})
-                        state["count"] += 1
-                        log_trade(sym, "BUY", price, qty, 0, reason)
-                    else:
-                        log(f"[{sym}] ❌ Пропуск — прибыль < мин")
-                else:
-                    log(f"[{sym}] ❌ Пропуск — qty не вычислен")
-
-            if CYCLE_COUNT % 30 == 0:
-                cb = get_coin_balance(sym)
-                if cb:
-                    log(f"[{sym}] 📦 Баланс: {cb:.2f} ({cb * price:.2f} USDT)")
-        except Exception as e:
-            log(f"[{sym}] ❌ Ошибка: {type(e).__name__} — {e}")
-
+        # Покупка / усреднение
+        if sig=="buy":
+            if state["positions"]:
+                last_price=state["last_buy_price"]
+                drop_pct=(last_price-price)/last_price if last_price else 0
+                if drop_pct>=DEFAULT_PARAMS["avg_drop_pct"]:
+                    qty_usdt=min(bal*DEFAULT_PARAMS["risk_pct"], MAX_POS_USDT)
+                    qty=adjust_qty(qty_usdt/price, LIMITS[sym]["qty_step"])
+                    if qty*price>=LIMITS[sym]["min_amt"]:
+                        tp=price+DEFAULT_PARAMS["tp_multiplier"]*atr
+                        session.place_order(category="spot",symbol=sym,side="Buy",orderType="Market",qty=str(qty))
+                        msg=f"↔️ AVG {sym}@{price:.4f}, qty={qty}"
+                        log(msg); send_tg(msg)
+                        total_qty=sum(p["qty"] for p in state["positions"])+qty
+                        avg_price=(sum(p["buy"]*p["qty"] for p in state["positions"])+price*qty)/total_qty
+                        state["positions"].append({"buy":price,"qty":qty,"tp":tp,"peak":price})
+                        state["last_buy_price"]=avg_price
+            else:
+                qty_usdt=min(bal*DEFAULT_PARAMS["risk_pct"], MAX_POS_USDT)
+                qty=adjust_qty(qty_usdt/price, LIMITS[sym]["qty_step"])
+                if qty*price>=LIMITS[sym]["min_amt"]:
+                    tp=price+DEFAULT_PARAMS["tp_multiplier"]*atr
+                    session.place_order(category="spot",symbol=sym,side="Buy",orderType="Market",qty=str(qty))
+                    msg=f"🟢 BUY {sym}@{price:.4f}, qty={qty}"
+                    log(msg); send_tg(msg)
+                    state["positions"]=[{"buy":price,"qty":qty,"tp":tp,"peak":price}]
+                    state["last_buy_price"]=price
     save_state()
 
-def daily_report():
-    global LAST_REPORT_DATE
-    now = datetime.datetime.now()
-    if now.hour == 22 and LAST_REPORT_DATE != now.date():
-        total_pnl = sum(STATE[s]["pnl"] for s in SYMBOLS)
-        rep = f"📊 Отчёт за {now.date()}:\n\nМонета     | Сделок  | PnL\n" + "-" * 30 + "\n"
-        for sym, data in STATE.items():
-            rep += f"{sym:<10} | {data['count']:<7} | {data['pnl']:.2f} USDT\n"
-        rep += "-" * 30 + f"\n💰 Баланс: {get_balance():.2f} USDT\n📈 Общий PnL: {total_pnl:.2f} USDT"
-        send_tg(rep)
-        for sym in SYMBOLS:
-            STATE[sym]["count"] = 0
-            STATE[sym]["pnl"] = 0.0
-        save_state()
-        LAST_REPORT_DATE = now.date()
-
+# === Главная функция ===
 def main():
-    send_tg("🚀 Бот запущен. Объём фильтр 0.3, TP×1.8, риск 3%.")
-    log("🚀 Бот запущен. Объём фильтр 0.3, TP×1.8, риск 3%.")
+    send_tg("🚀 Бот запущен с подробными логами, TP/SL/Trailing/Averaging enabled.")
     while True:
         try:
             trade()
-            daily_report()
         except Exception as e:
-            log(f"❌ Главная ошибка: {type(e).__name__} — {e}")
+            log(f"❌ Ошибка: {e}")
+            send_tg(f"❌ Ошибка: {e}")
         time.sleep(60)
 
-if __name__ == "__main__":
+if __name__=="__main__":
     main()
-
-
-
-
-
-
-
