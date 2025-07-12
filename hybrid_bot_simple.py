@@ -137,7 +137,7 @@ def trade():
         elif last5["ema9"]<last5["ema21"] and last5["macd"]<last5["macd_s"]:
             sig = "sell"
 
-        trend_ok = any(check_trend(sym, tf) for tf in ["60", "240", "1440"])
+        trend_ok = any(check_trend(sym, tf) for tf in ["60", "240", "D"])
         if sig=="buy" and not trend_ok:
             log(f"{sym} пропущен: нет MTF тренда")
             sig = "none"
