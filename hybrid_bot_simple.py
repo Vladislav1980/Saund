@@ -5,7 +5,6 @@ from ta.trend import EMAIndicator, MACD
 from ta.momentum import RSIIndicator
 from ta.volatility import AverageTrueRange
 from pybit.unified_trading import HTTP
-import matplotlib.pyplot as plt
 
 # --- Конфигурация ---
 load_dotenv()
@@ -124,6 +123,8 @@ for s in SYMBOLS:
 
 def save_state():
     json.dump(STATE, open("state.json", "w"), indent=2)
+
+
 def trade():
     bal = get_balance()
     log(f"Баланс USDT: {bal:.2f}")
@@ -201,8 +202,6 @@ def trade():
                 txt = f"SELL {sym}@{price:.4f}, qty={q:.6f}, pnl={pnl:.2f} via {reason}"
                 log(txt)
                 send_tg(txt)
-                with open("trades.csv", "a") as f:
-                    f.write(f"{datetime.datetime.now()},{sym},SELL,{price:.4f},{q:.6f}\n")
                 state["pnl"] += pnl
                 state["count"] += 1
                 state["pos"] = None
@@ -224,8 +223,6 @@ def trade():
                         txt = f"BUY {sym}@{price:.4f}, qty={qty:.6f}, TP~{tp:.4f}"
                         log(txt)
                         send_tg(txt)
-                        with open("trades.csv", "a") as f:
-                            f.write(f"{datetime.datetime.now()},{sym},BUY,{price:.4f},{qty:.6f}\n")
                     else:
                         log(f"{sym} пропущен: est_profit={(est_profit + DEFAULT_PARAMS['min_profit_usdt']):.2f} < min")
                 else:
@@ -252,16 +249,12 @@ def trade():
                     txt = f"SELL SIGNAL {sym}@{price:.4f}, qty={qty:.6f} по индикаторам EMA/MACD"
                     log(txt)
                     send_tg(txt)
-                    with open("trades.csv", "a") as f:
-                        f.write(f"{datetime.datetime.now()},{sym},SELL,{price:.4f},{qty:.6f}\n")
                     state["pos"] = None
                 elif profit_sell:
                     session.place_order(category="spot", symbol=sym, side="Sell", orderType="Market", qty=str(qty))
                     txt = f"SELL PROFIT {sym}@{price:.4f}, qty={qty:.6f}, (+5% и ATR от {last_buy_price:.4f})"
                     log(txt)
                     send_tg(txt)
-                    with open("trades.csv", "a") as f:
-                        f.write(f"{datetime.datetime.now()},{sym},SELL,{price:.4f},{qty:.6f}\n")
                     state["pos"] = None
                 else:
                     log(f"{sym}: на балансе {cb:.4f}, но условий для продажи нет (EMA/MACD, 5% или ATR)")
@@ -284,34 +277,6 @@ def trade():
     save_state()
 
 
-def visualize_trades(symbol="TONUSDT"):
-    try:
-        df = pd.read_csv("trades.csv", header=None,
-                         names=["time", "symbol", "side", "price", "qty"],
-                         parse_dates=["time"])
-        df = df[df["symbol"] == symbol].copy()
-        if df.empty:
-            log(f"📉 Нет сделок для визуализации по {symbol}")
-            return
-        df.sort_values("time", inplace=True)
-        buys = df[df["side"] == "BUY"]
-        sells = df[df["side"] == "SELL"]
-        plt.figure(figsize=(12, 6))
-        plt.plot(df["time"], df["price"], label="Цена", color="gray", alpha=0.6)
-        plt.scatter(buys["time"], buys["price"], label="BUY", marker="^", color="green")
-        plt.scatter(sells["time"], sells["price"], label="SELL", marker="v", color="red")
-        plt.title(f"Сделки по {symbol}")
-        plt.xlabel("Время")
-        plt.ylabel("Цена USDT")
-        plt.legend()
-        plt.grid(True)
-        plt.tight_layout()
-        plt.savefig(f"plot_{symbol}.png")
-        log(f"📊 Визуализация сохранена: plot_{symbol}.png")
-    except Exception as e:
-        log(f"Ошибка визуализации {symbol}: {e}")
-
-
 def daily_report():
     d = datetime.datetime.now()
     if d.hour == 22:
@@ -323,8 +288,6 @@ def daily_report():
         for s in SYMBOLS:
             STATE[s]["count"] = 0
             STATE[s]["pnl"] = 0.0
-        for s in SYMBOLS:
-            visualize_trades(s)
         save_state()
 
 
