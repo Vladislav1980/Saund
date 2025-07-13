@@ -3,4 +3,6 @@ pandas
 python-dotenv
 pybit
 ta
+ccxt
+schedule
 
