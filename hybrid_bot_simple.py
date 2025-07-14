@@ -8,7 +8,7 @@ from pybit.unified_trading import HTTP
 
 # --- Список монет ---
 SYMBOLS = [
-    "ARBUSDT", "TRXUSDT", "DOGEUSDT", "MASKUSDT",
+    "ARBUSDT", "TRXUSDT", "DOGEUSDT",
     "NEARUSDT", "COMPUSDT", "TONUSDT", "XRPUSDT",
     "ADAUSDT", "BCHUSDT", "LTCUSDT", "AVAXUSDT",
     "SUIUSDT", "FILUSDT"
