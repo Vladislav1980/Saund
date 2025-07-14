@@ -92,7 +92,13 @@ if os.path.exists("state.json"):
     try: STATE=json.load(open("state.json"))
     except: STATE={}
 for s in SYMBOLS:
-    STATE.setdefault(s,{"pos":None,"last_rebuy":0,"count":0,"pnl":0.0})
+    STATE.setdefault(s,{
+        "pos": None,
+        "last_rebuy": 0,
+        "count": 0,
+        "pnl": 0.0,
+        "last_sig": None
+    })
 def save_state(): json.dump(STATE, open("state.json","w"), indent=2)
 
 def trade():
@@ -134,13 +140,17 @@ def trade():
             logs[tf]=f"{'OK' if ok else 'fail'} EMA9={last['ema9']:.2f},EMA21={last['ema21']:.2f},MACD={last['macd']:.4f}/{last['macd_s']:.4f},RSI={last['rsi']:.1f},ATR={last['atr']:.4f}"
             if sig=="buy" and not ok: mt_ok=False
 
-        if sig=="buy" and not mt_ok:
-            log(f"{sym} 5m=BUY, но MTF не подтвердил:")
-            for tf in ["15","60","240"]:
-                log(f"   {tf}m -> {logs.get(tf,'')}")
-            sig="none"
-
         state=STATE[sym]; pos=state["pos"]
+
+        if sig == "buy" and not mt_ok:
+            if state.get("last_sig") != "buy_mtf_fail":
+                log(f"{sym} 5m=BUY, но MTF не подтвердил:")
+                for tf in ["15","60","240"]:
+                    log(f"   {tf}m -> {logs.get(tf,'')}")
+                state["last_sig"] = "buy_mtf_fail"
+            sig = "none"
+        else:
+            state["last_sig"] = None  # сброс, если сигнал другой или подтверждён
 
         # 🟢 Покупка
         if sig=="buy":
@@ -163,11 +173,10 @@ def trade():
                     log(f"{sym} пропущен: qty*price={(qty*price):.2f}<min_amt")
             continue
 
-        # 🔴 Продажа (только при сигнале или профите)
+        # 🔴 Продажа
         if cb > 0 and sym in LIMITS:
             qty = adjust(cb, LIMITS[sym]["step"])
-            if qty == 0:
-                continue
+            if qty == 0: continue
             sell_signal = last5["ema9"] < last5["ema21"] and last5["macd"] < last5["macd_s"]
             last_buy = state.get("last_manual_buy", 0)
             threshold_price_pct = last_buy * (1 + 0.05) if last_buy else 0
@@ -181,7 +190,7 @@ def trade():
                 log(txt); send_tg(txt)
                 state["pos"]=None
 
-        # 📊 Управление открытой позицией
+        # 🧠 Управление позицией
         if state["pos"]:
             b,q,tp,peak = state["pos"]["buy_price"],state["pos"]["qty"],state["pos"]["tp"],state["pos"]["peak"]
             pnl=(price-b)*q-price*q*0.001
@@ -202,7 +211,7 @@ def trade():
             else:
                 state["pos"].update({"tp":max(tp,price+DEFAULT_PARAMS["tp_multiplier"]*atr),"peak":peak})
 
-        # 📉 Усреднение
+        # 🔁 Усреднение
         if state["pos"] and price <= state["pos"]["buy_price"]*(1-DEFAULT_PARAMS["avg_rebuy_drop_pct"]) and now-state["last_rebuy"]>=DEFAULT_PARAMS["rebuy_cooldown_secs"]:
             extra_usd=min(bal*DEFAULT_PARAMS["risk_pct"],MAX_POS_USDT)
             extra_qty=adjust(extra_usd/price,LIMITS[sym]["step"])
@@ -217,7 +226,7 @@ def trade():
 
     save_state()
 
-# 📆 Отчёт раз в день
+# 📅 Ежедневный отчёт
 LAST_REPORT_FILE = "last_report.txt"
 def daily_report():
     now = datetime.datetime.now()
