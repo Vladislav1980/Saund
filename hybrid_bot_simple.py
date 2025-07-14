@@ -27,7 +27,6 @@ MAX_POS_USDT=100
 session = HTTP(api_key=API_KEY, api_secret=API_SECRET, recv_window=15000)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s",
                     handlers=[logging.FileHandler("bot.log", encoding="utf-8"), logging.StreamHandler()])
-
 def log(msg): logging.info(msg)
 def send_tg(msg):
     try:
@@ -103,10 +102,16 @@ def trade():
         return
     load_limits(); now=time.time()
     for sym in SYMBOLS:
-        df5=get_klines(sym,"5"); 
-        df15=get_klines(sym,"15")
+        df5=get_klines(sym,"5"); df15=get_klines(sym,"15")
         if df5.empty or df15.empty: continue
         df5=signal(df5); df15=signal(df15); last5=df5.iloc[-1]
+        price=last5["c"]; atr=last5["atr"]
+        cb=get_coin_balance(sym)
+
+        # ✅ Фильтр минимального баланса
+        min_sell_usdt = 2
+        if cb * price < min_sell_usdt and not STATE[sym]["pos"]:
+            continue
 
         vol_ch=last5["vol_ch"]; sig="none"
         if vol_ch < -DEFAULT_PARAMS["volume_filter"]:
@@ -135,10 +140,9 @@ def trade():
                 log(f"   {tf}m -> {logs.get(tf,'')}")
             sig="none"
 
-        price=last5["c"]; atr=last5["atr"]
         state=STATE[sym]; pos=state["pos"]
 
-        # сначала покупаем/усредняем, если есть сигнал buy
+        # 🟢 Покупка
         if sig=="buy":
             qty_usd=min(bal*DEFAULT_PARAMS["risk_pct"],MAX_POS_USDT)
             qty=qty_usd/price
@@ -157,29 +161,27 @@ def trade():
                         log(f"{sym} пропущен: est_profit={(est_profit+DEFAULT_PARAMS['min_profit_usdt']):.2f}<min")
                 else:
                     log(f"{sym} пропущен: qty*price={(qty*price):.2f}<min_amt")
-            continue  # пропускаем другие ветви
+            continue
 
-        # затем продажи по наличию баланса
-        cb=get_coin_balance(sym)
-        if cb>0 and sym in LIMITS:
-            qty=adjust(cb,LIMITS[sym]["step"])
-            if qty==0:
-                log(f"{sym} qty=0 после округления sell")
-            else:
-                sell_signal = last5["ema9"]<last5["ema21"] and last5["macd"]<last5["macd_s"]
-                last_buy=state.get("last_manual_buy",0)
-                threshold_price_pct=last_buy*(1+0.05) if last_buy else 0
-                threshold_price_atr=last_buy+DEFAULT_PARAMS["tp_multiplier"]*atr if last_buy else 0
-                profit_sell = last_buy>0 and price>=max(threshold_price_pct,threshold_price_atr)
-                if sell_signal or profit_sell:
-                    typ="SIGNAL" if sell_signal else "PROFIT"
-                    session.place_order(category="spot",symbol=sym,side="Sell",orderType="Market",qty=str(qty))
-                    txt=f"SELL {typ} {sym}@{price:.4f}, qty={qty:.6f}"
-                    log(txt); send_tg(txt)
-                    state["pos"]=None
-                else:
-                    log(f"{sym}: баланс={cb:.4f}, но нет условий для продажи")
-        # управление открытой позицией
+        # 🔴 Продажа (только при сигнале или профите)
+        if cb > 0 and sym in LIMITS:
+            qty = adjust(cb, LIMITS[sym]["step"])
+            if qty == 0:
+                continue
+            sell_signal = last5["ema9"] < last5["ema21"] and last5["macd"] < last5["macd_s"]
+            last_buy = state.get("last_manual_buy", 0)
+            threshold_price_pct = last_buy * (1 + 0.05) if last_buy else 0
+            threshold_price_atr = last_buy + DEFAULT_PARAMS["tp_multiplier"] * atr if last_buy else 0
+            profit_sell = last_buy > 0 and price >= max(threshold_price_pct, threshold_price_atr)
+
+            if sell_signal or profit_sell:
+                typ = "SIGNAL" if sell_signal else "PROFIT"
+                session.place_order(category="spot",symbol=sym,side="Sell",orderType="Market",qty=str(qty))
+                txt = f"SELL {typ} {sym}@{price:.4f}, qty={qty:.6f}"
+                log(txt); send_tg(txt)
+                state["pos"]=None
+
+        # 📊 Управление открытой позицией
         if state["pos"]:
             b,q,tp,peak = state["pos"]["buy_price"],state["pos"]["qty"],state["pos"]["tp"],state["pos"]["peak"]
             pnl=(price-b)*q-price*q*0.001
@@ -200,7 +202,7 @@ def trade():
             else:
                 state["pos"].update({"tp":max(tp,price+DEFAULT_PARAMS["tp_multiplier"]*atr),"peak":peak})
 
-        # усреднение
+        # 📉 Усреднение
         if state["pos"] and price <= state["pos"]["buy_price"]*(1-DEFAULT_PARAMS["avg_rebuy_drop_pct"]) and now-state["last_rebuy"]>=DEFAULT_PARAMS["rebuy_cooldown_secs"]:
             extra_usd=min(bal*DEFAULT_PARAMS["risk_pct"],MAX_POS_USDT)
             extra_qty=adjust(extra_usd/price,LIMITS[sym]["step"])
@@ -212,17 +214,30 @@ def trade():
                 state["last_rebuy"]=now
                 txt=f"AVERAGE {sym}: +{extra_qty:.6f}@{price:.4f} => avg {avg:.4f}"
                 log(txt); send_tg(txt)
+
     save_state()
 
+# 📆 Отчёт раз в день
+LAST_REPORT_FILE = "last_report.txt"
 def daily_report():
-    d=datetime.datetime.now()
-    if d.hour==22:
-        rep="📊 Ежедневный отчет\n"
-        for s in SYMBOLS: rep+=f"{s}: trades={STATE[s]['count']}, pnl={STATE[s]['pnl']:.2f}\n"
-        rep+=f"Баланс={get_balance():.2f}"
+    now = datetime.datetime.now()
+    today = now.date()
+    last_sent_date = None
+    if os.path.exists(LAST_REPORT_FILE):
+        with open(LAST_REPORT_FILE) as f:
+            last_sent_date = f.read().strip()
+    if str(today) != last_sent_date and now.hour == 22:
+        rep = "📊 Ежедневный отчет\n"
+        for s in SYMBOLS:
+            rep += f"{s}: trades={STATE[s]['count']}, pnl={STATE[s]['pnl']:.2f}\n"
+        rep += f"Баланс={get_balance():.2f}"
         send_tg(rep)
-        for s in SYMBOLS: STATE[s]["count"]=0; STATE[s]["pnl"]=0.0
+        for s in SYMBOLS:
+            STATE[s]["count"] = 0
+            STATE[s]["pnl"] = 0.0
         save_state()
+        with open(LAST_REPORT_FILE, "w") as f:
+            f.write(str(today))
 
 def main():
     log("🚀 Bot start full logs + MTF (5m/15m/1h/4h)")
