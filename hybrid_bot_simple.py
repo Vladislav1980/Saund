@@ -13,9 +13,12 @@ SYMBOLS = [
     "ADAUSDT", "BCHUSDT", "LTCUSDT", "AVAXUSDT",
     "SUIUSDT", "FILUSDT"
 ]
+
 load_dotenv()
-API_KEY = os.getenv("BYBIT_API_KEY"); API_SECRET = os.getenv("BYBIT_API_SECRET")
-TG_TOKEN = os.getenv("TG_TOKEN"); CHAT_ID = os.getenv("CHAT_ID")
+API_KEY = os.getenv("BYBIT_API_KEY")
+API_SECRET = os.getenv("BYBIT_API_SECRET")
+TG_TOKEN = os.getenv("TG_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
 
 DEFAULT_PARAMS = {
     "risk_pct": 0.03, "tp_multiplier": 1.8, "trailing_stop_pct": 0.02,
@@ -35,7 +38,9 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
+
 def log(msg): logging.info(msg)
+
 def send_tg(msg):
     try:
         requests.post(
@@ -68,25 +73,25 @@ def get_balance():
     return 0
 
 def get_coin_balance(sym):
-    coin=sym.replace("USDT","")
+    coin = sym.replace("USDT", "")
     try:
         for w in session.get_wallet_balance(accountType="UNIFIED")["result"]["list"]:
             for c in w["coin"]:
-                if c["coin"]==coin: return float(c["walletBalance"])
+                if c["coin"] == coin: return float(c["walletBalance"])
     except: pass
     return 0
 
 def get_klines(sym, interval="5", limit=100):
     try:
         r = session.get_kline(category="spot", symbol=sym, interval=interval, limit=limit)
-        return pd.DataFrame(r["result"]["list"], columns=["ts","o","h","l","c","vol","turn"]).astype(float)
+        return pd.DataFrame(r["result"]["list"], columns=["ts", "o", "h", "l", "c", "vol", "turn"]).astype(float)
     except Exception as e:
         log(f"klines err {sym}@{interval}: {e}")
         return pd.DataFrame()
 
 def adjust(qty, step):
     e = int(f"{step:e}".split("e")[-1])
-    return math.floor(qty * 10**abs(e)) / 10**abs(e)
+    return math.floor(qty * 10 ** abs(e)) / 10 ** abs(e)
 
 def signal(df):
     df["ema9"] = EMAIndicator(df["c"], 9).ema_indicator()
@@ -110,7 +115,7 @@ for s in SYMBOLS:
     STATE.setdefault(s, {"pos": None, "count": 0, "pnl": 0.0})
 
 def save_state():
-    json.dump(STATE, open("state.json","w"), indent=2)
+    json.dump(STATE, open("state.json", "w"), indent=2)
 
 def calculate_weights(dfs):
     weights = {}
@@ -119,7 +124,7 @@ def calculate_weights(dfs):
         score = 1.0
         ok15 = df["15"]["ema9"] > df["15"]["ema21"] and df["15"]["macd"] > df["15"]["macd_s"]
         ok60 = df["60"]["ema9"] > df["60"]["ema21"] and df["60"]["macd"] > df["60"]["macd_s"]
-        ok240= df["240"]["ema9"] > df["240"]["ema21"] and df["240"]["macd"] > df["240"]["macd_s"]
+        ok240 = df["240"]["ema9"] > df["240"]["ema21"] and df["240"]["macd"] > df["240"]["macd_s"]
         if ok15 and ok60 and ok240: score += 0.5
         if 50 < df["5"]["rsi"] < 65: score += 0.2
         weights[sym] = score
@@ -138,7 +143,7 @@ def trade():
     dfs = {}
     for sym in SYMBOLS:
         dfs[sym] = {}
-        for tf in ["5","15","60","240"]:
+        for tf in ["5", "15", "60", "240"]:
             df = signal(get_klines(sym, tf))
             if df.empty:
                 log(f"{sym} {tf}m нет данных, пропуск")
@@ -160,21 +165,30 @@ def trade():
         price = df["5"]["c"]
         atr = df["5"]["atr"]
         buy5 = df["5"]["ema9"] > df["5"]["ema21"] and df["5"]["macd"] > df["5"]["macd_s"]
+
+        # 🔄 Новый блок с чувствительными фильтрами
         mtf_ok_count = sum(
-            1 for tf in ["15","60","240"]
+            1 for tf in ["15", "60", "240"]
             if df[tf]["ema9"] > df[tf]["ema21"] and df[tf]["macd"] > df[tf]["macd_s"]
         )
-        mtf_ok = mtf_ok_count >= 2
+        mtf_ok = mtf_ok_count >= 1  # Упрощённый MTF фильтр
+
         rsi5 = df["5"]["rsi"]
-        rsi_ok = rsi5 <= 75
+        rsi_ok = rsi5 <= 80  # Повышен порог RSI
 
         log(f"{sym}: buy5={buy5}, rsi5={rsi5:.1f}, mtf_ok_count={mtf_ok_count}/3")
+
+        # vol_ch фильтр отключён — закомментировано
+        # vol_ok = df["5"]["vol_ch"] > DEFAULT_PARAMS["volume_filter"]
+        # if not vol_ok:
+        #     log(f"{sym} пропуск: объём vol_ch={df['5']['vol_ch']:.2f} < {DEFAULT_PARAMS['volume_filter']}")
+        #     continue
 
         if not buy5:
             log(f"{sym} пропуск: 5m сигнал отсутствует")
             continue
         if not rsi_ok:
-            log(f"{sym} пропуск: RSI={rsi5:.1f} > 75")
+            log(f"{sym} пропуск: RSI={rsi5:.1f} > 80")
             continue
         if not mtf_ok:
             log(f"{sym} пропуск: MTF OK только на {mtf_ok_count}/3 TF")
@@ -184,11 +198,11 @@ def trade():
         qty_usd = min(alloc_usdt * DEFAULT_PARAMS["risk_pct"], MAX_POS_USDT)
         qty = adjust(qty_usd / price, LIMITS[sym]["step"])
         if qty * price < LIMITS[sym]["min_amt"]:
-            log(f"{sym} пропуск: qty*price={qty*price:.2f} < min_amt")
+            log(f"{sym} пропуск: qty*price={qty * price:.2f} < min_amt")
             continue
         est = atr * DEFAULT_PARAMS["tp_multiplier"] * qty - price * qty * 0.001 - DEFAULT_PARAMS["min_profit_usdt"]
         if est < 0:
-            log(f"{sym} пропуск: плохая PNL={est+DEFAULT_PARAMS['min_profit_usdt']:.2f}")
+            log(f"{sym} пропуск: плохая PNL={est + DEFAULT_PARAMS['min_profit_usdt']:.2f}")
             continue
 
         session.place_order(category="spot", symbol=sym, side="Buy", orderType="Market", qty=str(qty))
@@ -199,7 +213,7 @@ def trade():
 
         cb = get_coin_balance(sym)
         if cb > 0:
-            b,q,tp_old,peak = STATE[sym]["pos"]["buy_price"],STATE[sym]["pos"]["qty"],STATE[sym]["pos"]["tp"],STATE[sym]["pos"]["peak"]
+            b, q, tp_old, peak = STATE[sym]["pos"]["buy_price"], STATE[sym]["pos"]["qty"], STATE[sym]["pos"]["tp"], STATE[sym]["pos"]["peak"]
             peak = max(peak, price)
             pnl = (price - b) * q - price * q * 0.001
             dd = (peak - price) / peak
@@ -208,7 +222,7 @@ def trade():
                 "TRAILING": dd > DEFAULT_PARAMS["trailing_stop_pct"],
                 "PROFIT": price >= tp_old
             }
-            reason = next((k for k,v in conds.items() if v), None)
+            reason = next((k for k, v in conds.items() if v), None)
             if reason:
                 qty_s = adjust(cb, LIMITS[sym]["step"])
                 session.place_order(category="spot", symbol=sym, side="Sell", orderType="Market", qty=str(qty_s))
@@ -234,15 +248,15 @@ def daily_report():
         for s in SYMBOLS:
             STATE[s]["count"] = STATE[s]["pnl"] = 0.0
         save_state()
-        open(fn,"w").write(str(now.date()))
+        open(fn, "w").write(str(now.date()))
 
 def main():
-    log("🚀 Bot старт — MTF фильтр 2/3, RSI<=75")
-    send_tg("🚀 Bot старт — MTF:2/3, RSI<=75. Остальной функционал без изменений")
+    log("🚀 Bot старт — MTF фильтр 1/3, RSI<=80")
+    send_tg("🚀 Bot старт — MTF:1/3, RSI<=80. Остальной функционал без изменений")
     while True:
         trade()
         daily_report()
         time.sleep(60)
 
-if __name__=="__main__":
+if __name__ == "__main__":
     main()
