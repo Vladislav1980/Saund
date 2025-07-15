@@ -8,10 +8,8 @@ from pybit.unified_trading import HTTP
 
 DEBUG = False
 SYMBOLS = [
-    "BTCUSDT", "ARBUSDT", "TRXUSDT", "DOGEUSDT",
-    "NEARUSDT", "COMPUSDT", "TONUSDT", "XRPUSDT",
-    "ADAUSDT", "BCHUSDT", "LTCUSDT", "AVAXUSDT",
-    "SUIUSDT", "FILUSDT"
+    "BTCUSDT", "COMPUSDT", "TONUSDT", "XRPUSDT",
+    "ADAUSDT", "LTCUSDT", "FILUSDT"
 ]
 
 load_dotenv()
@@ -21,7 +19,7 @@ TG_TOKEN = os.getenv("TG_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
 DEFAULT_PARAMS = {
-    "risk_pct": 0.03, "tp_multiplier": 1.8, "trailing_stop_pct": 0.02,
+    "risk_pct": 0.05, "tp_multiplier": 1.8, "trailing_stop_pct": 0.02,
     "max_drawdown_sl": 0.06, "min_profit_usdt": 2.5, "volume_filter": 0.3,
     "avg_rebuy_drop_pct": 0.07, "rebuy_cooldown_secs": 3600
 }
@@ -103,10 +101,6 @@ def signal(df):
     df["vol_ch"] = df["vol"].pct_change().fillna(0)
     return df
 
-def check_trend(df):
-    last = df.iloc[-1]
-    return last["ema9"] > last["ema21"] and last["macd"] > last["macd_s"], last
-
 STATE = {}
 if os.path.exists("state.json"):
     try: STATE = json.load(open("state.json"))
@@ -155,6 +149,7 @@ def trade():
 
     weights = calculate_weights(dfs)
     log(f"Весовые коэффициенты: {weights}")
+    any_buy = False
 
     for sym, df in dfs.items():
         log(f"--- {sym} индикаторы ---")
@@ -166,23 +161,15 @@ def trade():
         atr = df["5"]["atr"]
         buy5 = df["5"]["ema9"] > df["5"]["ema21"] and df["5"]["macd"] > df["5"]["macd_s"]
 
-        # 🔄 Новый блок с чувствительными фильтрами
         mtf_ok_count = sum(
             1 for tf in ["15", "60", "240"]
             if df[tf]["ema9"] > df[tf]["ema21"] and df[tf]["macd"] > df[tf]["macd_s"]
         )
-        mtf_ok = mtf_ok_count >= 1  # Упрощённый MTF фильтр
-
+        mtf_ok = mtf_ok_count >= 1
         rsi5 = df["5"]["rsi"]
-        rsi_ok = rsi5 <= 80  # Повышен порог RSI
+        rsi_ok = rsi5 <= 80
 
         log(f"{sym}: buy5={buy5}, rsi5={rsi5:.1f}, mtf_ok_count={mtf_ok_count}/3")
-
-        # vol_ch фильтр отключён — закомментировано
-        # vol_ok = df["5"]["vol_ch"] > DEFAULT_PARAMS["volume_filter"]
-        # if not vol_ok:
-        #     log(f"{sym} пропуск: объём vol_ch={df['5']['vol_ch']:.2f} < {DEFAULT_PARAMS['volume_filter']}")
-        #     continue
 
         if not buy5:
             log(f"{sym} пропуск: 5m сигнал отсутствует")
@@ -210,8 +197,19 @@ def trade():
         STATE[sym]["pos"] = {"buy_price": price, "qty": qty, "tp": tp, "peak": price}
         msg = f"✅ BUY {sym}@{price:.4f}, qty={qty:.6f}, Вес={weights[sym]:.3f}, TP~{tp:.4f}"
         log(msg); send_tg(msg)
+        any_buy = True
 
         cb = get_coin_balance(sym)
+        if cb > 0 and STATE[sym]["pos"] is None:
+            qty = adjust(cb, LIMITS[sym]["step"])
+            STATE[sym]["pos"] = {
+                "buy_price": price * 1.01,
+                "qty": qty,
+                "tp": price * 1.03,
+                "peak": price
+            }
+            log(f"🧩 Восстановлена позиция {sym} с баланса qty={qty}")
+
         if cb > 0:
             b, q, tp_old, peak = STATE[sym]["pos"]["buy_price"], STATE[sym]["pos"]["qty"], STATE[sym]["pos"]["tp"], STATE[sym]["pos"]["peak"]
             peak = max(peak, price)
@@ -232,6 +230,9 @@ def trade():
                 STATE[sym]["count"] += 1
                 STATE[sym]["pos"] = None
             break
+
+    if not any_buy:
+        log("⛔ Ни одна монета не прошла фильтры — покупок не выполнено")
 
     save_state()
 
