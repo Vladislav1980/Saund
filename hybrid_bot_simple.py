@@ -19,9 +19,14 @@ TG_TOKEN = os.getenv("TG_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
 DEFAULT_PARAMS = {
-    "risk_pct": 0.05, "tp_multiplier": 1.8, "trailing_stop_pct": 0.02,
-    "max_drawdown_sl": 0.06, "min_profit_usdt": 2.5, "volume_filter": 0.3,
-    "avg_rebuy_drop_pct": 0.07, "rebuy_cooldown_secs": 3600
+    "risk_pct": 0.05,  # увеличено с 0.03
+    "tp_multiplier": 1.8,
+    "trailing_stop_pct": 0.02,
+    "max_drawdown_sl": 0.06,
+    "min_profit_usdt": 2.5,
+    "volume_filter": 0.3,
+    "avg_rebuy_drop_pct": 0.07,
+    "rebuy_cooldown_secs": 3600
 }
 
 RESERVE_BALANCE = 0
@@ -101,6 +106,10 @@ def signal(df):
     df["vol_ch"] = df["vol"].pct_change().fillna(0)
     return df
 
+def check_trend(df):
+    last = df.iloc[-1]
+    return last["ema9"] > last["ema21"] and last["macd"] > last["macd_s"], last
+
 STATE = {}
 if os.path.exists("state.json"):
     try: STATE = json.load(open("state.json"))
@@ -149,7 +158,6 @@ def trade():
 
     weights = calculate_weights(dfs)
     log(f"Весовые коэффициенты: {weights}")
-    any_buy = False
 
     for sym, df in dfs.items():
         log(f"--- {sym} индикаторы ---")
@@ -160,7 +168,6 @@ def trade():
         price = df["5"]["c"]
         atr = df["5"]["atr"]
         buy5 = df["5"]["ema9"] > df["5"]["ema21"] and df["5"]["macd"] > df["5"]["macd_s"]
-
         mtf_ok_count = sum(
             1 for tf in ["15", "60", "240"]
             if df[tf]["ema9"] > df[tf]["ema21"] and df[tf]["macd"] > df[tf]["macd_s"]
@@ -184,9 +191,15 @@ def trade():
         alloc_usdt = bal * weights[sym]
         qty_usd = min(alloc_usdt * DEFAULT_PARAMS["risk_pct"], MAX_POS_USDT)
         qty = adjust(qty_usd / price, LIMITS[sym]["step"])
+
         if qty * price < LIMITS[sym]["min_amt"]:
-            log(f"{sym} пропуск: qty*price={qty * price:.2f} < min_amt")
-            continue
+            min_amt = LIMITS[sym]["min_amt"]
+            qty = adjust(min_amt / price, LIMITS[sym]["step"])
+            if qty * price > bal:
+                log(f"{sym} пропуск: min_amt {min_amt:.2f} превышает баланс")
+                continue
+            log(f"{sym}: qty скорректирован до min_amt — qty={qty:.6f}, price={price:.4f}")
+
         est = atr * DEFAULT_PARAMS["tp_multiplier"] * qty - price * qty * 0.001 - DEFAULT_PARAMS["min_profit_usdt"]
         if est < 0:
             log(f"{sym} пропуск: плохая PNL={est + DEFAULT_PARAMS['min_profit_usdt']:.2f}")
@@ -197,19 +210,8 @@ def trade():
         STATE[sym]["pos"] = {"buy_price": price, "qty": qty, "tp": tp, "peak": price}
         msg = f"✅ BUY {sym}@{price:.4f}, qty={qty:.6f}, Вес={weights[sym]:.3f}, TP~{tp:.4f}"
         log(msg); send_tg(msg)
-        any_buy = True
 
         cb = get_coin_balance(sym)
-        if cb > 0 and STATE[sym]["pos"] is None:
-            qty = adjust(cb, LIMITS[sym]["step"])
-            STATE[sym]["pos"] = {
-                "buy_price": price * 1.01,
-                "qty": qty,
-                "tp": price * 1.03,
-                "peak": price
-            }
-            log(f"🧩 Восстановлена позиция {sym} с баланса qty={qty}")
-
         if cb > 0:
             b, q, tp_old, peak = STATE[sym]["pos"]["buy_price"], STATE[sym]["pos"]["qty"], STATE[sym]["pos"]["tp"], STATE[sym]["pos"]["peak"]
             peak = max(peak, price)
@@ -230,9 +232,6 @@ def trade():
                 STATE[sym]["count"] += 1
                 STATE[sym]["pos"] = None
             break
-
-    if not any_buy:
-        log("⛔ Ни одна монета не прошла фильтры — покупок не выполнено")
 
     save_state()
 
