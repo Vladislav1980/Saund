@@ -19,7 +19,7 @@ TG_TOKEN = os.getenv("TG_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
 DEFAULT_PARAMS = {
-    "risk_pct": 0.05,  # увеличено с 0.03
+    "risk_pct": 0.05,
     "tp_multiplier": 1.8,
     "trailing_stop_pct": 0.02,
     "max_drawdown_sl": 0.06,
@@ -191,6 +191,13 @@ def trade():
         alloc_usdt = bal * weights[sym]
         qty_usd = min(alloc_usdt * DEFAULT_PARAMS["risk_pct"], MAX_POS_USDT)
         qty = adjust(qty_usd / price, LIMITS[sym]["step"])
+
+        # 🔧 Новый блок логирования qty, min_amt, qtyStep
+        min_qty = adjust(LIMITS[sym]["min_amt"] / price, LIMITS[sym]["step"])
+        log(f"{sym} шаг qtyStep={LIMITS[sym]['step']}, min_amt={LIMITS[sym]['min_amt']}, min_qty={min_qty:.6f}, qty={qty:.6f}")
+        if qty == 0:
+            log(f"⚠️ {sym} qty округлён до 0. Возможно, шаг слишком крупный")
+            continue
 
         if qty * price < LIMITS[sym]["min_amt"]:
             min_amt = LIMITS[sym]["min_amt"]
