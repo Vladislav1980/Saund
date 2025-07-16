@@ -61,8 +61,12 @@ def load_limits():
         s = it["symbol"]
         if s in SYMBOLS:
             f = it.get("lotSizeFilter", {})
+            step = float(f.get("qtyStep", 1))
+            # 🔧 Fix for incorrect API step values
+            if step >= 1.0:
+                step = 0.0001
             LIMITS[s] = {
-                "step": float(f.get("qtyStep", 1)),
+                "step": step,
                 "min_amt": float(it.get("minOrderAmt", 10)),
                 "max_amt": float(it.get("maxOrderAmt", 1e9))
             }
@@ -172,7 +176,6 @@ def trade():
             1 for tf in ["15", "60", "240"]
             if df[tf]["ema9"] > df[tf]["ema21"] and df[tf]["macd"] > df[tf]["macd_s"]
         )
-        mtf_ok = mtf_ok_count >= 1
         rsi5 = df["5"]["rsi"]
         rsi_ok = rsi5 <= 80
 
@@ -184,7 +187,7 @@ def trade():
         if not rsi_ok:
             log(f"{sym} пропуск: RSI={rsi5:.1f} > 80")
             continue
-        if not mtf_ok:
+        if mtf_ok_count < 1:
             log(f"{sym} пропуск: MTF OK только на {mtf_ok_count}/3 TF")
             continue
 
@@ -192,7 +195,7 @@ def trade():
         qty_usd = min(alloc_usdt * DEFAULT_PARAMS["risk_pct"], MAX_POS_USDT)
         qty = adjust(qty_usd / price, LIMITS[sym]["step"])
 
-        # 🔧 Новый блок логирования qty, min_amt, qtyStep
+        # 🔧 Expanded qty logging and zero-check
         min_qty = adjust(LIMITS[sym]["min_amt"] / price, LIMITS[sym]["step"])
         log(f"{sym} шаг qtyStep={LIMITS[sym]['step']}, min_amt={LIMITS[sym]['min_amt']}, min_qty={min_qty:.6f}, qty={qty:.6f}")
         if qty == 0:
