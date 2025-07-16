@@ -19,11 +19,11 @@ TG_TOKEN = os.getenv("TG_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
 DEFAULT_PARAMS = {
-    "risk_pct": 0.05,
+    "risk_pct": 0.05,  # увеличено с 0.03
     "tp_multiplier": 1.8,
     "trailing_stop_pct": 0.02,
     "max_drawdown_sl": 0.06,
-    "min_profit_usdt": 2.5,
+    "min_profit_usdt": 1.0,  # изменено с 2.5
     "volume_filter": 0.3,
     "avg_rebuy_drop_pct": 0.07,
     "rebuy_cooldown_secs": 3600
@@ -61,12 +61,8 @@ def load_limits():
         s = it["symbol"]
         if s in SYMBOLS:
             f = it.get("lotSizeFilter", {})
-            step = float(f.get("qtyStep", 1))
-            # 🔧 Fix for incorrect API step values
-            if step >= 1.0:
-                step = 0.0001
             LIMITS[s] = {
-                "step": step,
+                "step": float(f.get("qtyStep", 1)),
                 "min_amt": float(it.get("minOrderAmt", 10)),
                 "max_amt": float(it.get("maxOrderAmt", 1e9))
             }
@@ -176,6 +172,7 @@ def trade():
             1 for tf in ["15", "60", "240"]
             if df[tf]["ema9"] > df[tf]["ema21"] and df[tf]["macd"] > df[tf]["macd_s"]
         )
+        mtf_ok = mtf_ok_count >= 1
         rsi5 = df["5"]["rsi"]
         rsi_ok = rsi5 <= 80
 
@@ -187,7 +184,7 @@ def trade():
         if not rsi_ok:
             log(f"{sym} пропуск: RSI={rsi5:.1f} > 80")
             continue
-        if mtf_ok_count < 1:
+        if not mtf_ok:
             log(f"{sym} пропуск: MTF OK только на {mtf_ok_count}/3 TF")
             continue
 
@@ -195,12 +192,7 @@ def trade():
         qty_usd = min(alloc_usdt * DEFAULT_PARAMS["risk_pct"], MAX_POS_USDT)
         qty = adjust(qty_usd / price, LIMITS[sym]["step"])
 
-        # 🔧 Expanded qty logging and zero-check
-        min_qty = adjust(LIMITS[sym]["min_amt"] / price, LIMITS[sym]["step"])
-        log(f"{sym} шаг qtyStep={LIMITS[sym]['step']}, min_amt={LIMITS[sym]['min_amt']}, min_qty={min_qty:.6f}, qty={qty:.6f}")
-        if qty == 0:
-            log(f"⚠️ {sym} qty округлён до 0. Возможно, шаг слишком крупный")
-            continue
+        log(f"{sym} шаг qtyStep={LIMITS[sym]['step']}, min_amt={LIMITS[sym]['min_amt']}, qty={qty:.6f}")
 
         if qty * price < LIMITS[sym]["min_amt"]:
             min_amt = LIMITS[sym]["min_amt"]
@@ -210,13 +202,19 @@ def trade():
                 continue
             log(f"{sym}: qty скорректирован до min_amt — qty={qty:.6f}, price={price:.4f}")
 
+        reward = atr * DEFAULT_PARAMS["tp_multiplier"]
+        risk = atr
+        if (reward / risk) < 1.5:
+            log(f"{sym} пропуск: низкое reward/risk = {(reward/risk):.2f}")
+            continue
+
         est = atr * DEFAULT_PARAMS["tp_multiplier"] * qty - price * qty * 0.001 - DEFAULT_PARAMS["min_profit_usdt"]
         if est < 0:
-            log(f"{sym} пропуск: плохая PNL={est + DEFAULT_PARAMS['min_profit_usdt']:.2f}")
+            log(f"{sym} пропуск: плохая PNL={(est + DEFAULT_PARAMS['min_profit_usdt']):.2f}")
             continue
 
         session.place_order(category="spot", symbol=sym, side="Buy", orderType="Market", qty=str(qty))
-        tp = price + atr * DEFAULT_PARAMS["tp_multiplier"]
+        tp = price + reward
         STATE[sym]["pos"] = {"buy_price": price, "qty": qty, "tp": tp, "peak": price}
         msg = f"✅ BUY {sym}@{price:.4f}, qty={qty:.6f}, Вес={weights[sym]:.3f}, TP~{tp:.4f}"
         log(msg); send_tg(msg)
