@@ -19,11 +19,11 @@ TG_TOKEN = os.getenv("TG_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
 DEFAULT_PARAMS = {
-    "risk_pct": 0.05,  # увеличено с 0.03
+    "risk_pct": 0.05,
     "tp_multiplier": 1.8,
     "trailing_stop_pct": 0.02,
     "max_drawdown_sl": 0.06,
-    "min_profit_usdt": 1.0,  # изменено с 2.5
+    "min_profit_usdt": 2.5,
     "volume_filter": 0.3,
     "avg_rebuy_drop_pct": 0.07,
     "rebuy_cooldown_secs": 3600
@@ -110,15 +110,26 @@ def check_trend(df):
     last = df.iloc[-1]
     return last["ema9"] > last["ema21"] and last["macd"] > last["macd_s"], last
 
+# ——— Блок загрузки состояния ———
 STATE = {}
 if os.path.exists("state.json"):
-    try: STATE = json.load(open("state.json"))
-    except: STATE = {}
+    try:
+        with open("state.json", "r") as f:
+            STATE = json.load(f)
+    except:
+        STATE = {}
+else:
+    STATE = {}
 for s in SYMBOLS:
     STATE.setdefault(s, {"pos": None, "count": 0, "pnl": 0.0})
+# ————————————————
 
 def save_state():
-    json.dump(STATE, open("state.json", "w"), indent=2)
+    try:
+        with open("state.json", "w") as f:
+            json.dump(STATE, f, indent=2)
+    except Exception as e:
+        log(f"Ошибка сохранения state.json: {e}")
 
 def calculate_weights(dfs):
     weights = {}
@@ -197,51 +208,51 @@ def trade():
         if qty * price < LIMITS[sym]["min_amt"]:
             min_amt = LIMITS[sym]["min_amt"]
             qty = adjust(min_amt / price, LIMITS[sym]["step"])
-            if qty * price > bal:
-                log(f"{sym} пропуск: min_amt {min_amt:.2f} превышает баланс")
-                continue
             log(f"{sym}: qty скорректирован до min_amt — qty={qty:.6f}, price={price:.4f}")
 
-        reward = atr * DEFAULT_PARAMS["tp_multiplier"]
-        risk = atr
-        if (reward / risk) < 1.5:
-            log(f"{sym} пропуск: низкое reward/risk = {(reward/risk):.2f}")
+        if qty == 0:
+            log(f"⚠️ {sym} qty округлён до 0. Возможно, шаг слишком крупный")
             continue
 
         est = atr * DEFAULT_PARAMS["tp_multiplier"] * qty - price * qty * 0.001 - DEFAULT_PARAMS["min_profit_usdt"]
         if est < 0:
-            log(f"{sym} пропуск: плохая PNL={(est + DEFAULT_PARAMS['min_profit_usdt']):.2f}")
+            log(f"{sym} пропуск: плохая PNL={est + DEFAULT_PARAMS['min_profit_usdt']:.2f}")
             continue
 
         session.place_order(category="spot", symbol=sym, side="Buy", orderType="Market", qty=str(qty))
-        tp = price + reward
+        tp = price + atr * DEFAULT_PARAMS["tp_multiplier"]
         STATE[sym]["pos"] = {"buy_price": price, "qty": qty, "tp": tp, "peak": price}
+        save_state()
         msg = f"✅ BUY {sym}@{price:.4f}, qty={qty:.6f}, Вес={weights[sym]:.3f}, TP~{tp:.4f}"
         log(msg); send_tg(msg)
 
-        cb = get_coin_balance(sym)
-        if cb > 0:
-            b, q, tp_old, peak = STATE[sym]["pos"]["buy_price"], STATE[sym]["pos"]["qty"], STATE[sym]["pos"]["tp"], STATE[sym]["pos"]["peak"]
-            peak = max(peak, price)
-            pnl = (price - b) * q - price * q * 0.001
-            dd = (peak - price) / peak
-            conds = {
-                "STOPLOSS": price < b * (1 - DEFAULT_PARAMS["max_drawdown_sl"]),
-                "TRAILING": dd > DEFAULT_PARAMS["trailing_stop_pct"],
-                "PROFIT": price >= tp_old
-            }
-            reason = next((k for k, v in conds.items() if v), None)
-            if reason:
-                qty_s = adjust(cb, LIMITS[sym]["step"])
-                session.place_order(category="spot", symbol=sym, side="Sell", orderType="Market", qty=str(qty_s))
-                msg = f"✅ SELL {reason} {sym}@{price:.4f}, qty={qty_s:.6f}, PNL={pnl:.2f}"
-                log(msg); send_tg(msg)
-                STATE[sym]["pnl"] += pnl
-                STATE[sym]["count"] += 1
-                STATE[sym]["pos"] = None
-            break
+        break  # после покупки выходим, чтоб не входить в несколько сразу
 
-    save_state()
+    # Продажа
+    for sym in SYMBOLS:
+        pos = STATE[sym].get("pos")
+        if not pos: continue
+        price = session.get_ticker(symbol=sym)["result"]["price"]
+        cb = get_coin_balance(sym)
+        if cb <= 0: continue
+        peak = max(pos["peak"], price)
+        pnl = (price - pos["buy_price"]) * pos["qty"] - price * pos["qty"] * 0.001
+        dd = (peak - price) / peak
+        conds = {
+            "STOPLOSS": price < pos["buy_price"] * (1 - DEFAULT_PARAMS["max_drawdown_sl"]),
+            "TRAILING": dd > DEFAULT_PARAMS["trailing_stop_pct"],
+            "PROFIT": price >= pos["tp"]
+        }
+        reason = next((k for k, v in conds.items() if v), None)
+        if reason:
+            qty_s = adjust(cb, LIMITS[sym]["step"])
+            session.place_order(category="spot", symbol=sym, side="Sell", orderType="Market", qty=str(qty_s))
+            msg = f"✅ SELL {reason} {sym}@{price:.4f}, qty={qty_s:.6f}, PNL={pnl:.2f}"
+            log(msg); send_tg(msg)
+            STATE[sym]["pnl"] += pnl
+            STATE[sym]["count"] += 1
+            STATE[sym]["pos"] = None
+            save_state()
 
 def daily_report():
     now = datetime.datetime.now()
