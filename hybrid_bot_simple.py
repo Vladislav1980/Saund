@@ -7,8 +7,7 @@ from ta.volatility import AverageTrueRange
 from pybit.unified_trading import HTTP
 
 DEBUG = False
-SYMBOLS = ["COMPUSDT", "TONUSDT", "XRPUSDT", "ADAUSDT", "LTCUSDT", "FILUSDT", "SOLUSDT", "DOGEUSDT"]
-VOLUME_FILTER_THRESHOLD = 0.5  # объём: минимум 50% прирост за 5m
+SYMBOLS = ["SOLUSDT","COMPUSDT","TONUSDT","XRPUSDT","ADAUSDT","LTCUSDT","FILUSDT"]
 load_dotenv()
 API_KEY, API_SECRET = os.getenv("BYBIT_API_KEY"), os.getenv("BYBIT_API_SECRET")
 TG_TOKEN, CHAT_ID = os.getenv("TG_TOKEN"), os.getenv("CHAT_ID")
@@ -20,6 +19,7 @@ DEFAULT_PARAMS = {
     "max_drawdown_sl": 0.06,
     "min_profit_usdt": 2.5,
 }
+VOLUME_THRESHOLD = 0.2  # фильтр по объёму: рост >=20%
 RESERVE_BALANCE = 0
 DAILY_LOSS_LIMIT = -50
 MAX_POS_USDT = 50
@@ -27,14 +27,18 @@ MAX_POS_USDT = 50
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(message)s",
-    handlers=[logging.FileHandler("bot.log", mode="a", encoding="utf-8"), logging.StreamHandler()]
+    handlers=[
+        logging.FileHandler("bot.log", mode="a", encoding="utf-8"),
+        logging.StreamHandler()
+    ]
 )
-
 def log(msg): logging.info(msg)
 def send_tg(msg):
     try:
-        requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-                      data={"chat_id": CHAT_ID, "text": msg})
+        requests.post(
+            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+            data={"chat_id": CHAT_ID, "text": msg}
+        )
     except Exception as e:
         log(f"TG error: {e}")
 
@@ -57,7 +61,8 @@ def get_balance():
             for c in w["coin"]:
                 if c["coin"] == "USDT":
                     return float(c["walletBalance"])
-    except: pass
+    except:
+        pass
     return 0
 
 def get_coin_balance(sym):
@@ -67,7 +72,8 @@ def get_coin_balance(sym):
             for c in w["coin"]:
                 if c["coin"] == coin:
                     return float(c["walletBalance"])
-    except: pass
+    except:
+        pass
     return 0
 
 def get_klines(sym, interval="5", limit=100):
@@ -92,7 +98,6 @@ def signal(df):
     df["vol_ch"] = df["vol"].pct_change().fillna(0)
     return df
 
-# ——— STATE LOAD ———
 STATE = {}
 if os.path.exists("state.json"):
     try:
@@ -126,89 +131,83 @@ def calculate_weights(dfs):
 def trade():
     bal = get_balance()
     log(f"Баланс USDT: {bal:.2f}")
-    if bal < RESERVE_BALANCE or sum(STATE[s]["pnl"] for s in SYMBOLS) < DAILY_LOSS_LIMIT:
+    if bal<RESERVE_BALANCE or sum(STATE[s]["pnl"] for s in SYMBOLS) < DAILY_LOSS_LIMIT:
         log("🚫 Торговля остановлена по лимиту")
         return
 
     load_limits()
     dfs = {}
+    no_entry_flag = True
+
     for sym in SYMBOLS:
         dfs[sym] = {}
-        for tf in ["5", "15", "60", "240"]:
+        klines5 = get_klines(sym, "5")
+        if klines5.shape[0] < 2:
+            log(f"{sym} 5m нет данных, пропуск"); continue
+
+        df5 = signal(klines5)
+        vol_ch = df5.iloc[-1]["vol_ch"]
+        vol_ok = vol_ch >= VOLUME_THRESHOLD
+
+        # собираем остальные tf
+        for tf in ["15","60","240"]:
             df = signal(get_klines(sym, tf))
             if df.empty:
-                log(f"{sym} {tf}m нет данных, пропуск")
-                dfs.pop(sym, None)
-                break
+                log(f"{sym} {tf}m нет данных, пропуск"); dfs.pop(sym,None); break
             dfs[sym][tf] = df.iloc[-1]
-    if not dfs:
-        return
+        else:
+            dfs[sym]["5"] = df5.iloc[-1]
 
-    weights = calculate_weights(dfs)
-    log(f"Весовые коэффициенты: {weights}")
-    entries_made = False
+            # условия входа
+            d5 = dfs[sym]["5"]
+            buy5 = d5["ema9"] > d5["ema21"] and d5["macd"] > d5["macd_s"]
+            rsi_ok = d5["rsi"] <= 85
+            mtf_ok = sum(1 for tf in ["15","60","240"] if dfs[sym][tf]["ema9"] > dfs[sym][tf]["ema21"] and dfs[sym][tf]["macd"] > dfs[sym][tf]["macd_s"]) >= 1
 
-    for sym, df in dfs.items():
-        log(f"--- {sym} индикаторы ---")
-        for tf, last in df.items():
-            log(f"{sym} {tf}m: EMA9={last['ema9']:.2f}, EMA21={last['ema21']:.2f}, MACD={last['macd']:.4f}/{last['macd_s']:.4f}, RSI={last['rsi']:.1f}, ATR={last['atr']:.4f}, vol_ch={last['vol_ch']:.2f}")
+            log(f"{sym}: buy5={buy5}, rsi5={d5['rsi']:.1f}, mtf_ok={mtf_ok}, vol_ch={vol_ch:.2f}")
 
-        price = df["5"]["c"]
-        atr = df["5"]["atr"]
-        buy5 = df["5"]["ema9"] > df["5"]["ema21"] and df["5"]["macd"] > df["5"]["macd_s"]
-        rsi5 = df["5"]["rsi"]
-        rsi_ok = rsi5 <= 85
-        vol_ok = df["5"]["vol_ch"] > VOLUME_FILTER_THRESHOLD
-        mtf_ok_count = sum(1 for tf in ["15", "60", "240"] if df[tf]["ema9"] > df[tf]["ema21"] and df[tf]["macd"] > df[tf]["macd_s"])
+            if not (buy5 and rsi_ok and vol_ok):
+                log(f"{sym} пропуск: условия не выполнены (buy5={buy5}, rsi_ok={rsi_ok}, vol_ok={vol_ok})")
+                continue
 
-        log(f"{sym}: buy5={buy5}, rsi5={rsi5:.1f}, mtf_ok_count={mtf_ok_count}/3, vol_ok={vol_ok}")
-        if not buy5:
-            log(f"{sym} пропуск: без сигнала на 5m")
-            continue
-        if not rsi_ok:
-            log(f"{sym} пропуск: RSI={rsi5:.1f} > 85")
-            continue
-        if not vol_ok:
-            log(f"{sym} пропуск: слабый объем vol_ch={df['5']['vol_ch']:.2f} < {VOLUME_FILTER_THRESHOLD}")
-            continue
-        if mtf_ok_count < 1:
-            log(f"{sym} ⚠️ агрессивный вход: нет MTF, но buy5=True — вход разрешён")
+            # если сюда дошли — вход
+            weights = calculate_weights(dfs)
+            alloc_usdt = bal * weights[sym]
+            qty_usd = min(alloc_usdt * DEFAULT_PARAMS["risk_pct"], MAX_POS_USDT)
+            price = d5["c"]
+            qty = adjust(qty_usd / price, LIMITS[sym]["step"])
+            if qty * price < LIMITS[sym]["min_amt"]:
+                qty = adjust(LIMITS[sym]["min_amt"] / price, LIMITS[sym]["step"])
+            if qty <= 0:
+                log(f"{sym} qty<=0 пропуск"); continue
 
-        alloc_usdt = bal * weights[sym]
-        qty_usd = min(alloc_usdt * DEFAULT_PARAMS["risk_pct"], MAX_POS_USDT)
-        qty = adjust(qty_usd / price, LIMITS[sym]["step"])
-        if qty * price < LIMITS[sym]["min_amt"]:
-            qty = adjust(LIMITS[sym]["min_amt"] / price, LIMITS[sym]["step"])
-            log(f"{sym}: qty под min_amt => {qty:.6f}")
-        if qty == 0:
-            log(f"{sym} qty = 0, стадий пропуска")
-            continue
+            atr = d5["atr"]
+            est_pnl = atr * DEFAULT_PARAMS["tp_multiplier"] * qty - price * qty * 0.001 - DEFAULT_PARAMS["min_profit_usdt"]
+            if est_pnl < 0:
+                log(f"{sym} пропуск: плохое PNL {est_pnl:.2f}")
+                continue
 
-        est_pnl = atr * DEFAULT_PARAMS["tp_multiplier"] * qty - price * qty * 0.001 - DEFAULT_PARAMS["min_profit_usdt"]
-        if est_pnl < 0:
-            log(f"{sym} пропуск: плохое PNL={est_pnl + DEFAULT_PARAMS['min_profit_usdt']:.2f}")
-            continue
+            session.place_order(category="spot", symbol=sym, side="Buy", orderType="Market", qty=str(qty))
+            tp = price + atr * DEFAULT_PARAMS["tp_multiplier"]
+            STATE[sym]["pos"] = {"buy_price": price, "qty": qty, "tp": tp, "peak": price}
+            save_state()
+            msg = f"✅ BUY {sym}@{price:.4f}, qty={qty:.6f}, TP~{tp:.4f}"
+            log(msg); send_tg(msg)
+            no_entry_flag = False
+            break  # одна сделка за цикл
 
-        session.place_order(category="spot", symbol=sym, side="Buy", orderType="Market", qty=str(qty))
-        tp = price + atr * DEFAULT_PARAMS["tp_multiplier"]
-        STATE[sym]["pos"] = {"buy_price": price, "qty": qty, "tp": tp, "peak": price}
-        save_state()
-        msg = f"✅ BUY {sym}@{price:.4f}, qty={qty:.6f}, TP~{tp:.4f}"
-        log(msg)
-        send_tg(msg)
-        entries_made = True
-        break
-
-    if not entries_made:
+    if no_entry_flag:
         send_tg("ℹ️ Нет подходящих сигналов для входа в позицию.")
 
+    # обработка выхода
     for sym in SYMBOLS:
         pos = STATE[sym].get("pos")
         if not pos: continue
-        price = session.get_ticker(symbol=sym)["result"]["price"]
+        price = float(session.get_ticker(symbol=sym)["result"]["price"])
         cb = get_coin_balance(sym)
         if cb <= 0: continue
-        peak = max(pos["peak"], price)
+
+        peak = pos["peak"] = max(pos["peak"], price)
         pnl = (price - pos["buy_price"]) * pos["qty"] - price * pos["qty"] * 0.001
         dd = (peak - price) / peak
         conds = {
@@ -221,8 +220,7 @@ def trade():
             qty_s = adjust(cb, LIMITS[sym]["step"])
             session.place_order(category="spot", symbol=sym, side="Sell", orderType="Market", qty=str(qty_s))
             msg = f"✅ SELL {reason} {sym}@{price:.4f}, qty={qty_s:.6f}, PNL={pnl:.2f}"
-            log(msg)
-            send_tg(msg)
+            log(msg); send_tg(msg)
             STATE[sym]["pnl"] += pnl
             STATE[sym]["count"] += 1
             STATE[sym]["pos"] = None
@@ -238,7 +236,8 @@ def daily_report():
         ) + f"\nБаланс={get_balance():.2f}"
         send_tg(report)
         for s in SYMBOLS:
-            STATE[s]["count"] = STATE[s]["pnl"] = 0.0
+            STATE[s]["count"] = 0
+            STATE[s]["pnl"] = 0.0
         save_state()
         open(fn, "w").write(str(now.date()))
 
