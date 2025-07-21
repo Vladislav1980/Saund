@@ -7,8 +7,8 @@ from ta.volatility import AverageTrueRange
 from pybit.unified_trading import HTTP
 
 DEBUG = False
-SYMBOLS = ["SOLUSDT","COMPUSDT","TONUSDT","XRPUSDT","ADAUSDT","LTCUSDT","FILUSDT"]
-VOL_THRESHOLD = 0.2  # минимальный рост объёма при входе (vol_ch > threshold)
+SYMBOLS = ["SOLUSDT", "COMPUSDT", "TONUSDT", "XRPUSDT", "ADAUSDT", "LTCUSDT", "FILUSDT"]
+VOL_THRESHOLD = 0.2  # минимальный рост объёма для входа (vol_ch > threshold)
 
 load_dotenv()
 API_KEY, API_SECRET = os.getenv("BYBIT_API_KEY"), os.getenv("BYBIT_API_SECRET")
@@ -30,6 +30,7 @@ logging.basicConfig(
     format="%(asctime)s | %(message)s",
     handlers=[logging.FileHandler("bot.log", mode="a", encoding="utf-8"), logging.StreamHandler()]
 )
+
 def log(msg): logging.info(msg)
 def send_tg(msg):
     try:
@@ -92,7 +93,6 @@ def signal(df):
     df["vol_ch"] = df["vol"].pct_change().fillna(0)
     return df
 
-# ——— STATE LOAD ———
 STATE = {}
 if os.path.exists("state.json"):
     try:
@@ -146,9 +146,7 @@ def trade():
     weights = calculate_weights(dfs)
     log(f"Весовые коэффициенты: {weights}")
 
-    entered = False
     for sym, df in dfs.items():
-        # Лог всех индикаторов
         log(f"--- {sym} индикаторы ---")
         for tf,last in df.items():
             log(f"{sym} {tf}m: EMA9={last['ema9']:.2f}, EMA21={last['ema21']:.2f}, MACD={last['macd']:.4f}/{last['macd_s']:.4f}, RSI={last['rsi']:.1f}, ATR={last['atr']:.4f}, vol_ch={last['vol_ch']:.2f}")
@@ -182,17 +180,14 @@ def trade():
             log(f"{sym} пропуск: плохое PNL={est_pnl+DEFAULT_PARAMS['min_profit_usdt']:.2f}")
             continue
 
-        # Покупка
         session.place_order(category="spot", symbol=sym, side="Buy", orderType="Market", qty=str(qty))
         tp = price + atr*DEFAULT_PARAMS["tp_multiplier"]
         STATE[sym]["pos"]={"buy_price":price,"qty":qty,"tp":tp,"peak":price}
         save_state()
         msg = f"✅ BUY {sym}@{price:.4f}, qty={qty:.6f}, TP~{tp:.4f}"
         log(msg); send_tg(msg)
-        entered = True
-        break  # только одна сделка за цикл
+        break  # одна сделка за цикл
 
-    # Проверка для продажи
     for sym in SYMBOLS:
         pos = STATE[sym].get("pos")
         if not pos: continue
@@ -219,10 +214,6 @@ def trade():
             STATE[sym]["pos"] = None
             save_state()
 
-    # Если не было входа и уведомление за период нужно — шлём
-    if not entered:
-        send_tg("ℹ️ Нет входов за этот интервал.")
-
 def daily_report():
     fn="last_report.txt"
     prev = open(fn).read().strip() if os.path.exists(fn) else ""
@@ -236,8 +227,8 @@ def daily_report():
         open(fn,"w").write(str(now.date()))
 
 def main():
-    log("🚀 Bot старт — фильтр объёма + единое уведомление нет входа")
-    send_tg("🚀 Bot старт — фильтр объёма активирован")
+    log("🚀 Bot старт — объёмный фильтр активен")
+    send_tg("🚀 Bot старт — объёмный фильтр активен")
     while True:
         trade()
         daily_report()
