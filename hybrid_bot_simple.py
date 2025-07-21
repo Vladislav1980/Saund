@@ -8,7 +8,7 @@ from pybit.unified_trading import HTTP
 
 DEBUG = False
 SYMBOLS = ["SOLUSDT", "COMPUSDT", "TONUSDT", "XRPUSDT", "ADAUSDT", "LTCUSDT", "FILUSDT"]
-VOL_THRESHOLD = 0.2  # минимальный рост объёма для входа (vol_ch > threshold)
+VOL_THRESHOLD = 0.05  # снижено с 0.2
 
 load_dotenv()
 API_KEY, API_SECRET = os.getenv("BYBIT_API_KEY"), os.getenv("BYBIT_API_SECRET")
@@ -90,7 +90,7 @@ def signal(df):
     m = MACD(df["c"])
     df["macd"], df["macd_s"] = m.macd(), m.macd_signal()
     df["atr"] = AverageTrueRange(df["h"],df["l"],df["c"]).average_true_range()
-    df["vol_ch"] = df["vol"].pct_change().fillna(0)
+    df["vol_ch"] = df["turn"].pct_change().fillna(0)  # обновлено: считаем рост объема по обороту (turn)
     return df
 
 STATE = {}
@@ -153,13 +153,17 @@ def trade():
 
         price = df["5"]["c"]
         atr = df["5"]["atr"]
-        buy5 = df["5"]["ema9"]>df["5"]["ema21"] and df["5"]["macd"]>df["5"]["macd_s"]
+        buy5 = df["5"]["ema9"] > df["5"]["ema21"] and df["5"]["macd"] > df["5"]["macd_s"]
         rsi5 = df["5"]["rsi"]
-        rsi_ok = rsi5<=85
-        mtf_ok_count = sum(1 for tf in ["15","60","240"] if df[tf]["ema9"]>df[tf]["ema21"] and df[tf]["macd"]>df[tf]["macd_s"])
+        rsi_ok = rsi5 <= 85
+        mtf_ok_count = sum(1 for tf in ["15", "60", "240"] if df[tf]["ema9"] > df[tf]["ema21"] and df[tf]["macd"] > df[tf]["macd_s"])
         vol_ok = df["5"]["vol_ch"] > VOL_THRESHOLD
 
         log(f"{sym}: buy5={buy5}, rsi5={rsi5:.1f}, mtf_ok_count={mtf_ok_count}/3, vol_ch={df['5']['vol_ch']:.2f}, vol_ok={vol_ok}")
+
+        if mtf_ok_count == 0:
+            log(f"{sym} пропуск: слабый тренд mtf_ok_count=0")
+            continue
 
         if not (buy5 and rsi_ok and vol_ok):
             log(f"{sym} пропуск: условия не выполнены (buy5={buy5}, rsi_ok={rsi_ok}, vol_ok={vol_ok})")
