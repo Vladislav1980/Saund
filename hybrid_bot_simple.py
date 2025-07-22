@@ -8,10 +8,8 @@ from pybit.unified_trading import HTTP
 
 DEBUG = False
 SYMBOLS = [
-    "SOLUSDT", "ARBUSDT", "DOGEUSDT",
-    "NEARUSDT", "COMPUSDT", "TONUSDT", "XRPUSDT",
-    "ADAUSDT", "BCHUSDT", "LTCUSDT", "AVAXUSDT",
-    "SUIUSDT", "FILUSDT"
+    "TONUSDT", "SOLUSDT", "BTCUSDT",
+    "DOGEUSDT", "XRPUSDT", "COMPUSDT"
 ]
 
 load_dotenv()
@@ -33,7 +31,6 @@ RESERVE_BALANCE = 0
 DAILY_LOSS_LIMIT = -50
 MAX_POS_USDT = 50
 
-# Настройки логгирования
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(message)s",
@@ -55,7 +52,6 @@ def send_tg(msg):
 session = HTTP(api_key=API_KEY, api_secret=API_SECRET, recv_window=15000)
 LIMITS = {}
 
-# Забираем лимиты ордеров
 def load_limits():
     for it in session.get_instruments_info(category="spot")["result"]["list"]:
         s = it["symbol"]
@@ -67,7 +63,6 @@ def load_limits():
                 "max_amt": float(it.get("maxOrderAmt", 1e9))
             }
 
-# Общий баланс USDT
 def get_balance():
     try:
         for w in session.get_wallet_balance(accountType="UNIFIED")["result"]["list"]:
@@ -76,7 +71,6 @@ def get_balance():
     except: pass
     return 0
 
-# Баланс конкретной монеты
 def get_coin_balance(sym):
     coin = sym.replace("USDT","")
     try:
@@ -86,7 +80,6 @@ def get_coin_balance(sym):
     except: pass
     return 0
 
-# Подгрузка свечей
 def get_klines(sym, interval="5", limit=100):
     try:
         r = session.get_kline(category="spot", symbol=sym, interval=interval, limit=limit)
@@ -95,12 +88,10 @@ def get_klines(sym, interval="5", limit=100):
         log(f"klines err {sym}@{interval}: {e}")
         return pd.DataFrame()
 
-# Подгонка шага
 def adjust(qty, step):
     e = int(f"{step:e}".split("e")[-1])
     return math.floor(qty * 10**abs(e)) / 10**abs(e)
 
-# Расчет индикаторов
 def signal(df):
     df["ema9"] = EMAIndicator(df["c"], 9).ema_indicator()
     df["ema21"] = EMAIndicator(df["c"], 21).ema_indicator()
@@ -120,7 +111,6 @@ for s in SYMBOLS:
 def save_state():
     json.dump(STATE, open("state.json","w"), indent=2)
 
-# Веса по монетам на основе фильтра «бычьих» молодых сигналов
 def calculate_weights(dfs):
     weights = {}
     total = 0
@@ -137,7 +127,6 @@ def calculate_weights(dfs):
         weights[sym] /= total
     return weights
 
-# Основная торговая функция
 def trade():
     bal = get_balance()
     log(f"Баланс USDT: {bal:.2f}")
@@ -178,10 +167,8 @@ def trade():
             1 for tf in ["15","60","240"]
             if df[tf]["ema9"] > df[tf]["ema21"] and df[tf]["macd"] > df[tf]["macd_s"]
         )
-        # ← изменение 1: должно быть mtf_ok_count >= 1
         mtf_ok = mtf_ok_count >= 1
         rsi5 = df["5"]["rsi"]
-        # ← изменение 2: теперь до RSI 80
         rsi_ok = rsi5 <= 80
 
         log(f"{sym}: buy5={buy5}, rsi5={rsi5:.1f}, mtf_ok_count={mtf_ok_count}/3")
@@ -237,7 +224,6 @@ def trade():
 
     save_state()
 
-# Ежедневный отчёт
 def daily_report():
     now = datetime.datetime.now()
     fn = "last_report.txt"
