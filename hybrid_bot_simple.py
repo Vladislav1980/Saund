@@ -24,7 +24,7 @@ DEFAULT_PARAMS = {
     "min_profit_usdt": 2.5,
     "avg_rebuy_drop_pct": 0.07,
     "rebuy_cooldown_secs": 3600,
-    "volume_filter": False  # отключён фильтр объёма
+    "volume_filter": False
 }
 
 RESERVE_BALANCE = 0
@@ -214,6 +214,10 @@ def trade():
             reason = next((k for k,v in conds.items() if v), None)
             if reason:
                 qty_s = adjust(cb, LIMITS[sym]["step"])
+                pnl = (price - b) * q - price * q * 0.001
+                if pnl < DEFAULT_PARAMS["min_profit_usdt"]:
+                    log(f"{sym} пропуск продажи: PNL={pnl:.2f} < min_profit")
+                    continue
                 session.place_order(category="spot", symbol=sym, side="Sell", orderType="Market", qty=str(qty_s))
                 msg = f"✅ SELL {reason} {sym}@{price:.4f}, qty={qty_s:.6f}, PNL={pnl:.2f}"
                 log(msg); send_tg(msg)
