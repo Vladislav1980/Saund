@@ -17,11 +17,11 @@ API_KEY = os.getenv("BYBIT_API_KEY"); API_SECRET = os.getenv("BYBIT_API_SECRET")
 TG_TOKEN = os.getenv("TG_TOKEN"); CHAT_ID = os.getenv("CHAT_ID")
 
 DEFAULT_PARAMS = {
-    "risk_pct": 0.05,
+    "risk_pct": 0.1,              # повысили аллокацию до 10%
     "tp_multiplier": 1.8,
     "trailing_stop_pct": 0.02,
     "max_drawdown_sl": 0.06,
-    "min_profit_usdt": 1.5,
+    "min_profit_usdt": 1.5,       # минимум $1.5 чистой прибыли
     "avg_rebuy_drop_pct": 0.07,
     "rebuy_cooldown_secs": 3600,
     "volume_filter": False
@@ -119,8 +119,7 @@ def calculate_weights(dfs):
         ok15 = df["15"]["ema9"] > df["15"]["ema21"]
         ok60 = df["60"]["ema9"] > df["60"]["ema21"]
         ok240= df["240"]["ema9"] > df["240"]["ema21"]
-        mtf_ok_count = sum([ok15, ok60, ok240])
-        if mtf_ok_count >= 1: score += 0.5
+        if ok15 and ok60 and ok240: score += 0.5
         if 50 < df["5"]["rsi"] < 65: score += 0.2
         weights[sym] = score
         total += score
@@ -166,13 +165,7 @@ def trade():
         buy5 = df["5"]["ema9"] > df["5"]["ema21"]
         rsi5 = df["5"]["rsi"]
         rsi_ok = rsi5 <= 80
-
-        ok15 = df["15"]["ema9"] > df["15"]["ema21"]
-        ok60 = df["60"]["ema9"] > df["60"]["ema21"]
-        ok240 = df["240"]["ema9"] > df["240"]["ema21"]
-        mtf_ok_count = sum([ok15, ok60, ok240])
-
-        log(f"{sym}: buy5={buy5}, rsi5={rsi5:.1f}, mtf_ok={mtf_ok_count}/3")
+        log(f"{sym}: buy5={buy5}, rsi5={rsi5:.1f}")
 
         if not buy5:
             log(f"{sym} пропуск: EMA не дала сигнал")
@@ -180,20 +173,18 @@ def trade():
         if not rsi_ok:
             log(f"{sym} пропуск: RSI={rsi5:.1f} > 80")
             continue
-        if mtf_ok_count < 1:
-            log(f"{sym} пропуск: MTF")
-            continue
 
         alloc_usdt = bal * weights[sym]
         qty_usd = min(alloc_usdt * DEFAULT_PARAMS["risk_pct"], MAX_POS_USDT)
         qty = adjust(qty_usd / price, LIMITS[sym]["step"])
-        if qty * price < LIMITS[sym]["min_amt"]:
-            log(f"{sym} пропуск: qty*price={qty*price:.2f} < min_amt")
+        # принудительно выставляем минималку = 1 USDT
+        if qty * price < LIMITS[sym]["min_amt"] and qty * price < 1:
+            log(f"{sym} пропуск: qty*price={qty*price:.2f} < min(Limit,1)")
             continue
 
         est = atr * DEFAULT_PARAMS["tp_multiplier"] * qty \
-            - price * qty * 0.001 \
-            - DEFAULT_PARAMS["min_profit_usdt"]
+              - price * qty * 0.001 \
+              - DEFAULT_PARAMS["min_profit_usdt"]
         if est < 0:
             log(f"{sym} пропуск: плохая PNL, est={est+DEFAULT_PARAMS['min_profit_usdt']:.2f}")
             continue
