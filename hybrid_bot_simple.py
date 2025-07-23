@@ -17,11 +17,11 @@ API_KEY = os.getenv("BYBIT_API_KEY"); API_SECRET = os.getenv("BYBIT_API_SECRET")
 TG_TOKEN = os.getenv("TG_TOKEN"); CHAT_ID = os.getenv("CHAT_ID")
 
 DEFAULT_PARAMS = {
-    "risk_pct": 0.03,
+    "risk_pct": 0.05,             # увеличили до 5%
     "tp_multiplier": 1.8,
     "trailing_stop_pct": 0.02,
     "max_drawdown_sl": 0.06,
-    "min_profit_usdt": 2.5,
+    "min_profit_usdt": 1.5,       # теперь 1.5 USDT чистой прибыли
     "avg_rebuy_drop_pct": 0.07,
     "rebuy_cooldown_secs": 3600,
     "volume_filter": False
@@ -116,9 +116,9 @@ def calculate_weights(dfs):
     total = 0
     for sym, df in dfs.items():
         score = 1.0
-        ok15 = df["15"]["ema9"] > df["15"]["ema21"] and df["15"]["macd"] > df["15"]["macd_s"]
-        ok60 = df["60"]["ema9"] > df["60"]["ema21"] and df["60"]["macd"] > df["60"]["macd_s"]
-        ok240= df["240"]["ema9"] > df["240"]["ema21"] and df["240"]["macd"] > df["240"]["macd_s"]
+        ok15 = df["15"]["ema9"] > df["15"]["ema21"]
+        ok60 = df["60"]["ema9"] > df["60"]["ema21"]
+        ok240= df["240"]["ema9"] > df["240"]["ema21"]
         if ok15 and ok60 and ok240: score += 0.5
         if 50 < df["5"]["rsi"] < 65: score += 0.2
         weights[sym] = score
@@ -162,25 +162,16 @@ def trade():
 
         price = df["5"]["c"]
         atr = df["5"]["atr"]
-        buy5 = df["5"]["ema9"] > df["5"]["ema21"] and df["5"]["macd"] > df["5"]["macd_s"]
-        mtf_ok_count = sum(
-            1 for tf in ["15","60","240"]
-            if df[tf]["ema9"] > df[tf]["ema21"] and df[tf]["macd"] > df[tf]["macd_s"]
-        )
-        mtf_ok = mtf_ok_count >= 1
+        buy5 = df["5"]["ema9"] > df["5"]["ema21"]  # только EMA
         rsi5 = df["5"]["rsi"]
         rsi_ok = rsi5 <= 80
-
-        log(f"{sym}: buy5={buy5}, rsi5={rsi5:.1f}, mtf_ok_count={mtf_ok_count}/3")
+        log(f"{sym}: buy5={buy5}, rsi5={rsi5:.1f}")
 
         if not buy5:
-            log(f"{sym} пропуск: 5m сигнал отсутствует")
+            log(f"{sym} пропуск: EMA не дала сигнал")
             continue
         if not rsi_ok:
             log(f"{sym} пропуск: RSI={rsi5:.1f} > 80")
-            continue
-        if not mtf_ok:
-            log(f"{sym} пропуск: MTF OK только на {mtf_ok_count}/3 TF")
             continue
 
         alloc_usdt = bal * weights[sym]
@@ -189,15 +180,18 @@ def trade():
         if qty * price < LIMITS[sym]["min_amt"]:
             log(f"{sym} пропуск: qty*price={qty*price:.2f} < min_amt")
             continue
-        est = atr * DEFAULT_PARAMS["tp_multiplier"] * qty - price * qty * 0.001 - DEFAULT_PARAMS["min_profit_usdt"]
+
+        est = atr * DEFAULT_PARAMS["tp_multiplier"] * qty \
+              - price * qty * 0.001 \
+              - DEFAULT_PARAMS["min_profit_usdt"]
         if est < 0:
-            log(f"{sym} пропуск: плохая PNL={est+DEFAULT_PARAMS['min_profit_usdt']:.2f}")
+            log(f"{sym} пропуск: плохая PNL, est={est+DEFAULT_PARAMS['min_profit_usdt']:.2f}")
             continue
 
         session.place_order(category="spot", symbol=sym, side="Buy", orderType="Market", qty=str(qty))
         tp = price + atr * DEFAULT_PARAMS["tp_multiplier"]
         STATE[sym]["pos"] = {"buy_price": price, "qty": qty, "tp": tp, "peak": price}
-        msg = f"✅ BUY {sym}@{price:.4f}, qty={qty:.6f}, Вес={weights[sym]:.3f}, TP~{tp:.4f}"
+        msg = f"✅ BUY {sym}@{price:.4f}, qty={qty:.6f}, TP~{tp:.4f}"
         log(msg); send_tg(msg)
 
         cb = get_coin_balance(sym)
@@ -214,10 +208,6 @@ def trade():
             reason = next((k for k,v in conds.items() if v), None)
             if reason:
                 qty_s = adjust(cb, LIMITS[sym]["step"])
-                pnl = (price - b) * q - price * q * 0.001
-                if pnl < DEFAULT_PARAMS["min_profit_usdt"]:
-                    log(f"{sym} пропуск продажи: PNL={pnl:.2f} < min_profit")
-                    continue
                 session.place_order(category="spot", symbol=sym, side="Sell", orderType="Market", qty=str(qty_s))
                 msg = f"✅ SELL {reason} {sym}@{price:.4f}, qty={qty_s:.6f}, PNL={pnl:.2f}"
                 log(msg); send_tg(msg)
@@ -244,8 +234,8 @@ def daily_report():
         open(fn,"w").write(str(now.date()))
 
 def main():
-    log("🚀 Bot старт — MTF фильтр 1/3, RSI<=80, объём OFF")
-    send_tg("🚀 Bot старт — MTF:1/3, RSI<=80. Фильтр объёма отключён")
+    log("🚀 Bot старт — EMA5, RSI<=80, PROFIT>=1.5USDT")
+    send_tg("🚀 Bot старт — EMA5, RSI<=80, PROFIT>=1.5USDT")
     while True:
         trade()
         daily_report()
