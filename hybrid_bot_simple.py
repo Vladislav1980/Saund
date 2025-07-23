@@ -17,11 +17,11 @@ API_KEY = os.getenv("BYBIT_API_KEY"); API_SECRET = os.getenv("BYBIT_API_SECRET")
 TG_TOKEN = os.getenv("TG_TOKEN"); CHAT_ID = os.getenv("CHAT_ID")
 
 DEFAULT_PARAMS = {
-    "risk_pct": 0.1,              # повысили аллокацию до 10%
+    "risk_pct": 0.05,             # увеличили до 5%
     "tp_multiplier": 1.8,
     "trailing_stop_pct": 0.02,
     "max_drawdown_sl": 0.06,
-    "min_profit_usdt": 1.5,       # минимум $1.5 чистой прибыли
+    "min_profit_usdt": 1.5,       # теперь 1.5 USDT чистой прибыли
     "avg_rebuy_drop_pct": 0.07,
     "rebuy_cooldown_secs": 3600,
     "volume_filter": False
@@ -29,7 +29,7 @@ DEFAULT_PARAMS = {
 
 RESERVE_BALANCE = 0
 DAILY_LOSS_LIMIT = -50
-MAX_POS_USDT = 50
+MAX_POS_USDT = 100  # было 50, увеличено до 100
 
 logging.basicConfig(
     level=logging.INFO,
@@ -176,10 +176,10 @@ def trade():
 
         alloc_usdt = bal * weights[sym]
         qty_usd = min(alloc_usdt * DEFAULT_PARAMS["risk_pct"], MAX_POS_USDT)
+        qty_usd = max(qty_usd, 5)  # минимум $5 вклада
         qty = adjust(qty_usd / price, LIMITS[sym]["step"])
-        # принудительно выставляем минималку = 1 USDT
-        if qty * price < LIMITS[sym]["min_amt"] and qty * price < 1:
-            log(f"{sym} пропуск: qty*price={qty*price:.2f} < min(Limit,1)")
+        if qty * price < LIMITS[sym]["min_amt"]:
+            log(f"{sym} пропуск: qty*price={qty*price:.2f} < min_amt")
             continue
 
         est = atr * DEFAULT_PARAMS["tp_multiplier"] * qty \
