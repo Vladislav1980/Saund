@@ -37,7 +37,7 @@ def send_tg(msg):
     try:
         requests.post(
             f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-            data={"chat_id": CHAT_ID, "text": msg.encode("utf-16", "surrogatepass").decode("utf-16")}
+            data={"chat_id": CHAT_ID, "text": msg}
         )
     except Exception as e:
         log(f"TG error: {e}")
@@ -47,27 +47,32 @@ def send_state_to_telegram(filepath):
         with open(filepath, 'rb') as f:
             url = f"https://api.telegram.org/bot{TG_TOKEN}/sendDocument"
             files = {'document': f}
-            data = {'chat_id': CHAT_ID, 'caption': '📄 Обновлённый state.json'}
+            data = {'chat_id': CHAT_ID}  # без caption — чтобы не спамить
             requests.post(url, files=files, data=data)
-            print(f"📤 state.json отправлен в Telegram")
     except Exception as e:
         print(f"❌ Ошибка при отправке state.json: {e}")
 
 def download_state_from_telegram():
     try:
         print("📥 Загрузка state.json из Telegram...")
-        res = requests.get(f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates").json()
+        updates_url = f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates"
+        res = requests.get(updates_url).json()
+
         docs = []
         for update in res.get("result", []):
             msg = update.get("message", {})
             doc = msg.get("document")
             if doc and doc.get("file_name") == "state.json":
                 docs.append((msg["date"], doc["file_id"]))
+
         if not docs:
             print("❌ state.json не найден в Telegram")
             return
-        latest_file_id = sorted(docs, reverse=True)[0][1]
-        file_path = requests.get(f"https://api.telegram.org/bot{TG_TOKEN}/getFile?file_id={latest_file_id}").json()['result']['file_path']
+
+        docs.sort(reverse=True)
+        latest_file_id = docs[0][1]
+        file_info = requests.get(f"https://api.telegram.org/bot{TG_TOKEN}/getFile?file_id={latest_file_id}").json()
+        file_path = file_info['result']['file_path']
         file_download_url = f"https://api.telegram.org/file/bot{TG_TOKEN}/{file_path}"
         r = requests.get(file_download_url)
         with open(STATE_PATH, 'wb') as f:
@@ -86,10 +91,7 @@ logging.basicConfig(
     ]
 )
 def log(msg):
-    try:
-        logging.info(msg.encode("utf-16", "surrogatepass").decode("utf-16"))
-    except:
-        logging.info(msg)
+    logging.info(msg)
 
 # === API ===
 session = HTTP(api_key=API_KEY, api_secret=API_SECRET, recv_window=15000)
@@ -147,13 +149,17 @@ def signal(df):
     df["vol_ch"] = df["vol"].pct_change().fillna(0)
     return df
 
-# === Состояние ===
+# === Работа с состоянием ===
 STATE = {}
 download_state_from_telegram()
 if os.path.exists(STATE_PATH):
     try:
-        STATE = json.load(open(STATE_PATH))
+        with open(STATE_PATH, "r") as f:
+            STATE = json.load(f)
     except: STATE = {}
+else:
+    STATE = {}
+
 for s in SYMBOLS:
     STATE.setdefault(s, {"pos": None, "count": 0, "pnl": 0.0})
 
@@ -163,7 +169,22 @@ def save_state():
             json.dump(STATE, f, indent=2)
         send_state_to_telegram(STATE_PATH)
     except Exception as e:
-        log(f"Ошибка сохранения state.json: {e}")
+        print(f"❌ Ошибка сохранения state.json: {e}")
+
+# === Весовые коэффициенты ===
+def calculate_weights(dfs):
+    weights = {}; total = 0
+    for sym, df in dfs.items():
+        score = 1.0
+        if df["15"]["ema9"] > df["15"]["ema21"]: score += 0.2
+        if df["60"]["ema9"] > df["60"]["ema21"]: score += 0.2
+        if df["240"]["ema9"] > df["240"]["ema21"]: score += 0.2
+        if 50 < df["5"]["rsi"] < 65: score += 0.2
+        weights[sym] = score
+        total += score
+    for sym in weights:
+        weights[sym] /= total
+    return weights
 
 # === Торговля ===
 def trade():
@@ -183,14 +204,10 @@ def trade():
             dfs[sym][tf] = df.iloc[-1]
     if not dfs: return
 
-    weights = {s: 1/len(dfs) for s in dfs}  # simplify weights
+    weights = calculate_weights(dfs)
     log(f"Весовые коэффициенты: {weights}")
 
     for sym, df in dfs.items():
-        if STATE[sym]["pos"]:
-            log(f"{sym} уже есть позиция — пропуск")
-            continue
-
         price = df["5"]["c"]
         atr = df["5"]["atr"]
         buy5 = df["5"]["ema9"] > df["5"]["ema21"]
@@ -207,14 +224,31 @@ def trade():
 
         try:
             session.place_order(category="spot", symbol=sym, side="Buy", orderType="Market", qty=str(qty))
+            tp = price + atr * DEFAULT_PARAMS["tp_multiplier"]
+            STATE[sym]["pos"] = {"buy_price": price, "qty": qty, "tp": tp, "peak": price}
+            msg = f"✅ BUY {sym}@{price:.4f}, qty={qty:.6f}, TP~{tp:.4f}"
+            log(msg); send_tg(msg)
         except Exception as e:
             log(f"❌ Ошибка покупки {sym}: {e}")
-            continue
-
-        tp = price + atr * DEFAULT_PARAMS["tp_multiplier"]
-        STATE[sym]["pos"] = {"buy_price": price, "qty": qty, "tp": tp, "peak": price}
-        msg = f"✅ BUY {sym}@{price:.4f}, qty={qty:.6f}, TP~{tp:.4f}"
-        log(msg); send_tg(msg)
+            for s in SYMBOLS:
+                pos = STATE.get(s, {}).get("pos")
+                if not pos: continue
+                price_now = get_klines(s, "5").iloc[-1]["c"]
+                b, q, tp, peak = pos.values()
+                pnl = (price_now - b) * q - price_now * q * 0.001
+                if pnl >= DEFAULT_PARAMS["min_profit_usdt"]:
+                    try:
+                        qty_s = adjust(get_coin_balance(s), LIMITS[s]["step"])
+                        session.place_order(category="spot", symbol=s, side="Sell", orderType="Market", qty=str(qty_s))
+                        msg = f"♻️ SELL (по нехватке баланса) {s}@{price_now:.4f}, qty={qty_s:.6f}, PNL={pnl:.2f}"
+                        log(msg); send_tg(msg)
+                        STATE[s]["pnl"] += pnl
+                        STATE[s]["count"] += 1
+                        STATE[s]["pos"] = None
+                        save_state()
+                        break
+                    except Exception as se:
+                        log(f"❌ Ошибка при продаже {s}: {se}")
 
     for sym in SYMBOLS:
         cb = get_coin_balance(sym)
@@ -228,7 +262,7 @@ def trade():
                 "STOPLOSS": price < b * (1 - DEFAULT_PARAMS["max_drawdown_sl"]),
                 "TRAILING": dd > DEFAULT_PARAMS["trailing_stop_pct"],
                 "TPREACHED": price >= tp,
-                "PROFIT": pnl >= DEFAULT_PARAMS["min_profit_usdt"] and pnl > price * q * 0.001
+                "PROFIT": pnl >= 1.1 and pnl > price * q * 0.001
             }
             reason = next((k for k,v in conds.items() if v), None)
             if reason:
@@ -241,7 +275,7 @@ def trade():
                 STATE[sym]["pos"] = None
     save_state()
 
-# === Отчет ===
+# === Ежедневный отчет ===
 def daily_report():
     now = datetime.datetime.now()
     fn = "last_report.txt"
@@ -257,7 +291,7 @@ def daily_report():
         save_state()
         open(fn, "w").write(str(now.date()))
 
-# === main ===
+# === Главная точка входа ===
 def main():
     log("🚀 Bot старт — EMA5, RSI<=80, PROFIT>=1.1USDT")
     send_tg("🚀 Bot старт — EMA5, RSI<=80, PROFIT>=1.1USDT")
