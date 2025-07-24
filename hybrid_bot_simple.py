@@ -73,16 +73,6 @@ def get_balance():
     except: pass
     return 0
 
-def get_coin_balance(sym):
-    coin = sym.replace("USDT", "")
-    try:
-        for w in session.get_wallet_balance(accountType="UNIFIED")["result"]["list"]:
-            for c in w["coin"]:
-                if c["coin"] == coin:
-                    return float(c["walletBalance"])
-    except: pass
-    return 0
-
 def get_klines(sym, interval="5", limit=100):
     try:
         r = session.get_kline(category="spot", symbol=sym, interval=interval, limit=limit)
@@ -175,6 +165,9 @@ def trade():
         if not rsi_ok:
             log(f"{sym} пропуск: RSI={rsi5:.1f} > 80")
             continue
+        if STATE[sym]["pos"] is not None:
+            log(f"{sym} пропуск: уже открыта позиция")
+            continue
 
         alloc_usdt = bal * weights[sym]
         qty_usd = min(alloc_usdt * DEFAULT_PARAMS["risk_pct"], MAX_POS_USDT)
@@ -190,30 +183,28 @@ def trade():
         msg = f"✅ BUY {sym}@{price:.4f}, qty={qty:.6f}, TP~{tp:.4f}"
         log(msg); send_tg(msg)
 
-        cb = get_coin_balance(sym)
-        if cb > 0:
+    for sym in SYMBOLS:
+        cb = get_balance()
+        if STATE[sym]["pos"]:
+            price = dfs[sym]["5"]["c"]
             b, q, tp_old, peak = STATE[sym]["pos"].values()
             peak = max(peak, price)
             pnl = (price - b) * q - price * q * 0.001
             dd = (peak - price) / peak
-            if pnl >= 1.1 and pnl > price * q * 0.001:
-                reason = "PROFIT_1.1"
-            else:
-                conds = {
-                    "STOPLOSS": price < b * (1 - DEFAULT_PARAMS["max_drawdown_sl"]),
-                    "TRAILING": dd > DEFAULT_PARAMS["trailing_stop_pct"],
-                    "PROFIT": price >= tp_old
-                }
-                reason = next((k for k,v in conds.items() if v), None)
+            conds = {
+                "STOPLOSS": price < b * (1 - DEFAULT_PARAMS["max_drawdown_sl"]),
+                "TRAILING": dd > DEFAULT_PARAMS["trailing_stop_pct"],
+                "PROFIT": pnl >= 1.1 and pnl > 0
+            }
+            reason = next((k for k,v in conds.items() if v), None)
             if reason:
-                qty_s = adjust(cb, LIMITS[sym]["step"])
+                qty_s = adjust(q, LIMITS[sym]["step"])
                 session.place_order(category="spot", symbol=sym, side="Sell", orderType="Market", qty=str(qty_s))
                 msg = f"✅ SELL {reason} {sym}@{price:.4f}, qty={qty_s:.6f}, PNL={pnl:.2f}"
                 log(msg); send_tg(msg)
                 STATE[sym]["pnl"] += pnl
                 STATE[sym]["count"] += 1
                 STATE[sym]["pos"] = None
-            break
 
     save_state()
 
