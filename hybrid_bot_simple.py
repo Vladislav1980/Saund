@@ -17,10 +17,10 @@ CHAT_ID = os.getenv("CHAT_ID")
 
 DEFAULT_PARAMS = {
     "risk_pct": 0.05,
-    "tp_multiplier": 1.3,  # изменено с 1.8
+    "tp_multiplier": 1.3,
     "trailing_stop_pct": 0.02,
     "max_drawdown_sl": 0.06,
-    "min_profit_usdt": 1.5,  # без изменений
+    "min_profit_usdt": 1.5,  # Оставлено для совместимости, но не используется ниже
     "avg_rebuy_drop_pct": 0.07,
     "rebuy_cooldown_secs": 3600,
     "volume_filter": False
@@ -184,11 +184,12 @@ def trade():
             log(f"{sym} пропуск: qty*price={qty*price:.2f} < min_amt")
             continue
 
+        min_profit = 1.1  # Новое условие
         est = atr * DEFAULT_PARAMS["tp_multiplier"] * qty \
               - price * qty * 0.001 \
-              - DEFAULT_PARAMS["min_profit_usdt"]
+              - min_profit
         if est < 0:
-            log(f"{sym} пропуск: плохая PNL, est={est+DEFAULT_PARAMS['min_profit_usdt']:.2f}")
+            log(f"{sym} пропуск: плохая PNL, est={est+min_profit:.2f}")
             continue
 
         session.place_order(category="spot", symbol=sym, side="Buy", orderType="Market", qty=str(qty))
@@ -237,8 +238,8 @@ def daily_report():
         open(fn, "w").write(str(now.date()))
 
 def main():
-    log("🚀 Bot старт — EMA5, RSI<=80, PROFIT>=1.5USDT")
-    send_tg("🚀 Bot старт — EMA5, RSI<=80, PROFIT>=1.5USDT")
+    log("🚀 Bot старт — EMA5, RSI<=80, PROFIT>=1.1USDT")
+    send_tg("🚀 Bot старт — EMA5, RSI<=80, PROFIT>=1.1USDT")
     while True:
         trade()
         daily_report()
