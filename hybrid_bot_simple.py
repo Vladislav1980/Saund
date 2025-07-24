@@ -6,17 +6,15 @@ from ta.momentum import RSIIndicator
 from ta.volatility import AverageTrueRange
 from pybit.unified_trading import HTTP
 
-# === Загрузка переменных окружения ===
+DEBUG = False
+SYMBOLS = ["TONUSDT", "DOGEUSDT", "XRPUSDT"]
+
 load_dotenv()
 API_KEY = os.getenv("BYBIT_API_KEY")
 API_SECRET = os.getenv("BYBIT_API_SECRET")
 TG_TOKEN = os.getenv("TG_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
-# === Настройки ===
-DEBUG = False
-SYMBOLS = ["TONUSDT", "DOGEUSDT", "XRPUSDT"]
-STATE_PATH = "state.json"
 DEFAULT_PARAMS = {
     "risk_pct": 0.05,
     "tp_multiplier": 1.3,
@@ -27,16 +25,20 @@ DEFAULT_PARAMS = {
     "rebuy_cooldown_secs": 3600,
     "volume_filter": False
 }
+
 RESERVE_BALANCE = 0
 DAILY_LOSS_LIMIT = -50
 MAX_POS_USDT = 100
 
-# === Логирование ===
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(message)s",
-    handlers=[logging.FileHandler("bot.log", mode="a", encoding="utf-8"), logging.StreamHandler()]
+    handlers=[
+        logging.FileHandler("bot.log", mode="a", encoding="utf-8"),
+        logging.StreamHandler()
+    ]
 )
+
 def log(msg): logging.info(msg)
 
 def send_tg(msg):
@@ -47,34 +49,6 @@ def send_tg(msg):
         )
     except Exception as e:
         log(f"TG error: {e}")
-
-def send_state_to_telegram():
-    try:
-        with open(STATE_PATH, "rb") as f:
-            requests.post(
-                f"https://api.telegram.org/bot{TG_TOKEN}/sendDocument",
-                data={"chat_id": CHAT_ID, "caption": "📄 Обновлённый state.json"},
-                files={"document": f}
-            )
-    except Exception as e:
-        log(f"Ошибка отправки state.json: {e}")
-
-def load_state_from_telegram():
-    try:
-        updates = requests.get(f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates").json()
-        documents = [m["message"]["document"] for m in updates.get("result", []) if "document" in m.get("message", {})]
-        for doc in reversed(documents):
-            if doc["file_name"] == "state.json":
-                file_id = doc["file_id"]
-                file_path = requests.get(f"https://api.telegram.org/bot{TG_TOKEN}/getFile?file_id={file_id}").json()["result"]["file_path"]
-                file_url = f"https://api.telegram.org/file/bot{TG_TOKEN}/{file_path}"
-                r = requests.get(file_url)
-                with open(STATE_PATH, "wb") as f:
-                    f.write(r.content)
-                log("📥 Загружен state.json из Telegram")
-                break
-    except Exception as e:
-        log(f"Ошибка загрузки state.json из Telegram: {e}")
 
 session = HTTP(api_key=API_KEY, api_secret=API_SECRET, recv_window=15000)
 LIMITS = {}
@@ -94,7 +68,8 @@ def get_balance():
     try:
         for w in session.get_wallet_balance(accountType="UNIFIED")["result"]["list"]:
             for c in w["coin"]:
-                if c["coin"] == "USDT": return float(c["walletBalance"])
+                if c["coin"] == "USDT":
+                    return float(c["walletBalance"])
     except: pass
     return 0
 
@@ -103,7 +78,8 @@ def get_coin_balance(sym):
     try:
         for w in session.get_wallet_balance(accountType="UNIFIED")["result"]["list"]:
             for c in w["coin"]:
-                if c["coin"] == coin: return float(c["walletBalance"])
+                if c["coin"] == coin:
+                    return float(c["walletBalance"])
     except: pass
     return 0
 
@@ -129,31 +105,33 @@ def signal(df):
     df["vol_ch"] = df["vol"].pct_change().fillna(0)
     return df
 
-# === STATE ===
 STATE = {}
-if not os.path.exists(STATE_PATH):
-    load_state_from_telegram()
-if os.path.exists(STATE_PATH):
-    try: STATE = json.load(open(STATE_PATH))
+if os.path.exists("state.json"):
+    try: STATE = json.load(open("state.json"))
     except: STATE = {}
 for s in SYMBOLS:
     STATE.setdefault(s, {"pos": None, "count": 0, "pnl": 0.0})
 
 def save_state():
+    json.dump(STATE, open("state.json", "w"), indent=2)
     try:
-        json.dump(STATE, open(STATE_PATH, "w"), indent=2)
-        send_state_to_telegram()
+        requests.post(
+            f"https://api.telegram.org/bot{TG_TOKEN}/sendDocument",
+            data={"chat_id": CHAT_ID},
+            files={"document": ("state.json", open("state.json", "rb"))}
+        )
     except Exception as e:
-        log(f"Ошибка сохранения state.json: {e}")
+        log(f"TG state send error: {e}")
 
 def calculate_weights(dfs):
     weights = {}
     total = 0
     for sym, df in dfs.items():
         score = 1.0
-        if df["15"]["ema9"] > df["15"]["ema21"]: score += 0.2
-        if df["60"]["ema9"] > df["60"]["ema21"]: score += 0.2
-        if df["240"]["ema9"] > df["240"]["ema21"]: score += 0.2
+        ok15 = df["15"]["ema9"] > df["15"]["ema21"]
+        ok60 = df["60"]["ema9"] > df["60"]["ema21"]
+        ok240= df["240"]["ema9"] > df["240"]["ema21"]
+        if ok15 and ok60 and ok240: score += 0.5
         if 50 < df["5"]["rsi"] < 65: score += 0.2
         weights[sym] = score
         total += score
@@ -188,12 +166,22 @@ def trade():
     for sym, df in dfs.items():
         log(f"--- {sym} индикаторы ---")
         for tf, last in df.items():
-            log(f"{sym} {tf}m: EMA9={last['ema9']:.2f}, EMA21={last['ema21']:.2f}, MACD={last['macd']:.4f}/{last['macd_s']:.4f}, RSI={last['rsi']:.1f}, ATR={last['atr']:.4f}, vol_ch={last['vol_ch']:.2f}")
+            log(f"{sym} {tf}m: EMA9={last['ema9']:.2f}, EMA21={last['ema21']:.2f}, "
+                f"MACD={last['macd']:.4f}/{last['macd_s']:.4f}, RSI={last['rsi']:.1f}, "
+                f"ATR={last['atr']:.4f}, vol_ch={last['vol_ch']:.2f}")
 
         price = df["5"]["c"]
         atr = df["5"]["atr"]
-        if df["5"]["ema9"] <= df["5"]["ema21"] or df["5"]["rsi"] > 80:
-            log(f"{sym} пропуск по фильтрам EMA или RSI")
+        buy5 = df["5"]["ema9"] > df["5"]["ema21"]
+        rsi5 = df["5"]["rsi"]
+        rsi_ok = rsi5 <= 80
+        log(f"{sym}: buy5={buy5}, rsi5={rsi5:.1f}")
+
+        if not buy5:
+            log(f"{sym} пропуск: EMA не дала сигнал")
+            continue
+        if not rsi_ok:
+            log(f"{sym} пропуск: RSI={rsi5:.1f} > 80")
             continue
 
         alloc_usdt = bal * weights[sym]
@@ -204,11 +192,16 @@ def trade():
             log(f"{sym} пропуск: qty*price={qty*price:.2f} < min_amt")
             continue
 
-        session.place_order(category="spot", symbol=sym, side="Buy", orderType="Market", qty=str(qty))
-        tp = price + atr * DEFAULT_PARAMS["tp_multiplier"]
-        STATE[sym]["pos"] = {"buy_price": price, "qty": qty, "tp": tp, "peak": price}
-        msg = f"✅ BUY {sym}@{price:.4f}, qty={qty:.6f}, TP~{tp:.4f}"
-        log(msg); send_tg(msg)
+        try:
+            session.place_order(category="spot", symbol=sym, side="Buy", orderType="Market", qty=str(qty))
+            tp = price + atr * DEFAULT_PARAMS["tp_multiplier"]
+            STATE[sym]["pos"] = {"buy_price": price, "qty": qty, "tp": tp, "peak": price}
+            msg = f"✅ BUY {sym}@{price:.4f}, qty={qty:.6f}, TP~{tp:.4f}"
+            log(msg); send_tg(msg)
+        except Exception as e:
+            log(f"❌ Ошибка покупки {sym}: {e}")
+            send_tg(f"❌ Ошибка покупки {sym}: {e}")
+            continue
 
     for sym in SYMBOLS:
         cb = get_coin_balance(sym)
@@ -241,9 +234,10 @@ def daily_report():
     fn = "last_report.txt"
     prev = open(fn).read().strip() if os.path.exists(fn) else ""
     if now.hour == 22 and str(now.date()) != prev:
-        rep = "📊 Ежедневный отчет\n" + "\n".join(
-            f"{s}: trades={STATE[s]['count']}, pnl={STATE[s]['pnl']:.2f}" for s in SYMBOLS
-        ) + f"\nБаланс={get_balance():.2f}"
+        rep = "\ud83d\udcca \u0415\u0436\u0435\u0434\u043d\u0435\u0432\u043d\u044b\u0439 \u043e\u0442\u0447\u0451\u0442\n" + "\n".join(
+            f"{s}: trades={STATE[s]['count']}, pnl={STATE[s]['pnl']:.2f}"
+            for s in SYMBOLS
+        ) + f"\n\u0411\u0430\u043b\u0430\u043d\u0441={get_balance():.2f}"
         send_tg(rep)
         for s in SYMBOLS:
             STATE[s]["count"] = STATE[s]["pnl"] = 0.0
@@ -251,11 +245,15 @@ def daily_report():
         open(fn, "w").write(str(now.date()))
 
 def main():
-    log("🚀 Bot старт — EMA5, RSI<=80, PROFIT>=1.1USDT")
-    send_tg("🚀 Bot старт — EMA5, RSI<=80, PROFIT>=1.1USDT")
+    log("\ud83d\ude80 Bot \u0441\u0442\u0430\u0440\u0442 \u2014 EMA5, RSI<=80, PROFIT>=1.1USDT")
+    send_tg("\ud83d\ude80 Bot \u0441\u0442\u0430\u0440\u0442 \u2014 EMA5, RSI<=80, PROFIT>=1.1USDT")
     while True:
-        trade()
-        daily_report()
+        try:
+            trade()
+            daily_report()
+        except Exception as e:
+            log(f"\u26a0\ufe0f \u041e\u0448\u0438\u0431\u043a\u0430: {e}")
+            send_tg(f"\u26a0\ufe0f \u041e\u0448\u0438\u0431\u043a\u0430: {e}")
         time.sleep(60)
 
 if __name__ == "__main__":
