@@ -114,14 +114,6 @@ for s in SYMBOLS:
 
 def save_state():
     json.dump(STATE, open("state.json", "w"), indent=2)
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{TG_TOKEN}/sendDocument",
-            data={"chat_id": CHAT_ID},
-            files={"document": ("state.json", open("state.json", "rb"))}
-        )
-    except Exception as e:
-        log(f"TG state send error: {e}")
 
 def calculate_weights(dfs):
     weights = {}
@@ -166,9 +158,7 @@ def trade():
     for sym, df in dfs.items():
         log(f"--- {sym} индикаторы ---")
         for tf, last in df.items():
-            log(f"{sym} {tf}m: EMA9={last['ema9']:.2f}, EMA21={last['ema21']:.2f}, "
-                f"MACD={last['macd']:.4f}/{last['macd_s']:.4f}, RSI={last['rsi']:.1f}, "
-                f"ATR={last['atr']:.4f}, vol_ch={last['vol_ch']:.2f}")
+            log(f"{sym} {tf}m: EMA9={last['ema9']:.2f}, EMA21={last['ema21']:.2f}, MACD={last['macd']:.4f}/{last['macd_s']:.4f}, RSI={last['rsi']:.1f}, ATR={last['atr']:.4f}, vol_ch={last['vol_ch']:.2f}")
 
         price = df["5"]["c"]
         atr = df["5"]["atr"]
@@ -183,6 +173,9 @@ def trade():
         if not rsi_ok:
             log(f"{sym} пропуск: RSI={rsi5:.1f} > 80")
             continue
+        if STATE[sym]["pos"]:
+            log(f"{sym} пропуск: уже есть открытая позиция")
+            continue
 
         alloc_usdt = bal * weights[sym]
         qty_usd = min(alloc_usdt * DEFAULT_PARAMS["risk_pct"], MAX_POS_USDT)
@@ -192,16 +185,11 @@ def trade():
             log(f"{sym} пропуск: qty*price={qty*price:.2f} < min_amt")
             continue
 
-        try:
-            session.place_order(category="spot", symbol=sym, side="Buy", orderType="Market", qty=str(qty))
-            tp = price + atr * DEFAULT_PARAMS["tp_multiplier"]
-            STATE[sym]["pos"] = {"buy_price": price, "qty": qty, "tp": tp, "peak": price}
-            msg = f"✅ BUY {sym}@{price:.4f}, qty={qty:.6f}, TP~{tp:.4f}"
-            log(msg); send_tg(msg)
-        except Exception as e:
-            log(f"❌ Ошибка покупки {sym}: {e}")
-            send_tg(f"❌ Ошибка покупки {sym}: {e}")
-            continue
+        session.place_order(category="spot", symbol=sym, side="Buy", orderType="Market", qty=str(qty))
+        tp = price + atr * DEFAULT_PARAMS["tp_multiplier"]
+        STATE[sym]["pos"] = {"buy_price": price, "qty": qty, "tp": tp, "peak": price}
+        msg = f"✅ BUY {sym}@{price:.4f}, qty={qty:.6f}, TP~{tp:.4f}"
+        log(msg); send_tg(msg)
 
     for sym in SYMBOLS:
         cb = get_coin_balance(sym)
@@ -234,10 +222,10 @@ def daily_report():
     fn = "last_report.txt"
     prev = open(fn).read().strip() if os.path.exists(fn) else ""
     if now.hour == 22 and str(now.date()) != prev:
-        rep = "\ud83d\udcca \u0415\u0436\u0435\u0434\u043d\u0435\u0432\u043d\u044b\u0439 \u043e\u0442\u0447\u0451\u0442\n" + "\n".join(
+        rep = "📊 Ежедневный отчет\n" + "\n".join(
             f"{s}: trades={STATE[s]['count']}, pnl={STATE[s]['pnl']:.2f}"
             for s in SYMBOLS
-        ) + f"\n\u0411\u0430\u043b\u0430\u043d\u0441={get_balance():.2f}"
+        ) + f"\nБаланс={get_balance():.2f}"
         send_tg(rep)
         for s in SYMBOLS:
             STATE[s]["count"] = STATE[s]["pnl"] = 0.0
@@ -245,15 +233,11 @@ def daily_report():
         open(fn, "w").write(str(now.date()))
 
 def main():
-    log("\ud83d\ude80 Bot \u0441\u0442\u0430\u0440\u0442 \u2014 EMA5, RSI<=80, PROFIT>=1.1USDT")
-    send_tg("\ud83d\ude80 Bot \u0441\u0442\u0430\u0440\u0442 \u2014 EMA5, RSI<=80, PROFIT>=1.1USDT")
+    log("\ud83d\ude80 Bot старт — EMA5, RSI<=80, PROFIT>=1.1USDT")
+    send_tg("\ud83d\ude80 Bot старт — EMA5, RSI<=80, PROFIT>=1.1USDT")
     while True:
-        try:
-            trade()
-            daily_report()
-        except Exception as e:
-            log(f"\u26a0\ufe0f \u041e\u0448\u0438\u0431\u043a\u0430: {e}")
-            send_tg(f"\u26a0\ufe0f \u041e\u0448\u0438\u0431\u043a\u0430: {e}")
+        trade()
+        daily_report()
         time.sleep(60)
 
 if __name__ == "__main__":
