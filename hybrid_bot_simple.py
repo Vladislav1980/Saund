@@ -7,7 +7,7 @@ from ta.volatility import AverageTrueRange
 from pybit.unified_trading import HTTP
 
 DEBUG = False
-SYMBOLS = ["TONUSDT", "DOGEUSDT", "XRPUSDT"]  # ← оставлены только эти три
+SYMBOLS = ["TONUSDT", "DOGEUSDT", "XRPUSDT"]
 
 load_dotenv()
 API_KEY = os.getenv("BYBIT_API_KEY"); API_SECRET = os.getenv("BYBIT_API_SECRET")
@@ -18,7 +18,7 @@ DEFAULT_PARAMS = {
     "tp_multiplier": 1.8,
     "trailing_stop_pct": 0.02,
     "max_drawdown_sl": 0.06,
-    "min_profit_usdt": 1.5,  # ← учтена минимальная прибыль
+    "min_profit_usdt": 1.5,
     "avg_rebuy_drop_pct": 0.07,
     "rebuy_cooldown_secs": 3600,
     "volume_filter": False
@@ -36,7 +36,6 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
-
 def log(msg): logging.info(msg)
 def send_tg(msg):
     try:
@@ -57,7 +56,7 @@ def load_limits():
             f = it.get("lotSizeFilter", {})
             LIMITS[s] = {
                 "step": float(f.get("qtyStep", 1)),
-                "min_amt": float(it.get("minOrderAmt", 10)),
+                "min_amt": 5.0,  # заменено с float(it.get("minOrderAmt", 10))
                 "max_amt": float(it.get("maxOrderAmt", 1e9))
             }
 
@@ -174,7 +173,7 @@ def trade():
 
         alloc_usdt = bal * weights[sym]
         qty_usd = min(alloc_usdt * DEFAULT_PARAMS["risk_pct"], MAX_POS_USDT)
-        qty_usd = max(qty_usd, 5)
+        qty_usd = max(qty_usd, 30)  # было 5, стало 30
         qty = adjust(qty_usd / price, LIMITS[sym]["step"])
         if qty * price < LIMITS[sym]["min_amt"]:
             log(f"{sym} пропуск: qty*price={qty*price:.2f} < min_amt")
