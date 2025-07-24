@@ -184,14 +184,6 @@ def trade():
             log(f"{sym} пропуск: qty*price={qty*price:.2f} < min_amt")
             continue
 
-        min_profit = 1.1  # Новое условие
-        est = atr * DEFAULT_PARAMS["tp_multiplier"] * qty \
-              - price * qty * 0.001 \
-              - min_profit
-        if est < 0:
-            log(f"{sym} пропуск: плохая PNL, est={est+min_profit:.2f}")
-            continue
-
         session.place_order(category="spot", symbol=sym, side="Buy", orderType="Market", qty=str(qty))
         tp = price + atr * DEFAULT_PARAMS["tp_multiplier"]
         STATE[sym]["pos"] = {"buy_price": price, "qty": qty, "tp": tp, "peak": price}
@@ -204,12 +196,15 @@ def trade():
             peak = max(peak, price)
             pnl = (price - b) * q - price * q * 0.001
             dd = (peak - price) / peak
-            conds = {
-                "STOPLOSS": price < b * (1 - DEFAULT_PARAMS["max_drawdown_sl"]),
-                "TRAILING": dd > DEFAULT_PARAMS["trailing_stop_pct"],
-                "PROFIT": price >= tp_old
-            }
-            reason = next((k for k,v in conds.items() if v), None)
+            if pnl >= 1.1 and pnl > price * q * 0.001:
+                reason = "PROFIT_1.1"
+            else:
+                conds = {
+                    "STOPLOSS": price < b * (1 - DEFAULT_PARAMS["max_drawdown_sl"]),
+                    "TRAILING": dd > DEFAULT_PARAMS["trailing_stop_pct"],
+                    "PROFIT": price >= tp_old
+                }
+                reason = next((k for k,v in conds.items() if v), None)
             if reason:
                 qty_s = adjust(cb, LIMITS[sym]["step"])
                 session.place_order(category="spot", symbol=sym, side="Sell", orderType="Market", qty=str(qty_s))
