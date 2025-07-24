@@ -1,4 +1,4 @@
-import os, time, math, json, datetime, logging, requests
+ os, time, math, json, datetime, logging, requests
 import pandas as pd
 from dotenv import load_dotenv
 from ta.trend import EMAIndicator, MACD
