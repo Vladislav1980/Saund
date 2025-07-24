@@ -10,15 +10,17 @@ DEBUG = False
 SYMBOLS = ["TONUSDT", "DOGEUSDT", "XRPUSDT"]
 
 load_dotenv()
-API_KEY = os.getenv("BYBIT_API_KEY"); API_SECRET = os.getenv("BYBIT_API_SECRET")
-TG_TOKEN = os.getenv("TG_TOKEN"); CHAT_ID = os.getenv("CHAT_ID")
+API_KEY = os.getenv("BYBIT_API_KEY")
+API_SECRET = os.getenv("BYBIT_API_SECRET")
+TG_TOKEN = os.getenv("TG_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
 
 DEFAULT_PARAMS = {
     "risk_pct": 0.05,
-    "tp_multiplier": 1.8,
+    "tp_multiplier": 1.3,  # изменено с 1.8
     "trailing_stop_pct": 0.02,
     "max_drawdown_sl": 0.06,
-    "min_profit_usdt": 1.5,
+    "min_profit_usdt": 1.5,  # без изменений
     "avg_rebuy_drop_pct": 0.07,
     "rebuy_cooldown_secs": 3600,
     "volume_filter": False
@@ -36,7 +38,9 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
+
 def log(msg): logging.info(msg)
+
 def send_tg(msg):
     try:
         requests.post(
@@ -56,7 +60,7 @@ def load_limits():
             f = it.get("lotSizeFilter", {})
             LIMITS[s] = {
                 "step": float(f.get("qtyStep", 1)),
-                "min_amt": 5.0,  # заменено с float(it.get("minOrderAmt", 10))
+                "min_amt": 5.0,
                 "max_amt": float(it.get("maxOrderAmt", 1e9))
             }
 
@@ -64,16 +68,18 @@ def get_balance():
     try:
         for w in session.get_wallet_balance(accountType="UNIFIED")["result"]["list"]:
             for c in w["coin"]:
-                if c["coin"] == "USDT": return float(c["walletBalance"])
+                if c["coin"] == "USDT":
+                    return float(c["walletBalance"])
     except: pass
     return 0
 
 def get_coin_balance(sym):
-    coin = sym.replace("USDT","")
+    coin = sym.replace("USDT", "")
     try:
         for w in session.get_wallet_balance(accountType="UNIFIED")["result"]["list"]:
             for c in w["coin"]:
-                if c["coin"] == coin: return float(c["walletBalance"])
+                if c["coin"] == coin:
+                    return float(c["walletBalance"])
     except: pass
     return 0
 
@@ -105,8 +111,9 @@ if os.path.exists("state.json"):
     except: STATE = {}
 for s in SYMBOLS:
     STATE.setdefault(s, {"pos": None, "count": 0, "pnl": 0.0})
+
 def save_state():
-    json.dump(STATE, open("state.json","w"), indent=2)
+    json.dump(STATE, open("state.json", "w"), indent=2)
 
 def calculate_weights(dfs):
     weights = {}
@@ -151,11 +158,9 @@ def trade():
     for sym, df in dfs.items():
         log(f"--- {sym} индикаторы ---")
         for tf, last in df.items():
-            log(
-                f"{sym} {tf}m: EMA9={last['ema9']:.2f}, EMA21={last['ema21']:.2f}, "
+            log(f"{sym} {tf}m: EMA9={last['ema9']:.2f}, EMA21={last['ema21']:.2f}, "
                 f"MACD={last['macd']:.4f}/{last['macd_s']:.4f}, RSI={last['rsi']:.1f}, "
-                f"ATR={last['atr']:.4f}, vol_ch={last['vol_ch']:.2f}"
-            )
+                f"ATR={last['atr']:.4f}, vol_ch={last['vol_ch']:.2f}")
 
         price = df["5"]["c"]
         atr = df["5"]["atr"]
@@ -173,7 +178,7 @@ def trade():
 
         alloc_usdt = bal * weights[sym]
         qty_usd = min(alloc_usdt * DEFAULT_PARAMS["risk_pct"], MAX_POS_USDT)
-        qty_usd = max(qty_usd, 30)  # было 5, стало 30
+        qty_usd = max(qty_usd, 30)
         qty = adjust(qty_usd / price, LIMITS[sym]["step"])
         if qty * price < LIMITS[sym]["min_amt"]:
             log(f"{sym} пропуск: qty*price={qty*price:.2f} < min_amt")
@@ -229,7 +234,7 @@ def daily_report():
         for s in SYMBOLS:
             STATE[s]["count"] = STATE[s]["pnl"] = 0.0
         save_state()
-        open(fn,"w").write(str(now.date()))
+        open(fn, "w").write(str(now.date()))
 
 def main():
     log("🚀 Bot старт — EMA5, RSI<=80, PROFIT>=1.5USDT")
@@ -239,5 +244,5 @@ def main():
         daily_report()
         time.sleep(60)
 
-if __name__=="__main__":
+if __name__ == "__main__":
     main()
