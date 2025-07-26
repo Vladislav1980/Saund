@@ -33,6 +33,8 @@ DAILY_LOSS_LIMIT = -50
 MAX_POS_USDT = 100
 
 # === Telegram ===
+last_notify_time = 0
+
 def send_tg(msg):
     try:
         requests.post(
@@ -47,7 +49,7 @@ def send_state_to_telegram(filepath):
         with open(filepath, 'rb') as f:
             url = f"https://api.telegram.org/bot{TG_TOKEN}/sendDocument"
             files = {'document': f}
-            data = {'chat_id': CHAT_ID}
+            data = {'chat_id': CHAT_ID, 'disable_notification': True}
             requests.post(url, files=files, data=data)
     except Exception as e:
         print(f"❌ Ошибка при отправке state.json: {e}")
@@ -85,6 +87,7 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
+
 def log(msg):
     try:
         logging.info(msg)
@@ -188,7 +191,7 @@ def calculate_weights(dfs):
 def trade():
     bal = get_balance()
     log(f"Баланс USDT: {bal:.2f}")
-    if bal < RESERVE_BALANCE or sum(STATE[s]["pnl"] for s in SYMBOLS) < DAILY_LOSS_LIMIT:
+    if bal < RESERVE_BALANCE or sum(STATE.get(s, {}).get("pnl", 0) for s in SYMBOLS) < DAILY_LOSS_LIMIT:
         log("🚫 Торговля остановлена по лимиту"); return
 
     load_limits()
@@ -206,23 +209,19 @@ def trade():
     log(f"Весовые коэффициенты: {weights}")
 
     for sym, df in dfs.items():
-        log(f"--- {sym} индикаторы ---")
-        for tf, last in df.items():
-            log(f"{sym} {tf}m: EMA9={last['ema9']:.2f}, EMA21={last['ema21']:.2f}, RSI={last['rsi']:.1f}")
-
         price = df["5"]["c"]
         atr = df["5"]["atr"]
         buy5 = df["5"]["ema9"] > df["5"]["ema21"]
         rsi_ok = df["5"]["rsi"] <= 80
         if not buy5 or not rsi_ok:
-            log(f"{sym} пропуск сигнала"); continue
+            continue
 
         alloc_usdt = bal * weights[sym]
         qty_usd = min(alloc_usdt * DEFAULT_PARAMS["risk_pct"], MAX_POS_USDT)
         qty_usd = max(qty_usd, 30)
         qty = adjust(qty_usd / price, LIMITS[sym]["step"])
         if qty * price < LIMITS[sym]["min_amt"]:
-            log(f"{sym} qty*price < min_amt"); continue
+            continue
 
         try:
             session.place_order(category="spot", symbol=sym, side="Buy", orderType="Market", qty=str(qty))
@@ -270,28 +269,19 @@ def daily_report():
         ) + f"\nБаланс={get_balance():.2f}"
         send_tg(rep)
         for s in SYMBOLS:
-            STATE[s]["count"] = STATE[s]["pnl"] = 0.0
+            STATE[s]["count"] = 0; STATE[s]["pnl"] = 0.0
         save_state()
         open(fn, "w").write(str(now.date()))
 
 # === Главная точка входа ===
 def main():
-    boot_file = "boot.flag"
-    now = time.time()
-    last_boot = 0
-    if os.path.exists(boot_file):
-        try:
-            with open(boot_file, "r") as f:
-                last_boot = float(f.read())
-        except: pass
-    if now - last_boot > 300:
+    global last_notify_time
+    if time.time() - last_notify_time > 3600:
         log("🚀 Bot запущен")
         send_tg("🚀 Bot запущен")
-        with open(boot_file, "w") as f:
-            f.write(str(now))
+        last_notify_time = time.time()
     else:
         log("⏳ Bot уже запущен недавно, уведомление не отправлено")
-
     while True:
         trade()
         daily_report()
