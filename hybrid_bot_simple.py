@@ -106,7 +106,7 @@ def signal(df):
     df["ema21"] = EMAIndicator(df["c"], 21).ema_indicator()
     df["rsi"] = RSIIndicator(df["c"], 9).rsi()
     df["atr"] = AverageTrueRange(df["h"], df["l"], df["c"], 14).average_true_range()
-    macd = MACD(df["c"], fast=6, slow=40, signal=4)
+    macd = MACD(close=df["c"])
     df["macd"], df["macd_signal"] = macd.macd(), macd.macd_signal()
     last = df.iloc[-1]
     info = (f"EMA9={last['ema9']:.4f},EMA21={last['ema21']:.4f},"
