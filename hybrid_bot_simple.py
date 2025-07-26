@@ -1,4 +1,4 @@
-import os, time, math, logging, datetime, requests
+import os, time, math, logging, datetime, requests, json
 import pandas as pd
 from dotenv import load_dotenv
 from pybit.unified_trading import HTTP
@@ -14,18 +14,18 @@ TG_TOKEN = os.getenv("TG_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
 TG_VERBOSE = True
-RESERVE_BALANCE = 1.0  # минимальный несгораемый баланс
+RESERVE_BALANCE = 1.0
 TRAIL_MULTIPLIER = 1.5
 MAX_DRAWDOWN = 0.10
 MAX_AVERAGES = 3
 MIN_PROFIT_PCT = 0.005
 MIN_ABSOLUTE_PNL = 3.0
-MIN_NET_PROFIT = 1.50  # минимальная чистая прибыль после комиссии
+MIN_NET_PROFIT = 1.50
 STOP_LOSS_PCT = 0.03
 SYMBOLS = ["TONUSDT", "DOGEUSDT", "XRPUSDT"]
+STATE_FILE = "state.json"
 
 session = HTTP(api_key=API_KEY, api_secret=API_SECRET, recv_window=15000)
-STATE = {s: {"positions": [], "pnl": 0.0, "count": 0, "avg_count": 0, "last_sell_price": 0.0} for s in SYMBOLS}
 LIMITS, LAST_REPORT_DATE = {}, None
 cycle_count = 0
 
@@ -41,12 +41,26 @@ def send_tg(msg):
             requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
                           data={"chat_id": CHAT_ID, "text": msg})
         except Exception as e:
-            logging.error(f“Tg send error: {e}”)
+            logging.error(f"Tg send error: {e}")
 
 def log(msg, tg=False):
     logging.info(msg)
     if tg:
         send_tg(msg)
+
+def save_state():
+    with open(STATE_FILE, "w") as f:
+        json.dump(STATE, f, default=list, indent=2)
+
+def init_state():
+    global STATE
+    try:
+        with open(STATE_FILE, "r") as f:
+            STATE = json.load(f)
+        log("✅ Loaded state from file", True)
+    except FileNotFoundError:
+        STATE = {s: {"positions": [], "pnl": 0.0, "count": 0, "avg_count": 0, "last_sell_price": 0.0} for s in SYMBOLS}
+        log("ℹ No state file found — starting fresh", True)
 
 def log_trade(sym, side, price, qty, pnl, info=""):
     usdt_val = price * qty
@@ -54,6 +68,7 @@ def log_trade(sym, side, price, qty, pnl, info=""):
     log(msg, True)
     with open("trades.csv", "a") as f:
         f.write(f"{datetime.datetime.now()},{sym},{side},{price},{qty},{usdt_val},{pnl},{info}\n")
+    save_state()
 
 def load_symbol_limits():
     data = session.get_instruments_info(category="spot")["result"]["list"]
@@ -83,7 +98,8 @@ def signal(df):
     macd = MACD(df["c"], fast=6, slow=40, signal=4)
     df["macd"], df["macd_signal"] = macd.macd(), macd.macd_signal()
     last = df.iloc[-1]
-    info = f"EMA9={last['ema9']:.4f},EMA21={last['ema21']:.4f},RSI={last['rsi']:.2f},MACD={last['macd']:.4f},SIG={last['macd_signal']:.4f}"
+    info = (f"EMA9={last['ema9']:.4f},EMA21={last['ema21']:.4f},"
+            f"RSI={last['rsi']:.2f},MACD={last['macd']:.4f},SIG={last['macd_signal']:.4f}")
     if last["ema9"] > last["ema21"] and last["rsi"] < 20 and last["macd"] > last["macd_signal"]:
         return "buy", last["atr"], info
     elif last["ema9"] < last["ema21"] and last["rsi"] > 80 and last["macd"] < last["macd_signal"]:
@@ -125,6 +141,7 @@ def init_positions():
             tp = price + TRAIL_MULTIPLIER * atr
             STATE[sym]["positions"].append({"buy_price": price, "qty": qty, "tp": tp})
             log(f"[{sym}] Recovered pos: qty={qty}, price={price:.4f}, tp={tp:.4f}", True)
+    save_state()
 
 def trade():
     global LAST_REPORT_DATE, cycle_count
@@ -132,14 +149,14 @@ def trade():
     log(f"USDT Balance: {usdt:.2f}")
     avail = max(0, usdt - RESERVE_BALANCE)
     if avail < LIMITS[SYMBOLS[0]]["min_amt"]:
-        log("Недостаточно USDT — продаём некоторые монеты для пополнения...")
+        log("Недостаточно USDT — пытаюсь продать активы...")
         for sym in SYMBOLS:
             bc = get_coin_balance(sym)
             price = get_kline(sym)["c"].iloc[-1]
             if bc * price >= LIMITS[sym]["min_amt"]:
                 qty = adjust_qty(bc, LIMITS[sym]["qty_step"])
                 session.place_order(category="spot", symbol=sym, side="Sell", orderType="Market", qty=str(qty))
-                log_trade(sym, "SELL for USDT", price, qty, 0.0, "to replenish USDT")
+                log_trade(sym, "SELL for USDT", price, qty, 0.0, "replenishing USDT")
         usdt = get_balance()
         avail = max(0, usdt - RESERVE_BALANCE)
 
@@ -148,7 +165,8 @@ def trade():
     for sym in SYMBOLS:
         try:
             df = get_kline(sym)
-            if df.empty: continue
+            if df.empty:
+                continue
             sig, atr, info_ind = signal(df)
             price = df["c"].iloc[-1]
             state = STATE[sym]
@@ -169,19 +187,17 @@ def trade():
                 if price <= b * (1 - STOP_LOSS_PCT):
                     if pnl >= MIN_NET_PROFIT:
                         session.place_order(category="spot", symbol=sym, side="Sell", orderType="Market", qty=str(q))
-                        log_trade(sym, "STOP LOSS SELL", price, q, pnl,
-                                  f"stop‑loss hit, pnl≥{MIN_NET_PROFIT}")
+                        log_trade(sym, "STOP LOSS SELL", price, q, pnl, f"stop-loss hit, pnl≥{MIN_NET_PROFIT}")
                         state["pnl"] += pnl
                         coin_bal -= q
                         state["last_sell_price"] = price
                     else:
-                        log(f"[{sym}] Stop‑loss skipped: net pnl {pnl:.2f} <", MIN_NET_PROFIT)
+                        log(f"[{sym}] Stop-loss skipped: net pnl {pnl:.2f} < {MIN_NET_PROFIT}")
                     continue
 
                 if price >= tp and pnl >= min_req:
                     session.place_order(category="spot", symbol=sym, side="Sell", orderType="Market", qty=str(q))
-                    log_trade(sym, "TP SELL", price, q, pnl,
-                              f"tp hit, pnl≥min_req")
+                    log_trade(sym, "TP SELL", price, q, pnl, f"tp hit, pnl≥min_req")
                     state["pnl"] += pnl
                     coin_bal -= q
                     state["last_sell_price"] = price
@@ -206,8 +222,7 @@ def trade():
                         state["positions"].append({"buy_price": price, "qty": qty, "tp": tp})
                         state["count"] += 1
                         state["avg_count"] += 1
-                        log_trade(sym, "BUY (avg)", price, qty, 0.0,
-                                  f"drawdown={drawdown:.4f}")
+                        log_trade(sym, "BUY (avg)", price, qty, 0.0, f"drawdown={drawdown:.4f}")
 
             if sig == "buy" and not state["positions"] and value < per_sym:
                 if abs(price - state["last_sell_price"]) / price < 0.001:
@@ -243,11 +258,12 @@ def trade():
 
 if __name__ == "__main__":
     log("🚀 Бот запущен", True)
+    init_state()
     load_symbol_limits()
     init_positions()
     while True:
         try:
             trade()
         except Exception as e:
-            log(f"Глобальная ошибка: {e}")
+            log(f"Глобальная ошибка: {e}", True)
         time.sleep(60)
