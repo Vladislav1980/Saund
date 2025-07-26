@@ -276,8 +276,22 @@ def daily_report():
 
 # === Главная точка входа ===
 def main():
-    log("🚀 Bot старт")
-    send_tg("🚀 Bot запущен")
+    boot_file = "boot.flag"
+    now = time.time()
+    last_boot = 0
+    if os.path.exists(boot_file):
+        try:
+            with open(boot_file, "r") as f:
+                last_boot = float(f.read())
+        except: pass
+    if now - last_boot > 300:
+        log("🚀 Bot запущен")
+        send_tg("🚀 Bot запущен")
+        with open(boot_file, "w") as f:
+            f.write(str(now))
+    else:
+        log("⏳ Bot уже запущен недавно, уведомление не отправлено")
+
     while True:
         trade()
         daily_report()
