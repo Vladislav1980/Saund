@@ -1,0 +1,20 @@
+{
+  "TONUSDT": {
+    "pos": null,
+    "count": 0.0,
+    "pnl": 0.0,
+    "last_buy": 0
+  },
+  "DOGEUSDT": {
+    "pos": null,
+    "count": 0.0,
+    "pnl": 0.0,
+    "last_buy": 0
+  },
+  "XRPUSDT": {
+    "pos": null,
+    "count": 0.0,
+    "pnl": 0.0,
+    "last_buy": 0
+  }
+}
