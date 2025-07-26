@@ -33,8 +33,6 @@ DAILY_LOSS_LIMIT = -50
 MAX_POS_USDT = 100
 
 # === Telegram ===
-last_notify_time = 0
-
 def send_tg(msg):
     try:
         requests.post(
@@ -49,7 +47,7 @@ def send_state_to_telegram(filepath):
         with open(filepath, 'rb') as f:
             url = f"https://api.telegram.org/bot{TG_TOKEN}/sendDocument"
             files = {'document': f}
-            data = {'chat_id': CHAT_ID, 'disable_notification': True}
+            data = {'chat_id': CHAT_ID}
             requests.post(url, files=files, data=data)
     except Exception as e:
         print(f"❌ Ошибка при отправке state.json: {e}")
@@ -87,7 +85,6 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
-
 def log(msg):
     try:
         logging.info(msg)
@@ -153,16 +150,18 @@ def signal(df):
 # === Работа с состоянием ===
 STATE = {}
 download_state_from_telegram()
-if os.path.exists(STATE_PATH):
-    try:
-        with open(STATE_PATH, "r") as f:
-            STATE = json.load(f)
-    except: STATE = {}
-else:
-    STATE = {}
+try:
+    with open(STATE_PATH, "r") as f:
+        STATE = json.load(f)
+except: STATE = {}
 
 for s in SYMBOLS:
-    STATE.setdefault(s, {"pos": None, "count": 0, "pnl": 0.0})
+    if s not in STATE:
+        STATE[s] = {"pos": None, "count": 0, "pnl": 0.0}
+    else:
+        STATE[s].setdefault("pos", None)
+        STATE[s].setdefault("count", 0)
+        STATE[s].setdefault("pnl", 0.0)
 
 def save_state():
     try:
@@ -191,7 +190,7 @@ def calculate_weights(dfs):
 def trade():
     bal = get_balance()
     log(f"Баланс USDT: {bal:.2f}")
-    if bal < RESERVE_BALANCE or sum(STATE.get(s, {}).get("pnl", 0) for s in SYMBOLS) < DAILY_LOSS_LIMIT:
+    if bal < RESERVE_BALANCE or sum(STATE[s]["pnl"] for s in SYMBOLS) < DAILY_LOSS_LIMIT:
         log("🚫 Торговля остановлена по лимиту"); return
 
     load_limits()
@@ -214,14 +213,14 @@ def trade():
         buy5 = df["5"]["ema9"] > df["5"]["ema21"]
         rsi_ok = df["5"]["rsi"] <= 80
         if not buy5 or not rsi_ok:
-            continue
+            log(f"{sym} пропуск сигнала"); continue
 
         alloc_usdt = bal * weights[sym]
         qty_usd = min(alloc_usdt * DEFAULT_PARAMS["risk_pct"], MAX_POS_USDT)
         qty_usd = max(qty_usd, 30)
         qty = adjust(qty_usd / price, LIMITS[sym]["step"])
         if qty * price < LIMITS[sym]["min_amt"]:
-            continue
+            log(f"{sym} qty*price < min_amt"); continue
 
         try:
             session.place_order(category="spot", symbol=sym, side="Buy", orderType="Market", qty=str(qty))
@@ -234,7 +233,7 @@ def trade():
 
     for sym in SYMBOLS:
         cb = get_coin_balance(sym)
-        if cb > 0 and STATE[sym]["pos"]:
+        if cb > 0 and STATE[sym].get("pos"):
             b, q, tp, peak = STATE[sym]["pos"].values()
             price = get_klines(sym, "5").iloc[-1]["c"]
             peak = max(peak, price)
@@ -269,19 +268,21 @@ def daily_report():
         ) + f"\nБаланс={get_balance():.2f}"
         send_tg(rep)
         for s in SYMBOLS:
-            STATE[s]["count"] = 0; STATE[s]["pnl"] = 0.0
+            STATE[s]["count"] = STATE[s]["pnl"] = 0.0
         save_state()
         open(fn, "w").write(str(now.date()))
 
 # === Главная точка входа ===
 def main():
-    global last_notify_time
-    if time.time() - last_notify_time > 3600:
+    ts = "launch.timestamp"
+    now = time.time()
+    if os.path.exists(ts) and now - os.path.getmtime(ts) < 60:
+        log("⏳ Bot уже запущен недавно, уведомление не отправлено")
+    else:
+        with open(ts, "w"): pass
         log("🚀 Bot запущен")
         send_tg("🚀 Bot запущен")
-        last_notify_time = time.time()
-    else:
-        log("⏳ Bot уже запущен недавно, уведомление не отправлено")
+
     while True:
         trade()
         daily_report()
