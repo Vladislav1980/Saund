@@ -150,18 +150,16 @@ def signal(df):
 # === Работа с состоянием ===
 STATE = {}
 download_state_from_telegram()
-try:
-    with open(STATE_PATH, "r") as f:
-        STATE = json.load(f)
-except: STATE = {}
+if os.path.exists(STATE_PATH):
+    try:
+        with open(STATE_PATH, "r") as f:
+            STATE = json.load(f)
+    except: STATE = {}
+else:
+    STATE = {}
 
 for s in SYMBOLS:
-    if s not in STATE:
-        STATE[s] = {"pos": None, "count": 0, "pnl": 0.0}
-    else:
-        STATE[s].setdefault("pos", None)
-        STATE[s].setdefault("count", 0)
-        STATE[s].setdefault("pnl", 0.0)
+    STATE.setdefault(s, {"pos": None, "count": 0, "pnl": 0.0})
 
 def save_state():
     try:
@@ -190,7 +188,7 @@ def calculate_weights(dfs):
 def trade():
     bal = get_balance()
     log(f"Баланс USDT: {bal:.2f}")
-    if bal < RESERVE_BALANCE or sum(STATE[s]["pnl"] for s in SYMBOLS) < DAILY_LOSS_LIMIT:
+    if bal < RESERVE_BALANCE or sum(STATE[s].get("pnl", 0) for s in SYMBOLS) < DAILY_LOSS_LIMIT:
         log("🚫 Торговля остановлена по лимиту"); return
 
     load_limits()
@@ -208,6 +206,10 @@ def trade():
     log(f"Весовые коэффициенты: {weights}")
 
     for sym, df in dfs.items():
+        log(f"--- {sym} индикаторы ---")
+        for tf, last in df.items():
+            log(f"{sym} {tf}m: EMA9={last['ema9']:.2f}, EMA21={last['ema21']:.2f}, RSI={last['rsi']:.1f}")
+
         price = df["5"]["c"]
         atr = df["5"]["atr"]
         buy5 = df["5"]["ema9"] > df["5"]["ema21"]
@@ -262,7 +264,7 @@ def daily_report():
     fn = "last_report.txt"
     prev = open(fn).read().strip() if os.path.exists(fn) else ""
     if now.hour == 22 and str(now.date()) != prev:
-        rep = "\n📊 Отчет\n" + "\n".join(
+        rep = "\n\ud83d\udcca Отчет\n" + "\n".join(
             f"{s}: trades={STATE[s]['count']}, pnl={STATE[s]['pnl']:.2f}"
             for s in SYMBOLS
         ) + f"\nБаланс={get_balance():.2f}"
@@ -274,14 +276,19 @@ def daily_report():
 
 # === Главная точка входа ===
 def main():
-    ts = "launch.timestamp"
-    now = time.time()
-    if os.path.exists(ts) and now - os.path.getmtime(ts) < 60:
-        log("⏳ Bot уже запущен недавно, уведомление не отправлено")
+    launch_flag = "launch.flag"
+    recent = False
+    if os.path.exists(launch_flag):
+        last_time = os.path.getmtime(launch_flag)
+        recent = time.time() - last_time < 900  # 15 минут
+    with open(launch_flag, "w") as f:
+        f.write(str(datetime.datetime.now()))
+
+    if not recent:
+        log("\ud83d\ude80 Bot запущен")
+        send_tg("\ud83d\ude80 Bot запущен")
     else:
-        with open(ts, "w"): pass
-        log("🚀 Bot запущен")
-        send_tg("🚀 Bot запущен")
+        log("\u23f3 Bot уже запущен недавно, уведомление не отправлено")
 
     while True:
         trade()
