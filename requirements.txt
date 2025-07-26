@@ -2,7 +2,7 @@ requests
 pandas
 python-dotenv
 pybit
-ta
+ta>=0.10.2
 ccxt
 schedule
 
