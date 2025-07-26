@@ -22,11 +22,13 @@ MIN_PROFIT_PCT = 0.005
 MIN_ABSOLUTE_PNL = 3.0
 MIN_NET_PROFIT = 1.50
 STOP_LOSS_PCT = 0.03
+
 SYMBOLS = ["TONUSDT", "DOGEUSDT", "XRPUSDT"]
 STATE_FILE = "state.json"
 
 session = HTTP(api_key=API_KEY, api_secret=API_SECRET, recv_window=15000)
-LIMITS, LAST_REPORT_DATE = {}, None
+LIMITS = {}
+LAST_REPORT_DATE = None
 cycle_count = 0
 
 logging.basicConfig(
@@ -38,8 +40,10 @@ logging.basicConfig(
 def send_tg(msg):
     if TG_VERBOSE and TG_TOKEN and CHAT_ID:
         try:
-            requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-                          data={"chat_id": CHAT_ID, "text": msg})
+            requests.post(
+                f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                data={"chat_id": CHAT_ID, "text": msg}
+            )
         except Exception as e:
             logging.error(f"Tg send error: {e}")
 
@@ -109,11 +113,13 @@ def signal(df):
     macd = MACD(close=df["c"])
     df["macd"], df["macd_signal"] = macd.macd(), macd.macd_signal()
     last = df.iloc[-1]
-    info = (f"EMA9={last['ema9']:.4f},EMA21={last['ema21']:.4f},"
-            f"RSI={last['rsi']:.2f},MACD={last['macd']:.4f},SIG={last['macd_signal']:.4f}")
-    if last["ema9"] > last["ema21"] and last["rsi"] < 20 and last["macd"] > last["macd_signal"]:
+    info = (
+        f"EMA9={last['ema9']:.4f},EMA21={last['ema21']:.4f},"
+        f"RSI={last['rsi']:.2f},MACD={last['macd']:.4f},SIG={last['macd_signal']:.4f}"
+    )
+    if last["ema9"] > last["ema21"] and last["rsi"] > 50 and last["macd"] > last["macd_signal"]:
         return "buy", last["atr"], info
-    elif last["ema9"] < last["ema21"] and last["rsi"] > 80 and last["macd"] < last["macd_signal"]:
+    elif last["ema9"] < last["ema21"] and last["rsi"] < 50 and last["macd"] < last["macd_signal"]:
         return "sell", last["atr"], info
     return "none", last["atr"], info
 
@@ -171,7 +177,6 @@ def trade():
                 log_trade(sym, "SELL for USDT", price, qty, 0.0, "replenishing USDT")
         usdt = get_balance()
         avail = max(0, usdt - RESERVE_BALANCE)
-
     per_sym = avail / len(SYMBOLS)
 
     for sym in SYMBOLS:
@@ -208,7 +213,7 @@ def trade():
 
                 if price >= tp and pnl >= min_req:
                     session.place_order(category="spot", symbol=sym, side="Sell", orderType="Market", qty=str(q))
-                    log_trade(sym, "TP SELL", price, q, pnl, f"tp hit, pnl≥min_req")
+                    log_trade(sym, "TP SELL", price, q, pnl, f"TP hit, pnl≥min_req")
                     state["pnl"] += pnl
                     state["last_sell_price"] = price
                 else:
@@ -255,15 +260,15 @@ def trade():
 
     cycle_count += 1
     if cycle_count % 3 == 0:
-        act = sum(len(v["positions"]) for v in STATE.values())
-        log(f"Активных позиций: {act}")
+        total = sum(len(v["positions"]) for v in STATE.values())
+        log(f"Активных позиций: {total}")
 
     now = datetime.datetime.now()
     if now.hour == 22 and now.minute >= 30 and LAST_REPORT_DATE != now.date():
-        rep = f"📊 Ежедневный отчёт {now.date()}:\nUSDT balance: {get_balance():.2f}\n"
+        report = f"📊 Ежедневный отчёт {now.date()}:\nUSDT balance: {get_balance():.2f}\n"
         for s, v in STATE.items():
-            rep += f"{s:<8} | Trades: {v['count']} | PnL: {v['pnl']:.2f}\n"
-        log(rep, True)
+            report += f"{s:<8} | Trades: {v['count']} | PnL: {v['pnl']:.2f}\n"
+        log(report, True)
         LAST_REPORT_DATE = now.date()
 
 if __name__ == "__main__":
