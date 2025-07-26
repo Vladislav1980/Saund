@@ -1,4 +1,4 @@
- os, time, math, json, datetime, logging, requests
+import os, time, math, json, datetime, logging, requests
 import pandas as pd
 from dotenv import load_dotenv
 from ta.trend import EMAIndicator, MACD
@@ -47,7 +47,7 @@ def send_state_to_telegram(filepath):
         with open(filepath, 'rb') as f:
             url = f"https://api.telegram.org/bot{TG_TOKEN}/sendDocument"
             files = {'document': f}
-            data = {'chat_id': CHAT_ID}  # без caption — чтобы не спамить
+            data = {'chat_id': CHAT_ID}
             requests.post(url, files=files, data=data)
     except Exception as e:
         print(f"❌ Ошибка при отправке state.json: {e}")
@@ -55,26 +55,21 @@ def send_state_to_telegram(filepath):
 def download_state_from_telegram():
     try:
         print("📥 Загрузка state.json из Telegram...")
-        updates_url = f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates"
-        res = requests.get(updates_url).json()
-
+        res = requests.get(f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates").json()
         docs = []
         for update in res.get("result", []):
             msg = update.get("message", {})
             doc = msg.get("document")
-            if doc and doc.get("file_name") == "state.json":
+            if doc and doc.get("file_name") == "state.json" and msg.get("chat", {}).get("id") == int(CHAT_ID):
                 docs.append((msg["date"], doc["file_id"]))
-
         if not docs:
             print("❌ state.json не найден в Telegram")
             return
-
         docs.sort(reverse=True)
         latest_file_id = docs[0][1]
         file_info = requests.get(f"https://api.telegram.org/bot{TG_TOKEN}/getFile?file_id={latest_file_id}").json()
         file_path = file_info['result']['file_path']
-        file_download_url = f"https://api.telegram.org/file/bot{TG_TOKEN}/{file_path}"
-        r = requests.get(file_download_url)
+        r = requests.get(f"https://api.telegram.org/file/bot{TG_TOKEN}/{file_path}")
         with open(STATE_PATH, 'wb') as f:
             f.write(r.content)
         print("✅ Загружен state.json из Telegram")
@@ -91,7 +86,10 @@ logging.basicConfig(
     ]
 )
 def log(msg):
-    logging.info(msg)
+    try:
+        logging.info(msg)
+    except UnicodeEncodeError:
+        logging.info(msg.encode('unicode_escape').decode())
 
 # === API ===
 session = HTTP(api_key=API_KEY, api_secret=API_SECRET, recv_window=15000)
@@ -208,6 +206,10 @@ def trade():
     log(f"Весовые коэффициенты: {weights}")
 
     for sym, df in dfs.items():
+        log(f"--- {sym} индикаторы ---")
+        for tf, last in df.items():
+            log(f"{sym} {tf}m: EMA9={last['ema9']:.2f}, EMA21={last['ema21']:.2f}, RSI={last['rsi']:.1f}")
+
         price = df["5"]["c"]
         atr = df["5"]["atr"]
         buy5 = df["5"]["ema9"] > df["5"]["ema21"]
@@ -230,25 +232,6 @@ def trade():
             log(msg); send_tg(msg)
         except Exception as e:
             log(f"❌ Ошибка покупки {sym}: {e}")
-            for s in SYMBOLS:
-                pos = STATE.get(s, {}).get("pos")
-                if not pos: continue
-                price_now = get_klines(s, "5").iloc[-1]["c"]
-                b, q, tp, peak = pos.values()
-                pnl = (price_now - b) * q - price_now * q * 0.001
-                if pnl >= DEFAULT_PARAMS["min_profit_usdt"]:
-                    try:
-                        qty_s = adjust(get_coin_balance(s), LIMITS[s]["step"])
-                        session.place_order(category="spot", symbol=s, side="Sell", orderType="Market", qty=str(qty_s))
-                        msg = f"♻️ SELL (по нехватке баланса) {s}@{price_now:.4f}, qty={qty_s:.6f}, PNL={pnl:.2f}"
-                        log(msg); send_tg(msg)
-                        STATE[s]["pnl"] += pnl
-                        STATE[s]["count"] += 1
-                        STATE[s]["pos"] = None
-                        save_state()
-                        break
-                    except Exception as se:
-                        log(f"❌ Ошибка при продаже {s}: {se}")
 
     for sym in SYMBOLS:
         cb = get_coin_balance(sym)
@@ -281,7 +264,7 @@ def daily_report():
     fn = "last_report.txt"
     prev = open(fn).read().strip() if os.path.exists(fn) else ""
     if now.hour == 22 and str(now.date()) != prev:
-        rep = "📊 Отчет\n" + "\n".join(
+        rep = "\n📊 Отчет\n" + "\n".join(
             f"{s}: trades={STATE[s]['count']}, pnl={STATE[s]['pnl']:.2f}"
             for s in SYMBOLS
         ) + f"\nБаланс={get_balance():.2f}"
