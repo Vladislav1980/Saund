@@ -54,7 +54,7 @@ def send_state_to_telegram(filepath):
 
 def download_state_from_telegram():
     try:
-        print("📥 Загрузка state.json из Telegram...")
+        print("\U0001F4E5 Загрузка state.json из Telegram...")
         res = requests.get(f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates").json()
         docs = []
         for update in res.get("result", []):
@@ -184,112 +184,32 @@ def calculate_weights(dfs):
         weights[sym] /= total
     return weights
 
-# === Торговля ===
+# === Блок предотвращения спама при запуске ===
+def send_startup_message():
+    try:
+        flag = "launch.lock"
+        if os.path.exists(flag):
+            with open(flag, "r") as f:
+                last = datetime.datetime.strptime(f.read().strip(), "%Y-%m-%d %H:%M:%S")
+                if datetime.datetime.utcnow() - last < datetime.timedelta(minutes=15):
+                    log("⏳ Bot уже запущен недавно, уведомление не отправлено")
+                    return
+        with open(flag, "w") as f:
+            f.write(datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"))
+        send_tg("🚀 Bot запущен")
+    except Exception as e:
+        log(f"Ошибка уведомления запуска: {e}")
+
+# === Главная функция ===
 def trade():
-    bal = get_balance()
-    log(f"Баланс USDT: {bal:.2f}")
-    if bal < RESERVE_BALANCE or sum(STATE[s].get("pnl", 0) for s in SYMBOLS) < DAILY_LOSS_LIMIT:
-        log("🚫 Торговля остановлена по лимиту"); return
+    ... # (оставь текущую реализацию без изменений)
 
-    load_limits()
-    dfs = {}
-    for sym in SYMBOLS:
-        dfs[sym] = {}
-        for tf in ["5","15","60","240"]:
-            df = signal(get_klines(sym, tf))
-            if df.empty:
-                log(f"{sym} {tf}m нет данных"); dfs.pop(sym, None); break
-            dfs[sym][tf] = df.iloc[-1]
-    if not dfs: return
-
-    weights = calculate_weights(dfs)
-    log(f"Весовые коэффициенты: {weights}")
-
-    for sym, df in dfs.items():
-        log(f"--- {sym} индикаторы ---")
-        for tf, last in df.items():
-            log(f"{sym} {tf}m: EMA9={last['ema9']:.2f}, EMA21={last['ema21']:.2f}, RSI={last['rsi']:.1f}")
-
-        price = df["5"]["c"]
-        atr = df["5"]["atr"]
-        buy5 = df["5"]["ema9"] > df["5"]["ema21"]
-        rsi_ok = df["5"]["rsi"] <= 80
-        if not buy5 or not rsi_ok:
-            log(f"{sym} пропуск сигнала"); continue
-
-        alloc_usdt = bal * weights[sym]
-        qty_usd = min(alloc_usdt * DEFAULT_PARAMS["risk_pct"], MAX_POS_USDT)
-        qty_usd = max(qty_usd, 30)
-        qty = adjust(qty_usd / price, LIMITS[sym]["step"])
-        if qty * price < LIMITS[sym]["min_amt"]:
-            log(f"{sym} qty*price < min_amt"); continue
-
-        try:
-            session.place_order(category="spot", symbol=sym, side="Buy", orderType="Market", qty=str(qty))
-            tp = price + atr * DEFAULT_PARAMS["tp_multiplier"]
-            STATE[sym]["pos"] = {"buy_price": price, "qty": qty, "tp": tp, "peak": price}
-            msg = f"✅ BUY {sym}@{price:.4f}, qty={qty:.6f}, TP~{tp:.4f}"
-            log(msg); send_tg(msg)
-        except Exception as e:
-            log(f"❌ Ошибка покупки {sym}: {e}")
-
-    for sym in SYMBOLS:
-        cb = get_coin_balance(sym)
-        if cb > 0 and STATE[sym].get("pos"):
-            b, q, tp, peak = STATE[sym]["pos"].values()
-            price = get_klines(sym, "5").iloc[-1]["c"]
-            peak = max(peak, price)
-            pnl = (price - b) * q - price * q * 0.001
-            dd = (peak - price) / peak
-            conds = {
-                "STOPLOSS": price < b * (1 - DEFAULT_PARAMS["max_drawdown_sl"]),
-                "TRAILING": dd > DEFAULT_PARAMS["trailing_stop_pct"],
-                "TPREACHED": price >= tp,
-                "PROFIT": pnl >= 1.1 and pnl > price * q * 0.001
-            }
-            reason = next((k for k,v in conds.items() if v), None)
-            if reason:
-                qty_s = adjust(cb, LIMITS[sym]["step"])
-                session.place_order(category="spot", symbol=sym, side="Sell", orderType="Market", qty=str(qty_s))
-                msg = f"✅ SELL {reason} {sym}@{price:.4f}, qty={qty_s:.6f}, PNL={pnl:.2f}"
-                log(msg); send_tg(msg)
-                STATE[sym]["pnl"] += pnl
-                STATE[sym]["count"] += 1
-                STATE[sym]["pos"] = None
-    save_state()
-
-# === Ежедневный отчет ===
 def daily_report():
-    now = datetime.datetime.now()
-    fn = "last_report.txt"
-    prev = open(fn).read().strip() if os.path.exists(fn) else ""
-    if now.hour == 22 and str(now.date()) != prev:
-        rep = "\n\ud83d\udcca Отчет\n" + "\n".join(
-            f"{s}: trades={STATE[s]['count']}, pnl={STATE[s]['pnl']:.2f}"
-            for s in SYMBOLS
-        ) + f"\nБаланс={get_balance():.2f}"
-        send_tg(rep)
-        for s in SYMBOLS:
-            STATE[s]["count"] = STATE[s]["pnl"] = 0.0
-        save_state()
-        open(fn, "w").write(str(now.date()))
+    ... # (оставь текущую реализацию без изменений)
 
-# === Главная точка входа ===
 def main():
-    launch_flag = "launch.flag"
-    recent = False
-    if os.path.exists(launch_flag):
-        last_time = os.path.getmtime(launch_flag)
-        recent = time.time() - last_time < 900  # 15 минут
-    with open(launch_flag, "w") as f:
-        f.write(str(datetime.datetime.now()))
-
-    if not recent:
-        log("\ud83d\ude80 Bot запущен")
-        send_tg("\ud83d\ude80 Bot запущен")
-    else:
-        log("\u23f3 Bot уже запущен недавно, уведомление не отправлено")
-
+    log("🚀 Bot запущен")
+    send_startup_message()
     while True:
         trade()
         daily_report()
