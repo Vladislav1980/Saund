@@ -50,7 +50,7 @@ def log(msg, tg=False):
 
 def save_state():
     with open(STATE_FILE, "w") as f:
-        json.dump(STATE, f, default=list, indent=2)
+        json.dump(STATE, f, indent=2)
 
 def init_state():
     global STATE
@@ -58,9 +58,20 @@ def init_state():
         with open(STATE_FILE, "r") as f:
             STATE = json.load(f)
         log("✅ Loaded state from file", True)
-    except FileNotFoundError:
-        STATE = {s: {"positions": [], "pnl": 0.0, "count": 0, "avg_count": 0, "last_sell_price": 0.0} for s in SYMBOLS}
-        log("ℹ No state file found — starting fresh", True)
+    except (FileNotFoundError, json.JSONDecodeError):
+        STATE = {}
+        log("ℹ No valid state file — starting fresh", True)
+
+def ensure_state_consistency():
+    for sym in SYMBOLS:
+        if sym not in STATE:
+            STATE[sym] = {
+                "positions": [],
+                "pnl": 0.0,
+                "count": 0,
+                "avg_count": 0,
+                "last_sell_price": 0.0
+            }
 
 def log_trade(sym, side, price, qty, pnl, info=""):
     usdt_val = price * qty
@@ -132,7 +143,8 @@ def get_qty(sym, price, usdt):
 def init_positions():
     for sym in SYMBOLS:
         df = get_kline(sym)
-        if df.empty: continue
+        if df.empty:
+            continue
         price = df["c"].iloc[-1]
         bal = get_coin_balance(sym)
         if price and bal * price >= LIMITS.get(sym, {}).get("min_amt", 0):
@@ -148,8 +160,8 @@ def trade():
     usdt = get_balance()
     log(f"USDT Balance: {usdt:.2f}")
     avail = max(0, usdt - RESERVE_BALANCE)
-    if avail < LIMITS[SYMBOLS[0]]["min_amt"]:
-        log("Недостаточно USDT — пытаюсь продать активы...")
+    if avail < min(v["min_amt"] for v in LIMITS.values()):
+        log("Недостаточно USDT — продаю активы для пополнения...")
         for sym in SYMBOLS:
             bc = get_coin_balance(sym)
             price = get_kline(sym)["c"].iloc[-1]
@@ -189,7 +201,6 @@ def trade():
                         session.place_order(category="spot", symbol=sym, side="Sell", orderType="Market", qty=str(q))
                         log_trade(sym, "STOP LOSS SELL", price, q, pnl, f"stop-loss hit, pnl≥{MIN_NET_PROFIT}")
                         state["pnl"] += pnl
-                        coin_bal -= q
                         state["last_sell_price"] = price
                     else:
                         log(f"[{sym}] Stop-loss skipped: net pnl {pnl:.2f} < {MIN_NET_PROFIT}")
@@ -199,7 +210,6 @@ def trade():
                     session.place_order(category="spot", symbol=sym, side="Sell", orderType="Market", qty=str(q))
                     log_trade(sym, "TP SELL", price, q, pnl, f"tp hit, pnl≥min_req")
                     state["pnl"] += pnl
-                    coin_bal -= q
                     state["last_sell_price"] = price
                 else:
                     new_tp = max(tp, price + TRAIL_MULTIPLIER * atr)
@@ -250,7 +260,7 @@ def trade():
 
     now = datetime.datetime.now()
     if now.hour == 22 and now.minute >= 30 and LAST_REPORT_DATE != now.date():
-        rep = f"📊 Ежедневный отчёт {now.date()}:\nUSDT balance: {usdt:.2f}\n"
+        rep = f"📊 Ежедневный отчёт {now.date()}:\nUSDT balance: {get_balance():.2f}\n"
         for s, v in STATE.items():
             rep += f"{s:<8} | Trades: {v['count']} | PnL: {v['pnl']:.2f}\n"
         log(rep, True)
@@ -259,6 +269,8 @@ def trade():
 if __name__ == "__main__":
     log("🚀 Бот запущен", True)
     init_state()
+    ensure_state_consistency()
+    save_state()
     load_symbol_limits()
     init_positions()
     while True:
