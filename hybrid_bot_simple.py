@@ -276,8 +276,8 @@ def daily_report():
 
 # === Главная точка входа ===
 def main():
-    log("🚀 Bot старт — EMA5, RSI<=80, PROFIT>=1.1USDT")
-    send_tg("🚀 Bot старт — EMA5, RSI<=80, PROFIT>=1.1USDT")
+    log("🚀 Bot старт")
+    send_tg("🚀 Bot запущен")
     while True:
         trade()
         daily_report()
