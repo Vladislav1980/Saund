@@ -15,13 +15,14 @@ CHAT_ID = os.getenv("CHAT_ID")
 TG_VERBOSE = True
 RESERVE_BALANCE = 1.0
 MAX_TRADE_USDT = 35.0
-TRAIL_MULTIPLIER = 1.5
+TRAIL_MULTIPLIER = 1.2  # уменьшен для частых TP
 MAX_DRAWDOWN = 0.10
-MAX_AVERAGES = 3
-MIN_PROFIT_PCT = 0.005
-MIN_ABSOLUTE_PNL = 3.0
-MIN_NET_PROFIT = 1.50
-STOP_LOSS_PCT = 0.03
+MAX_AVERAGES = 5        # до 5 усреднений
+COMMISSION_RATE = 0.0018
+MIN_PROFIT_PCT = 0.002  # 0.2%
+MIN_ABSOLUTE_PNL = 0.5
+MIN_NET_PROFIT = 0.5    # минимум $0.5 чистой прибыли
+STOP_LOSS_PCT = 0.02    # стоп-лосс 2%
 
 SYMBOLS = ["TONUSDT", "DOGEUSDT", "XRPUSDT"]
 STATE_FILE = "state.json"
@@ -41,8 +42,8 @@ def send_tg(msg):
     try:
         requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
                       data={"chat_id": CHAT_ID, "text": msg})
-    except:
-        logging.error("Telegram send failed")
+    except Exception as e:
+        logging.error(f"Telegram send failed: {e}")
 
 def log(msg, tg=False):
     logging.info(msg)
@@ -58,7 +59,7 @@ def init_state():
     try:
         with open(STATE_FILE, "r") as f:
             STATE = json.load(f)
-        log("✅ Loaded state from file", True)
+        log("✅ Loaded state file", True)
     except:
         STATE = {}
         log("ℹ No valid state file — starting fresh", True)
@@ -68,8 +69,7 @@ def ensure_state_consistency():
         STATE.setdefault(sym, {
             "positions": [], "pnl": 0.0,
             "count": 0, "avg_count": 0,
-            "last_sell_price": 0.0,
-            "max_drawdown": 0.0
+            "last_sell_price": 0.0, "max_drawdown": 0.0
         })
 
 def log_trade(sym, side, price, qty, pnl, info=""):
@@ -99,22 +99,21 @@ def adjust_qty(qty, step):
         return qty
 
 def signal(df):
-    if df.empty or len(df)<50:
-        return "none",0,""
-    df["ema9"] = EMAIndicator(df["c"],9).ema_indicator()
-    df["ema21"] = EMAIndicator(df["c"],21).ema_indicator()
-    df["rsi"] = RSIIndicator(df["c"],9).rsi()
-    df["atr"] = AverageTrueRange(df["h"],df["l"],df["c"],14).average_true_range()
+    if df.empty or len(df) < 50:
+        return "none", 0, ""
+    df["ema9"] = EMAIndicator(df["c"], 9).ema_indicator()
+    df["ema21"] = EMAIndicator(df["c"], 21).ema_indicator()
+    df["rsi"] = RSIIndicator(df["c"], 9).rsi()
+    df["atr"] = AverageTrueRange(df["h"], df["l"], df["c"], 14).average_true_range()
     macd = MACD(close=df["c"])
     df["macd"], df["macd_signal"] = macd.macd(), macd.macd_signal()
     last = df.iloc[-1]
-    info = (f"EMA9={last['ema9']:.4f},EMA21={last['ema21']:.4f},"
-            f"RSI={last['rsi']:.2f},MACD={last['macd']:.4f},SIG={last['macd_signal']:.4f}")
-    if last["ema9"]>last["ema21"] and last["rsi"]>50 and last["macd"]>last["macd_signal"]:
-        return "buy",last["atr"],info
-    elif last["ema9"]<last["ema21"] and last["rsi"]<50 and last["macd"]<last["macd_signal"]:
-        return "sell",last["atr"],info
-    return "none",last["atr"],info
+    info = f"EMA9={last['ema9']:.4f},EMA21={last['ema21']:.4f},RSI={last['rsi']:.2f},MACD={last['macd']:.4f},SIG={last['macd_signal']:.4f}"
+    if last["ema9"] > last["ema21"] and last["rsi"] > 50 and last["macd"] > last["macd_signal"]:
+        return "buy", last["atr"], info
+    elif last["ema9"] < last["ema21"] and last["rsi"] < 50 and last["macd"] < last["macd_signal"]:
+        return "sell", last["atr"], info
+    return "none", last["atr"], info
 
 def get_kline(sym):
     r = session.get_kline(category="spot", symbol=sym, interval="1", limit=100)
@@ -124,19 +123,19 @@ def get_kline(sym):
 
 def get_balance():
     coins = session.get_wallet_balance(accountType="UNIFIED")["result"]["list"][0]["coin"]
-    return float(next(c["walletBalance"] for c in coins if c["coin"]=="USDT"))
+    return float(next(c["walletBalance"] for c in coins if c["coin"] == "USDT"))
 
 def get_coin_balance(sym):
-    co = sym.replace("USDT","")
+    coin = sym.replace("USDT", "")
     coins = session.get_wallet_balance(accountType="UNIFIED")["result"]["list"][0]["coin"]
-    return float(next((c["walletBalance"] for c in coins if c["coin"]==co),0.0))
+    return float(next((c["walletBalance"] for c in coins if c["coin"] == coin), 0.0))
 
-def get_qty(sym,price,usdt):
-    if sym not in LIMITS:
-        return 0.0
+def get_qty(sym, price, usdt):
+    limits = LIMITS.get(sym, {})
+    if not limits: return 0.0
     alloc = min(usdt, MAX_TRADE_USDT)
-    q = adjust_qty(alloc/price, LIMITS[sym]["qty_step"])
-    if q< LIMITS[sym]["min_qty"] or q*price< LIMITS[sym]["min_amt"]:
+    q = adjust_qty(alloc / price, limits["qty_step"])
+    if q < limits["min_qty"] or q * price < limits["min_amt"]:
         return 0.0
     return q
 
@@ -146,24 +145,12 @@ def init_positions():
         if df.empty: continue
         price = df["c"].iloc[-1]
         bal = get_coin_balance(sym)
-        if price and bal*price >= LIMITS.get(sym,{}).get("min_amt",0):
+        if price and bal * price >= LIMITS.get(sym, {}).get("min_amt", 0):
             qty = adjust_qty(bal, LIMITS[sym]["qty_step"])
-            atr = AverageTrueRange(df["h"],df["l"],df["c"],14).average_true_range().iloc[-1]
-            tp = price + TRAIL_MULTIPLIER*atr
-            STATE[sym]["positions"].append({"buy_price":price,"qty":qty,"tp":tp})
-            log(f"[{sym}] Recovered pos qty={qty}, price={price:.4f}, tp={tp:.4f}", False)
+            atr = AverageTrueRange(df["h"], df["l"], df["c"], 14).average_true_range().iloc[-1]
+            tp = price + TRAIL_MULTIPLIER * atr
+            STATE[sym]["positions"].append({"buy_price": price, "qty": qty, "tp": tp})
     save_state()
-
-def send_daily_report():
-    report = f"📊 Daily Report {datetime.datetime.now().date()}\n\n"
-    report += "Symbol | Trades | PnL | Max Drawdown | Current Pos\n"
-    report += "-------|--------|-----|---------------|-------------\n"
-    for sym in SYMBOLS:
-        s = STATE[sym]
-        cur_pos = sum(p["qty"] for p in s["positions"])
-        dd = s.get("max_drawdown",0.0)
-        report += f"{sym:<7}|{s['count']:>6}  |{s['pnl']:>6.2f}|{dd*100:>9.2f}%   |{cur_pos:.4f}\n"
-    send_tg(report)
 
 def trade():
     global LAST_REPORT_DATE, cycle_count
@@ -178,78 +165,73 @@ def trade():
             sig, atr, info_ind = signal(df)
             price = df["c"].iloc[-1]
             state = STATE[sym]
-            limits = LIMITS[sym]
             coin_bal = get_coin_balance(sym)
             value = coin_bal * price
 
-            logging.info(f"[{sym}] sig={sig}, price={price:.4f}, value={value:.2f}, pos={len(state['positions'])}, {info_ind}")
-
-            # update max drawdown
             if state["positions"]:
-                avg_entry = sum(p["buy_price"]*p["qty"] for p in state["positions"])/ sum(p["qty"] for p in state["positions"])
-                curr_dd = (avg_entry - price)/avg_entry
-                if curr_dd > state["max_drawdown"]:
-                    state["max_drawdown"] = curr_dd
+                avg_entry = sum(p["buy_price"]*p["qty"] for p in state["positions"]) / sum(p["qty"] for p in state["positions"])
+                dd = (avg_entry - price) / avg_entry
+                state["max_drawdown"] = max(state["max_drawdown"], dd)
 
             new_positions = []
             for pos in state["positions"]:
-                b,q,tp = pos["buy_price"], adjust_qty(pos["qty"],limits["qty_step"]), pos["tp"]
-                commission = price*q*0.0025
-                pnl = (price - b)*q - commission
+                b, q, tp = pos["buy_price"], adjust_qty(pos["qty"], LIMITS[sym]["qty_step"]), pos["tp"]
+                commission = price * q * COMMISSION_RATE
+                pnl = (price - b) * q - commission
                 min_req = max(price*q*MIN_PROFIT_PCT, MIN_ABSOLUTE_PNL, MIN_NET_PROFIT)
 
-                if price <= b*(1-STOP_LOSS_PCT):
+                logging.info(f"[{sym}] DEBUG price={price:.4f}, qty={q:.4f}, pnl={pnl:.4f}, min_req={min_req:.4f}")
+
+                if price <= b * (1 - STOP_LOSS_PCT):
                     if pnl >= MIN_NET_PROFIT:
                         session.place_order(category="spot", symbol=sym, side="Sell", orderType="Market", qty=str(q))
-                        log_trade(sym,"STOP LOSS SELL",price,q,pnl,"stop-loss")
+                        log_trade(sym, "STOP LOSS SELL", price, q, pnl, "stop-loss")
                         state["pnl"] += pnl
-                        state["last_sell_price"]=price
+                        state["last_sell_price"] = price
                     continue
 
                 if price >= tp and pnl >= min_req:
                     session.place_order(category="spot", symbol=sym, side="Sell", orderType="Market", qty=str(q))
-                    log_trade(sym,"TP SELL",price,q,pnl,"take-profit")
+                    log_trade(sym, "TP SELL", price, q, pnl, "take-profit")
                     state["pnl"] += pnl
-                    state["last_sell_price"]=price
+                    state["last_sell_price"] = price
                 else:
-                    pos["tp"]=max(tp, price + TRAIL_MULTIPLIER*atr)
+                    pos["tp"] = max(tp, price + TRAIL_MULTIPLIER * atr)
                     new_positions.append(pos)
-            state["positions"]=new_positions
 
-            if sig=="buy":
-                if state["positions"] and state["avg_count"]<MAX_AVERAGES:
-                    total_q=sum(p["qty"] for p in state["positions"])
-                    avg_price=sum(p["qty"]*p["buy_price"] for p in state["positions"])/total_q
-                    drawdown=(price-avg_price)/avg_price
-                    if drawdown<0 and abs(drawdown)<=MAX_DRAWDOWN and value<per_sym:
-                        qty=get_qty(sym,price,per_sym-value)
-                        if qty and qty*price<=usdt:
+            state["positions"] = new_positions
+
+            if sig == "buy":
+                if state["positions"] and state["avg_count"] < MAX_AVERAGES:
+                    total_q = sum(p["qty"] for p in state["positions"])
+                    avg_price = sum(p["qty"]*p["buy_price"] for p in state["positions"]) / total_q
+                    dd = (price - avg_price) / avg_price
+                    if dd < 0 and abs(dd) <= MAX_DRAWDOWN and value < per_sym:
+                        qty = get_qty(sym, price, per_sym - value)
+                        if qty and qty * price <= usdt:
                             session.place_order(category="spot", symbol=sym, side="Buy", orderType="Market", qty=str(qty))
-                            tp=price+TRAIL_MULTIPLIER*atr
-                            STATE[sym]["positions"].append({"buy_price":price,"qty":qty,"tp":tp})
-                            state["count"]+=1; state["avg_count"]+=1
-                            log_trade(sym,"BUY (avg)",price,qty,0.0,f"drawdown={drawdown:.4f}")
-                elif not state["positions"] and value<per_sym:
-                    if abs(price-state["last_sell_price"])/price<0.001:
+                            tp = price + TRAIL_MULTIPLIER * atr
+                            STATE[sym]["positions"].append({"buy_price": price, "qty": qty, "tp": tp})
+                            state["count"] += 1
+                            state["avg_count"] += 1
+                            log_trade(sym, "BUY (avg)", price, qty, 0.0, f"drawdown={dd:.4f}")
+                elif not state["positions"] and value < per_sym:
+                    if abs(price - state["last_sell_price"]) / price < 0.001:
                         pass
                     else:
-                        qty=get_qty(sym,price,per_sym)
-                        if qty and qty*price<=usdt:
+                        qty = get_qty(sym, price, per_sym)
+                        if qty and qty * price <= usdt:
                             session.place_order(category="spot", symbol=sym, side="Buy", orderType="Market", qty=str(qty))
-                            tp=price+TRAIL_MULTIPLIER*atr
-                            STATE[sym]["positions"].append({"buy_price":price,"qty":qty,"tp":tp})
-                            state["count"]+=1
-                            log_trade(sym,"BUY",price,qty,0.0,info_ind)
+                            tp = price + TRAIL_MULTIPLIER * atr
+                            STATE[sym]["positions"].append({"buy_price": price, "qty": qty, "tp": tp})
+                            state["count"] += 1
+                            log_trade(sym, "BUY", price, qty, 0.0, info_ind)
         except Exception as e:
             log(f"[{sym}] Error: {e}", True)
 
-    cycle_count+=1
-    now = datetime.datetime.now()
-    if now.hour==22 and now.minute>=30 and LAST_REPORT_DATE!=now.date():
-        send_daily_report()
-        LAST_REPORT_DATE=now.date()
+        cycle_count += 1
 
-if __name__=="__main__":
+if __name__ == "__main__":
     log("🚀 Bot started", True)
     init_state()
     ensure_state_consistency()
