@@ -14,16 +14,16 @@ CHAT_ID = os.getenv("CHAT_ID")
 
 TG_VERBOSE = True
 RESERVE_BALANCE = 1.0
-MAX_TRADE_USDT = 35.0
+MAX_TRADE_USDT = 70.0
 TRAIL_MULTIPLIER = 1.5
 MAX_DRAWDOWN = 0.10
 MAX_AVERAGES = 3
 MIN_PROFIT_PCT = 0.005
 MIN_ABSOLUTE_PNL = 3.0
 MIN_NET_PROFIT = 1.50
-STOP_LOSS_PCT = 0.03
+STOP_LOSS_PCT = 0.03  # стоп-лосс = 3%
 
-SYMBOLS = ["TONUSDT", "DOGEUSDT", "XRPUSDT", WIFUSDT]
+SYMBOLS = ["TONUSDT", "DOGEUSDT", "XRPUSDT", "WIFUSDT"]
 STATE_FILE = "state.json"
 
 session = HTTP(api_key=API_KEY, api_secret=API_SECRET, recv_window=15000)
@@ -114,14 +114,12 @@ def signal(df):
     ema_up = last["ema9"] > last["ema21"]
     rsi_up = last["rsi"] > 50
     macd_up = last["macd"] > last["macd_signal"]
-
     ema_dn = last["ema9"] < last["ema21"]
     rsi_dn = last["rsi"] < 50
     macd_dn = last["macd"] < last["macd_signal"]
 
     buy_count = sum([ema_up, rsi_up, macd_up])
     sell_count = sum([ema_dn, rsi_dn, macd_dn])
-
     info = (f"EMA9={last['ema9']:.4f},EMA21={last['ema21']:.4f},"
             f"RSI={last['rsi']:.2f},MACD={last['macd']:.4f},SIG={last['macd_signal']:.4f}")
 
@@ -213,17 +211,17 @@ def trade():
                 pnl = (price - b) * q - commission
                 min_req = max(price * q * MIN_PROFIT_PCT, MIN_ABSOLUTE_PNL, MIN_NET_PROFIT)
 
+                # Новая безопасная логика стоп-лосса:
                 if price <= b * (1 - STOP_LOSS_PCT):
-                    if pnl >= MIN_NET_PROFIT:
-                        session.place_order(category="spot", symbol=sym, side="Sell", orderType="Market", qty=str(q))
-                        log_trade(sym, "STOP LOSS SELL", price, q, pnl, "stop-loss")
-                        state["pnl"] += pnl
-                        state["last_sell_price"] = price
+                    session.place_order(category="spot", symbol=sym, side="Sell", orderType="Market", qty=str(q))
+                    log_trade(sym, "STOP LOSS SELL", price, q, pnl, "stop‑loss")
+                    state["pnl"] += pnl
+                    state["last_sell_price"] = price
                     continue
 
                 if price >= tp and pnl >= min_req:
                     session.place_order(category="spot", symbol=sym, side="Sell", orderType="Market", qty=str(q))
-                    log_trade(sym, "TP SELL", price, q, pnl, "take-profit")
+                    log_trade(sym, "TP SELL", price, q, pnl, "take‑profit")
                     state["pnl"] += pnl
                     state["last_sell_price"] = price
                 else:
