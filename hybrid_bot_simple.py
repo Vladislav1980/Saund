@@ -15,13 +15,14 @@ CHAT_ID = os.getenv("CHAT_ID")
 TG_VERBOSE = True
 RESERVE_BALANCE = 1.0
 MAX_TRADE_USDT = 70.0
+MIN_PRICE_DIFF_PCT = 0.003  # минимум 0.3% разница цены для усреднения
 TRAIL_MULTIPLIER = 1.5
 MAX_DRAWDOWN = 0.10
-MAX_AVERAGES = 2       # <= только две покупки: основная + один раз усреднение
+MAX_AVERAGES = 2
 MIN_PROFIT_PCT = 0.005
 MIN_ABSOLUTE_PNL = 3.0
 MIN_NET_PROFIT = 1.50
-STOP_LOSS_PCT = 0.02   # <= стоп‑лосс теперь 2%
+STOP_LOSS_PCT = 0.02
 
 SYMBOLS = ["TONUSDT", "DOGEUSDT", "XRPUSDT", "WIFUSDT"]
 STATE_FILE = "state.json"
@@ -67,9 +68,8 @@ def init_state():
 def ensure_state_consistency():
     for sym in SYMBOLS:
         STATE.setdefault(sym, {
-            "positions": [], "pnl": 0.0,
-            "count": 0, "avg_count": 0,
-            "last_sell_price": 0.0,
+            "positions": [], "pnl": 0.0, "count": 0,
+            "avg_count": 0, "last_sell_price": 0.0,
             "max_drawdown": 0.0
         })
 
@@ -109,22 +109,13 @@ def signal(df):
     macd = MACD(close=df["c"])
     df["macd"], df["macd_signal"] = macd.macd(), macd.macd_signal()
     last = df.iloc[-1]
-
-    ema_up = last["ema9"] > last["ema21"]
-    rsi_up = last["rsi"] > 50
-    macd_up = last["macd"] > last["macd_signal"]
-    ema_dn = last["ema9"] < last["ema21"]
-    rsi_dn = last["rsi"] < 50
-    macd_dn = last["macd"] < last["macd_signal"]
-
-    buy_count = sum([ema_up, rsi_up, macd_up])
-    sell_count = sum([ema_dn, rsi_dn, macd_dn])
     info = (f"EMA9={last['ema9']:.4f},EMA21={last['ema21']:.4f},"
             f"RSI={last['rsi']:.2f},MACD={last['macd']:.4f},SIG={last['macd_signal']:.4f}")
-
-    if buy_count >= 2:
+    buy_cnt = sum([last["ema9"] > last["ema21"], last["rsi"] > 50, last["macd"] > last["macd_signal"]])
+    sell_cnt = sum([last["ema9"] < last["ema21"], last["rsi"] < 50, last["macd"] < last["macd_signal"]])
+    if buy_cnt >= 2:
         return "buy", last["atr"], info
-    if sell_count >= 2:
+    if sell_cnt >= 2:
         return "sell", last["atr"], info
     return "none", last["atr"], info
 
@@ -170,9 +161,7 @@ def init_positions():
             atr = AverageTrueRange(df["h"], df["l"], df["c"], 14).average_true_range().iloc[-1]
             tp = price + TRAIL_MULTIPLIER * atr
             STATE[sym]["positions"].append({
-                "buy_price": price,
-                "qty": qty,
-                "tp": tp,
+                "buy_price": price, "qty": qty, "tp": tp,
                 "timestamp": datetime.datetime.now().isoformat()
             })
             log(f"[{sym}] Recovered pos qty={qty}, price={price:.4f}, tp={tp:.4f}", False)
@@ -210,16 +199,16 @@ def trade():
             logging.info(f"[{sym}] sig={sig}, price={price:.4f}, value={value:.2f}, pos={len(state['positions'])}, {info_ind}")
 
             if state["positions"]:
-                avg_entry = sum(p["buy_price"]*p["qty"] for p in state["positions"])/sum(p["qty"] for p in state["positions"])
-                curr_dd = (avg_entry - price)/avg_entry
+                avg_entry = sum(p["buy_price"]*p["qty"] for p in state["positions"]) / sum(p["qty"] for p in state["positions"])
+                curr_dd = (avg_entry - price) / avg_entry
                 if curr_dd > state["max_drawdown"]:
                     state["max_drawdown"] = curr_dd
 
             new_positions = []
             for pos in state["positions"]:
                 b, q, tp = pos["buy_price"], adjust_qty(pos["qty"], limits["qty_step"]), pos["tp"]
-                commission = price*q*0.0025
-                pnl = (price - b)*q - commission
+                commission = price * q * 0.0025
+                pnl = (price - b) * q - commission
 
                 if price <= b * (1 - STOP_LOSS_PCT):
                     session.place_order(category="spot", symbol=sym, side="Sell", orderType="Market", qty=str(q))
@@ -243,23 +232,23 @@ def trade():
                 if len(state["positions"]) > 0 and state["avg_count"] < MAX_AVERAGES:
                     first_ts = state["positions"][0].get("timestamp", "")
                     hours = hours_since(first_ts)
+                    last_price = state["positions"][-1]["buy_price"]
                     total_q = sum(p["qty"] for p in state["positions"])
                     avg_price = sum(p["qty"]*p["buy_price"] for p in state["positions"]) / total_q
                     drawdown = (price - avg_price) / avg_price
-                    if drawdown < 0 and abs(drawdown) <= MAX_DRAWDOWN and value < per_sym and hours >= 4:
+                    price_diff = abs(price - last_price) / last_price
+                    if drawdown < 0 and abs(drawdown) <= MAX_DRAWDOWN and value < per_sym and hours >= 4 and price_diff >= MIN_PRICE_DIFF_PCT:
                         qty = get_qty(sym, price, per_sym - value)
                         if qty and qty * price <= usdt:
                             session.place_order(category="spot", symbol=sym, side="Buy", orderType="Market", qty=str(qty))
                             tp = price + TRAIL_MULTIPLIER * atr
                             STATE[sym]["positions"].append({
-                                "buy_price": price,
-                                "qty": qty,
-                                "tp": tp,
+                                "buy_price": price, "qty": qty, "tp": tp,
                                 "timestamp": datetime.datetime.now().isoformat()
                             })
                             state["count"] += 1
                             state["avg_count"] += 1
-                            log_trade(sym, "BUY (avg)", price, qty, 0.0, f"drawdown={drawdown:.4f}")
+                            log_trade(sym, "BUY (avg)", price, qty, 0.0, f"drawdown={drawdown:.4f}, pr diff={price_diff:.4f}")
                 elif len(state["positions"]) == 0 and value < per_sym:
                     if abs(price - state["last_sell_price"]) / price < 0.001:
                         pass
@@ -269,9 +258,7 @@ def trade():
                             session.place_order(category="spot", symbol=sym, side="Buy", orderType="Market", qty=str(qty))
                             tp = price + TRAIL_MULTIPLIER * atr
                             STATE[sym]["positions"].append({
-                                "buy_price": price,
-                                "qty": qty,
-                                "tp": tp,
+                                "buy_price": price, "qty": qty, "tp": tp,
                                 "timestamp": datetime.datetime.now().isoformat()
                             })
                             state["count"] += 1
