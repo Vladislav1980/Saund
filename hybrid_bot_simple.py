@@ -15,7 +15,7 @@ CHAT_ID = os.getenv("CHAT_ID")
 TG_VERBOSE = True
 RESERVE_BALANCE = 1.0
 MAX_TRADE_USDT = 70.0
-MIN_PRICE_DIFF_PCT = 0.003  # минимум 0.3% разница цены для усреднения
+MIN_PRICE_DIFF_PCT = 0.003
 TRAIL_MULTIPLIER = 1.5
 MAX_DRAWDOWN = 0.10
 MAX_AVERAGES = 2
@@ -68,8 +68,9 @@ def init_state():
 def ensure_state_consistency():
     for sym in SYMBOLS:
         STATE.setdefault(sym, {
-            "positions": [], "pnl": 0.0, "count": 0,
-            "avg_count": 0, "last_sell_price": 0.0,
+            "positions": [], "pnl": 0.0,
+            "count": 0, "avg_count": 0,
+            "last_sell_price": 0.0,
             "max_drawdown": 0.0
         })
 
@@ -161,7 +162,9 @@ def init_positions():
             atr = AverageTrueRange(df["h"], df["l"], df["c"], 14).average_true_range().iloc[-1]
             tp = price + TRAIL_MULTIPLIER * atr
             STATE[sym]["positions"].append({
-                "buy_price": price, "qty": qty, "tp": tp,
+                "buy_price": price,
+                "qty": qty,
+                "tp": tp,
                 "timestamp": datetime.datetime.now().isoformat()
             })
             log(f"[{sym}] Recovered pos qty={qty}, price={price:.4f}, tp={tp:.4f}", False)
@@ -211,17 +214,20 @@ def trade():
                 pnl = (price - b) * q - commission
 
                 if price <= b * (1 - STOP_LOSS_PCT):
-                    session.place_order(category="spot", symbol=sym, side="Sell", orderType="Market", qty=str(q))
-                    log_trade(sym, "STOP LOSS SELL", price, q, pnl, "stop‑loss")
-                    state["pnl"] += pnl
-                    state["last_sell_price"] = price
+                    if coin_bal * price >= q * price:
+                        session.place_order(category="spot", symbol=sym, side="Sell", orderType="Market", qty=str(q))
+                        log_trade(sym, "STOP LOSS SELL", price, q, pnl, "stop‑loss")
+                        state["pnl"] += pnl
+                        state["last_sell_price"] = price
+                        state["avg_count"] = 0  # сброс усреднения
                     continue
 
                 if price >= tp and pnl >= max(price*q*MIN_PROFIT_PCT, MIN_ABSOLUTE_PNL, MIN_NET_PROFIT):
-                    session.place_order(category="spot", symbol=sym, side="Sell", orderType="Market", qty=str(q))
-                    log_trade(sym, "TP SELL", price, q, pnl, "take‑profit")
-                    state["pnl"] += pnl
-                    state["last_sell_price"] = price
+                    if coin_bal * price >= q * price:
+                        session.place_order(category="spot", symbol=sym, side="Sell", orderType="Market", qty=str(q))
+                        log_trade(sym, "TP SELL", price, q, pnl, "take‑profit")
+                        state["pnl"] += pnl
+                        state["last_sell_price"] = price
                 else:
                     pos["tp"] = max(tp, price + TRAIL_MULTIPLIER * atr)
                     new_positions.append(pos)
@@ -249,10 +255,8 @@ def trade():
                             state["count"] += 1
                             state["avg_count"] += 1
                             log_trade(sym, "BUY (avg)", price, qty, 0.0, f"drawdown={drawdown:.4f}, pr diff={price_diff:.4f}")
-                elif len(state["positions"]) == 0 and value < per_sym:
-                    if abs(price - state["last_sell_price"]) / price < 0.001:
-                        pass
-                    else:
+                elif not state["positions"] and value < per_sym:
+                    if abs(price - state["last_sell_price"]) / price >= 0.001:
                         qty = get_qty(sym, price, per_sym)
                         if qty and qty * price <= usdt:
                             session.place_order(category="spot", symbol=sym, side="Buy", orderType="Market", qty=str(qty))
