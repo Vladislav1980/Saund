@@ -25,6 +25,10 @@ MIN_NET_PROFIT = 1.50
 STOP_LOSS_PCT = 0.008     # 0.8%
 TAKE_PROFIT_PCT = 0.02   # 2%
 
+# Комиссии Spot по твоему уровню (не-VIP):
+TAKER_FEE = 0.0018  # 0.18%
+MAKER_FEE = 0.0010  # 0.10%
+
 SYMBOLS = ["TONUSDT", "DOGEUSDT", "XRPUSDT", "WIFUSDT"]
 STATE_FILE = "state.json"
 
@@ -188,15 +192,16 @@ def trade():
         coin_bal = get_coin_balance(sym)
         value = coin_bal * price
 
-        # ВЛОЖЕННЫЙ ИНФОРМАТИВНЫЙ ЛОГ:
         logging.info(f"[{sym}] sig={sig}, price={price:.4f}, value={value:.2f}, "
                      f"pos={len(state['positions'])}, {info_ind}")
 
         new_positions = []
         for pos in state['positions']:
             b, q, tp = pos["buy_price"], pos["qty"], pos["tp"]
-            commission = price * q * 0.0025
-            pnl = (price - b) * q - commission
+            buy_comm = b * q * TAKER_FEE  # покупка market‑order (taker)
+            sell_comm = price * q * TAKER_FEE  # продажа market‑order (taker)
+            total_commission = buy_comm + sell_comm
+            pnl = (price - b) * q - total_commission
 
             if price <= b * (1 - STOP_LOSS_PCT):
                 if coin_bal >= q:
@@ -209,7 +214,7 @@ def trade():
                 state['avg_count'] = 0
                 continue
 
-            if price >= b * (1 + TAKE_PROFIT_PCT):
+            if price >= b * (1 + TAKE_PROFIT_PCT) and pnl >= MIN_NET_PROFIT:
                 if coin_bal >= q:
                     session.place_order(category="spot", symbol=sym, side="Sell", orderType="Market", qty=str(q))
                     log_trade(sym, "TP SELL", price, q, pnl, "take‑profit")
@@ -217,6 +222,7 @@ def trade():
                 new_positions = []
                 state['avg_count'] = 0
                 state['sell_failed'] = False
+                state['last_sell_price'] = price
                 break
 
             pos["tp"] = max(tp, price + TRAIL_MULTIPLIER * atr)
