@@ -17,15 +17,14 @@ TG_VERBOSE = True
 RESERVE_BALANCE = 1.0
 MAX_TRADE_USDT = 70.0
 MIN_PRICE_DIFF_PCT = 0.003
-TRAIL_MULTIPLIER = 1.5
 MAX_DRAWDOWN = 0.10
 MAX_AVERAGES = 2
-MIN_NET_PROFIT = 1.50  # минимальная прибыль после всех комиссий
+MIN_NET_PROFIT = 1.50
 STOP_LOSS_PCT = 0.008
-TAKE_PROFIT_PCT = 0.02
+TAKE_PROFIT_PCT = 0.02  # базовый процент, используется только для вычислений, но TP теперь динамический
 
-TAKER_BUY_FEE = 0.0010   # 0.10%
-TAKER_SELL_FEE = 0.0018  # 0.18%
+TAKER_BUY_FEE = 0.0010
+TAKER_SELL_FEE = 0.0018
 
 SYMBOLS = ["TONUSDT", "DOGEUSDT", "XRPUSDT", "WIFUSDT"]
 LAST_REPORT_DATE = None
@@ -36,8 +35,8 @@ redis_client = redis.from_url(REDIS_URL, decode_responses=True)
 STATE = {}
 
 logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s | %(message)s",
-                    handlers=[logging.FileHandler("bot.log", encoding="utf-8"), logging.StreamHandler()])
+    format="%(asctime)s | %(message)s",
+    handlers=[logging.FileHandler("bot.log", encoding="utf-8"), logging.StreamHandler()])
 
 SKIP_LOG_TIMESTAMPS = {}
 
@@ -55,8 +54,7 @@ def log_skip(sym, msg):
 def send_tg(msg):
     if TG_VERBOSE and TG_TOKEN and CHAT_ID:
         try:
-            requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-                          data={"chat_id": CHAT_ID, "text": msg})
+            requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage", data={"chat_id": CHAT_ID, "text": msg})
         except Exception as e:
             logging.error("Telegram send failed: " + str(e))
 
@@ -123,10 +121,8 @@ def signal(df):
     last = df.iloc[-1]
     buy_cnt = sum([last["ema9"] > last["ema21"], last["rsi"] > 50, last["macd"] > last["macd_signal"]])
     sell_cnt = sum([last["ema9"] < last["ema21"], last["rsi"] < 50, last["macd"] < last["macd_signal"]])
-    info = (
-        f"EMA9={last['ema9']:.4f},EMA21={last['ema21']:.4f},RSI={last['rsi']:.2f},"
-        f"MACD={last['macd']:.4f},SIG={last['macd_signal']:.4f}"
-    )
+    info = (f"EMA9={last['ema9']:.4f},EMA21={last['ema21']:.4f},RSI={last['rsi']:.2f},"
+            f"MACD={last['macd']:.4f},SIG={last['macd_signal']:.4f}")
     if buy_cnt >= 2:
         return "buy", last["atr"], info
     if sell_cnt >= 2:
@@ -164,8 +160,7 @@ def hours_since(ts):
         return 999.0
 
 def init_positions():
-    total = 0.0
-    msgs = []
+    total, msgs = 0.0, []
     for sym in SYMBOLS:
         bal = get_coin_balance(sym)
         log(f"DEBUG balance {sym}: {bal:.6f}", True)
@@ -175,7 +170,7 @@ def init_positions():
             if bal * price >= LIMITS[sym]["min_amt"]:
                 qty = adjust_qty(bal, LIMITS[sym]["qty_step"])
                 atr = AverageTrueRange(df["h"], df["l"], df["c"], 14).average_true_range().iloc[-1]
-                tp = price + TRAIL_MULTIPLIER * atr
+                tp = price + choose_multiplier(atr, price) * atr
                 STATE[sym]["positions"].append({
                     "buy_price": price, "qty": qty, "tp": tp,
                     "timestamp": datetime.datetime.now().isoformat()
@@ -184,9 +179,9 @@ def init_positions():
                 msgs.append(f"- {sym}: {qty} @ {price:.4f} (${qty * price:.2f})")
     if not STATE["TONUSDT"]["positions"]:
         pr, q = 3.596, 5.28
-        tp_val = pr + (MIN_NET_PROFIT / q)
+        tp = pr + choose_multiplier(0, pr) * 0.01  # пример
         STATE["TONUSDT"]["positions"].append({
-            "buy_price": pr, "qty": q, "tp": tp_val,
+            "buy_price": pr, "qty": q, "tp": tp,
             "timestamp": datetime.datetime.now().isoformat()
         })
         msgs.append(f"- TONUSDT restored: {q} @ {pr:.4f} (${q * pr:.2f})")
@@ -197,6 +192,15 @@ def init_positions():
     header += "💰 Active positions:\n" + "\n".join(msgs) + f"\n📊 Total: ${total:.2f}" if msgs else "💰 No active positions"
     log(header, True)
 
+def choose_multiplier(atr, price):
+    pct = atr / price if price > 0 else 0
+    if pct < 0.01:
+        return 0.7
+    elif pct < 0.02:
+        return 1.0
+    else:
+        return 1.5
+
 def trade():
     global cycle_count, LAST_REPORT_DATE
     usdt = get_balance()
@@ -205,8 +209,7 @@ def trade():
     log(f"DEBUG avail={avail:.2f}, per_sym={per_sym:.2f}", False)
 
     for sym in SYMBOLS:
-        st = STATE[sym]
-        st["sell_failed"] = False
+        st = STATE[sym]; st["sell_failed"] = False
         df = get_kline(sym)
         if df.empty:
             continue
@@ -216,83 +219,78 @@ def trade():
         value = coin_bal * price
         logging.info(f"[{sym}] sig={sig}, price={price:.4f}, value={value:.2f}, pos={len(st['positions'])}, {info}")
 
-        # STOP LOSS / TAKE PROFIT
         for pos in st["positions"]:
             b, q = pos["buy_price"], pos["qty"]
             cost = b * q
             buy_comm = cost * TAKER_BUY_FEE
             sell_comm = price * q * TAKER_SELL_FEE
             pnl = (price - b) * q - (buy_comm + sell_comm)
-            if q > 0 and price <= b * (1 - STOP_LOSS_PCT) and abs(pnl) >= MIN_NET_PROFIT:
-                if coin_bal >= q:
-                    session.place_order(category="spot", symbol=sym, side="Sell", orderType="Market", qty=str(q))
-                    log_trade(sym, "STOP LOSS SELL", price, q, pnl, "stop‑loss")
+            if q>0 and price <= b*(1-STOP_LOSS_PCT) and abs(pnl)>=MIN_NET_PROFIT:
+                if coin_bal>=q:
+                    session.place_order(category="spot",symbol=sym,side="Sell",orderType="Market",qty=str(q))
+                    log_trade(sym,"STOP LOSS SELL",price,q,pnl,"stop‑loss")
                     st["pnl"] += pnl
                 else:
                     log(f"SKIPPED STOP SELL {sym}: insufficient balance", True)
                     st["sell_failed"] = True
-                st["last_stop_time"] = datetime.datetime.now().isoformat()
-                st["avg_count"] = 0
+                st["last_stop_time"] = datetime.datetime.now().isoformat(); st["avg_count"] = 0
                 break
-            if q > 0 and price >= b * (1 + TAKE_PROFIT_PCT) and pnl >= MIN_NET_PROFIT:
-                if coin_bal >= q:
-                    session.place_order(category="spot", symbol=sym, side="Sell", orderType="Market", qty=str(q))
-                    log_trade(sym, "TP SELL", price, q, pnl, "take‑profit")
+            if q>0 and price >= pos["tp"] and pnl>=MIN_NET_PROFIT:
+                if coin_bal>=q:
+                    session.place_order(category="spot",symbol=sym,side="Sell",orderType="Market",qty=str(q))
+                    log_trade(sym,"TP SELL",price,q,pnl,"take‑profit")
                     st["pnl"] += pnl
-                st["positions"], st["avg_count"], st["sell_failed"], st["last_sell_price"] = [], 0, False, price
+                st["positions"], st["avg_count"], st["sell_failed"], st["last_sell_price"] = [],0,False,price
                 break
-            pos["tp"] = max(pos.get("tp", price), price + TRAIL_MULTIPLIER * atr)
 
         if st.get("sell_failed"):
             st["positions"] = []
 
-        # BUY new position logic
-        if sig == "buy" and not st["positions"]:
-            last_stop = st.get("last_stop_time", "")
+        if sig=="buy" and not st["positions"]:
+            last_stop = st.get("last_stop_time","")
             hrs = hours_since(last_stop) if last_stop else 999
-            if last_stop and hrs < 4:
-                if should_log_skip(sym, "stop_buy"):
+            if last_stop and hrs<4:
+                if should_log_skip(sym,"stop_buy"):
                     log_skip(sym, f"Skipped BUY — only {hrs:.1f}h since last stop‑loss")
             elif avail >= LIMITS[sym]["min_amt"]:
                 qty = get_qty(sym, price, avail)
-                if qty > 0:
+                if qty>0:
                     cost = price * qty
                     buy_comm = cost * TAKER_BUY_FEE
-                    tp_price = price * (1 + TAKE_PROFIT_PCT)
-                    estimated_sell_comm = tp_price * qty * TAKER_SELL_FEE
-                    est_pnl = (tp_price - price) * qty - (buy_comm + estimated_sell_comm)
+                    multiplier = choose_multiplier(atr, price)
+                    tp_price = price + multiplier * atr
+                    sell_comm = tp_price * qty * TAKER_SELL_FEE
+                    est_pnl = (tp_price - price) * qty - (buy_comm + sell_comm)
                     logging.info(f"[{sym}] est_pnl calc: qty={qty}, cost={cost:.4f}, buy_fee={buy_comm:.4f}, "
-                                 f"tp_price={tp_price:.4f}, sell_fee={estimated_sell_comm:.4f}, est_pnl={est_pnl:.4f}")
+                                 f"tp_price={tp_price:.4f}, sell_fee={sell_comm:.4f}, est_pnl={est_pnl:.4f}, multiplier={multiplier:.2f}")
                     if est_pnl >= MIN_NET_PROFIT:
-                        session.place_order(category="spot", symbol=sym, side="Buy", orderType="Market", qty=str(qty))
+                        session.place_order(category="spot",symbol=sym,side="Buy",orderType="Market",qty=str(qty))
                         STATE[sym]["positions"].append({
-                            "buy_price": price,
-                            "qty": qty,
-                            "tp": price + TRAIL_MULTIPLIER * atr,
+                            "buy_price": price, "qty": qty, "tp": tp_price,
                             "timestamp": datetime.datetime.now().isoformat()
                         })
-                        log_trade(sym, "BUY", price, qty, 0.0, "initiated position from USDT")
+                        log_trade(sym,"BUY",price,qty,0.0,"initiated position from USDT")
                         avail -= cost
                     else:
-                        if should_log_skip(sym, "skip_low_profit"):
-                            log_skip(sym, "Skipped BUY — expected PnL too small")
+                        if should_log_skip(sym,"skip_low_profit"):
+                            log_skip(sym,"Skipped BUY — expected PnL too small")
                 else:
-                    if should_log_skip(sym, "skip_qty"):
+                    if should_log_skip(sym,"skip_qty"):
                         limit = LIMITS[sym]
-                        log_skip(sym, f"Skipped BUY — qty=0 (price={price:.4f}, step={limit['qty_step']}, "
+                        log_skip(sym,f"Skipped BUY — qty=0 (price={price:.4f}, step={limit['qty_step']}, "
                                       f"min_qty={limit['min_qty']}, min_amt={limit['min_amt']})")
             else:
-                if should_log_skip(sym, "skip_funds"):
-                    log_skip(sym, "Skipped BUY — not enough free USDT")
+                if should_log_skip(sym,"skip_funds"):
+                    log_skip(sym,"Skipped BUY — not enough free USDT")
 
     cycle_count += 1
     now = datetime.datetime.now()
-    if now.hour == 22 and now.minute >= 30 and LAST_REPORT_DATE != now.date():
+    if now.hour==22 and now.minute>=30 and LAST_REPORT_DATE!=now.date():
         report = "📊 Daily report:\n" + "\n".join(f"{s}: PnL={STATE[s]['pnl']:.2f}" for s in SYMBOLS)
         send_tg(report)
         LAST_REPORT_DATE = now.date()
 
-if __name__ == "__main__":
+if __name__=="__main__":
     init_state()
     init_positions()
     while True:
