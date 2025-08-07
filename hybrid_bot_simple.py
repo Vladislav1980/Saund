@@ -15,8 +15,8 @@ REDIS_URL = os.getenv("REDIS_URL")
 
 TG_VERBOSE = True
 RESERVE_BALANCE = 1.0
-MAX_TRADE_USDT = 105.0         # 1) увеличен с 70.0
-MIN_NET_PROFIT = 0.7           # 2) временно снижено с 1.00 на 0.7
+MAX_TRADE_USDT = 105.0         # увеличено с 70.0
+MIN_NET_PROFIT = 0.7           # временно снижено с 1.00 на 0.7
 STOP_LOSS_PCT = 0.008
 
 TAKER_BUY_FEE = 0.0010
@@ -165,6 +165,15 @@ def choose_multiplier(atr, price):
     else:
         return 1.5
 
+def dynamic_min_profit(atr, price):
+    pct = atr / price if price > 0 else 0
+    if pct < 0.004:
+        return 0.6
+    elif pct < 0.008:
+        return 0.8
+    else:
+        return 1.2
+
 def init_positions():
     total, msgs = 0.0, []
     for sym in SYMBOLS:
@@ -209,7 +218,6 @@ def trade():
         value = coin_bal * price
         logging.info(f"[{sym}] sig={sig}, price={price:.4f}, value={value:.2f}, pos={len(st['positions'])}, {info}")
 
-        # Удаляем висячие позиции
         if st["positions"] and coin_bal < sum(p["qty"] for p in st["positions"]):
             state_count = len(st["positions"])
             st["positions"] = []
@@ -245,7 +253,6 @@ def trade():
         if st.get("sell_failed"):
             st["positions"] = []
 
-        # Покупка новой позиции
         if sig == "buy" and not st["positions"]:
             last_stop = st.get("last_stop_time", "")
             hrs = hours_since(last_stop) if last_stop else 999
@@ -265,7 +272,6 @@ def trade():
                     logging.info(f"[{sym}] multiplier={multiplier:.2f}, tp_price={tp_price:.4f}")
                     logging.info(f"[{sym}] est_pnl calc: qty={qty}, cost={cost:.4f}, buy_fee={buy_comm:.4f}, tp_price={tp_price:.4f}, sell_fee={sell_comm:.4f}, est_pnl={est_pnl:.4f}")
 
-                    # — замена статичного порога на адаптивный
                     required_pnl = dynamic_min_profit(atr, price)
                     if est_pnl >= required_pnl:
                         session.place_order(category="spot", symbol=sym, side="Buy", orderType="Market", qty=str(qty))
