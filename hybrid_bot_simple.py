@@ -15,11 +15,8 @@ REDIS_URL = os.getenv("REDIS_URL")
 
 TG_VERBOSE = True
 RESERVE_BALANCE = 1.0
-MAX_TRADE_USDT = 70.0
-MIN_PRICE_DIFF_PCT = 0.003
-MAX_DRAWDOWN = 0.10
-MAX_AVERAGES = 2
-MIN_NET_PROFIT = 1.00  # теперь минимум прибыли после всех комиссий — 1 доллар
+MAX_TRADE_USDT = 105.0         # 1) увеличен с 70.0
+MIN_NET_PROFIT = 0.7           # 2) временно снижено с 1.00 на 0.7
 STOP_LOSS_PCT = 0.008
 
 TAKER_BUY_FEE = 0.0010
@@ -203,7 +200,8 @@ def trade():
         st = STATE[sym]
         st["sell_failed"] = False
         df = get_kline(sym)
-        if df.empty: continue
+        if df.empty:
+            continue
 
         sig, atr, info = signal(df)
         price = df["c"].iloc[-1]
@@ -223,6 +221,7 @@ def trade():
             buy_comm = cost * TAKER_BUY_FEE
             sell_comm = price * q * TAKER_SELL_FEE
             pnl = (price - b) * q - (buy_comm + sell_comm)
+
             if q > 0 and price <= b * (1 - STOP_LOSS_PCT) and abs(pnl) >= MIN_NET_PROFIT:
                 if coin_bal >= q:
                     session.place_order(category="spot", symbol=sym, side="Sell", orderType="Market", qty=str(q))
@@ -234,6 +233,7 @@ def trade():
                 st["last_stop_time"] = datetime.datetime.now().isoformat()
                 st["avg_count"] = 0
                 break
+
             if q > 0 and price >= pos["tp"] and pnl >= MIN_NET_PROFIT:
                 if coin_bal >= q:
                     session.place_order(category="spot", symbol=sym, side="Sell", orderType="Market", qty=str(q))
@@ -263,10 +263,11 @@ def trade():
                     est_pnl = (tp_price - price) * qty - (buy_comm + sell_comm)
 
                     logging.info(f"[{sym}] multiplier={multiplier:.2f}, tp_price={tp_price:.4f}")
-                    logging.info(f"[{sym}] est_pnl calc: qty={qty}, cost={cost:.4f}, buy_fee={buy_comm:.4f}, "
-                                 f"tp_price={tp_price:.4f}, sell_fee={sell_comm:.4f}, est_pnl={est_pnl:.4f}")
+                    logging.info(f"[{sym}] est_pnl calc: qty={qty}, cost={cost:.4f}, buy_fee={buy_comm:.4f}, tp_price={tp_price:.4f}, sell_fee={sell_comm:.4f}, est_pnl={est_pnl:.4f}")
 
-                    if est_pnl >= MIN_NET_PROFIT:
+                    # — замена статичного порога на адаптивный
+                    required_pnl = dynamic_min_profit(atr, price)
+                    if est_pnl >= required_pnl:
                         session.place_order(category="spot", symbol=sym, side="Buy", orderType="Market", qty=str(qty))
                         STATE[sym]["positions"].append({
                             "buy_price": price, "qty": qty, "tp": tp_price,
@@ -276,12 +277,11 @@ def trade():
                         avail -= cost
                     else:
                         if should_log_skip(sym, "skip_low_profit"):
-                            log_skip(sym, "Skipped BUY — expected PnL too small")
+                            log_skip(sym, f"Skipped BUY — expected PnL too small (required {required_pnl:.2f}, got {est_pnl:.2f})")
                 else:
                     if should_log_skip(sym, "skip_qty"):
                         limit = LIMITS[sym]
-                        log_skip(sym, f"Skipped BUY — qty=0 (price={price:.4f}, step={limit['qty_step']}, "
-                                      f"min_qty={limit['min_qty']}, min_amt={limit['min_amt']})")
+                        log_skip(sym, f"Skipped BUY — qty=0 (price={price:.4f}, step={limit['qty_step']}, min_qty={limit['min_qty']}, min_amt={limit['min_amt']})")
             else:
                 if should_log_skip(sym, "skip_funds"):
                     log_skip(sym, "Skipped BUY — not enough free USDT")
