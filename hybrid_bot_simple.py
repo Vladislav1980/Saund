@@ -21,8 +21,8 @@ TG_VERBOSE = True
 
 RESERVE_BALANCE   = 1.0
 MAX_TRADE_USDT    = 105.0
-MIN_NET_PROFIT    = 0.7           # чистая цель по прибыли, USD
-STOP_LOSS_PCT     = 0.008         # твой прежний SL в процентах от buy
+MIN_NET_PROFIT    = 1.0           # >= $1 чистыми после комиссий
+STOP_LOSS_PCT     = 0.008         # SL по твоей старой логике (0.8%)
 
 TAKER_BUY_FEE  = 0.0010
 TAKER_SELL_FEE = 0.0018
@@ -50,8 +50,8 @@ logging.basicConfig(
 
 SKIP_LOG_TIMESTAMPS = {}
 _LIMITS_MEM = None           # ленивый кэш в памяти
-_LIMITS_OK  = False          # флаг: получилось ли загрузить лимиты
-_BUY_BLOCKED_REASON = ""     # причина, если покупки заблокированы
+_LIMITS_OK  = False          # флаг: удалось ли загрузить лимиты
+_BUY_BLOCKED_REASON = ""     # причина, если покупки временно заблокированы
 
 # ==================== UTIL ====================
 def send_tg(msg: str):
@@ -105,7 +105,6 @@ def init_state():
 
 # ==================== API HELPERS ====================
 def api_call(fn, *args, **kwargs):
-    # мягкий ретрай на сетевые/HTTP ошибки
     wait = 0.35
     for attempt in range(6):
         try:
@@ -148,16 +147,15 @@ def _limits_to_redis(limits: dict):
 def get_limits():
     """
     Ленивая загрузка лимитов:
-    - сперва берём из памяти
-    - если нет — из Redis
-    - если нет — тянем с API (может словить 403), кэшируем
-    Возвращает (limits_dict, ok_flag, buy_blocked_reason)
+    - сперва память
+    - иначе Redis
+    - иначе API → Redis
+    Если API не даёт (например 403), покупки блокируются, SELL остаётся разрешён.
     """
     global _LIMITS_MEM, _LIMITS_OK, _BUY_BLOCKED_REASON
     if _LIMITS_MEM is not None:
         return _LIMITS_MEM, _LIMITS_OK, _BUY_BLOCKED_REASON
 
-    # Redis → память
     cached = _limits_from_redis()
     if cached:
         _LIMITS_MEM = cached
@@ -166,7 +164,6 @@ def get_limits():
         logging.info("LIMITS loaded from Redis cache")
         return _LIMITS_MEM, _LIMITS_OK, _BUY_BLOCKED_REASON
 
-    # API → Redis → память
     try:
         limits = _load_symbol_limits_from_api()
         _limits_to_redis(limits)
@@ -175,7 +172,6 @@ def get_limits():
         _BUY_BLOCKED_REASON = ""
         logging.info("LIMITS loaded from API and cached")
     except Exception as e:
-        # 403 или другое → разрешаем только SELL, покупки блокируем
         _LIMITS_MEM = {}
         _LIMITS_OK = False
         _BUY_BLOCKED_REASON = f"LIMITS unavailable ({e}); BUY blocked, SELL allowed"
@@ -200,7 +196,6 @@ def get_coin_balance_from(by, sym):
 
 # ==================== QTY / ROUNDING ====================
 def adjust_qty(qty, step):
-    # надежное округление вниз к шагу
     q = Decimal(str(qty)); s = Decimal(str(step))
     return float((q // s) * s)
 
@@ -218,20 +213,46 @@ def get_qty(sym, price, usdt):
 def signal(df):
     if df.empty or len(df) < 50:
         return "none", 0, ""
-    df["ema9"]  = EMAIndicator(df["c"], 9).ema_indicator()
-    df["ema21"] = EMAIndicator(df["c"], 21).ema_indicator()
-    df["rsi"]   = RSIIndicator(df["c"], 9).rsi()
-    df["atr"]   = AverageTrueRange(df["h"], df["l"], df["c"], 14).average_true_range()
+    # индикаторы
+    ema9  = EMAIndicator(df["c"], 9).ema_indicator()
+    ema21 = EMAIndicator(df["c"], 21).ema_indicator()
+    rsi9  = RSIIndicator(df["c"], 9).rsi()
+    atr14 = AverageTrueRange(df["h"], df["l"], df["c"], 14).average_true_range()
     macd = MACD(close=df["c"])
-    df["macd"], df["macd_signal"] = macd.macd(), macd.macd_signal()
+    macd_line, macd_sig = macd.macd(), macd.macd_signal()
+
+    df = df.copy()
+    df["ema9"] = ema9
+    df["ema21"] = ema21
+    df["rsi"] = rsi9
+    df["atr"] = atr14
+    df["macd"] = macd_line
+    df["macd_signal"] = macd_sig
+
     last = df.iloc[-1]
-    buy_cnt  = sum([last["ema9"] > last["ema21"], last["rsi"] > 50, last["macd"] > last["macd_signal"]])
-    sell_cnt = sum([last["ema9"] < last["ema21"], last["rsi"] < 50, last["macd"] < last["macd_signal"]])
+    prev = df.iloc[-2]
+
+    # Ослабленный вход: 2 из 3, RSI > 48
+    two_of_three_buy = ((last["ema9"] > last["ema21"]) +
+                        (last["rsi"] > 48) +
+                        (last["macd"] > last["macd_signal"])) >= 2
+
+    # Крест вверх EMA + не низкий RSI
+    ema_cross_up   = (prev["ema9"] <= prev["ema21"]) and (last["ema9"] > last["ema21"]) and (last["rsi"] > 45)
+
+    # Селл‑сигнал (для логов/контекста; продажи у нас по TP/SL)
+    two_of_three_sell = ((last["ema9"] < last["ema21"]) +
+                         (last["rsi"] < 50) +
+                         (last["macd"] < last["macd_signal"])) >= 2
+    ema_cross_down = (prev["ema9"] >= prev["ema21"]) and (last["ema9"] < last["ema21"]) and (last["rsi"] < 55)
+
     info = (f"EMA9={last['ema9']:.6f},EMA21={last['ema21']:.6f},RSI={last['rsi']:.2f},"
-            f"MACD={last['macd']:.6f},SIG={last['macd_signal']:.6f}")
-    if buy_cnt >= 2:
+            f"MACD={last['macd']:.6f},SIG={last['macd_signal']:.6f},"
+            f"XUP={int(ema_cross_up)},XDN={int(ema_cross_down)}")
+
+    if two_of_three_buy or ema_cross_up:
         return "buy", last["atr"], info
-    if sell_cnt >= 2:
+    if two_of_three_sell or ema_cross_down:
         return "sell", last["atr"], info
     return "none", last["atr"], info
 
@@ -313,7 +334,6 @@ def reconcile_positions_on_start():
                 positions.clear()
                 lines.append(f"- {sym}: баланс≈0 → очищено {cnt} позиций")
             elif bal < saved_qty:
-                # Ужимаем LIFO
                 need = bal
                 new_positions = []
                 for p in reversed(positions):
@@ -321,37 +341,30 @@ def reconcile_positions_on_start():
                         break
                     take = _round_to_step(min(p["qty"], need), step)
                     if take >= step and take * price >= min_amt:
-                        np = p.copy()
-                        np["qty"] = take
+                        np = p.copy(); np["qty"] = take
                         new_positions.append(np)
                         need -= take
                 new_positions.reverse()
                 st["positions"] = new_positions
                 lines.append(f"- {sym}: скорректировано вниз до баланса={bal} (было {saved_qty})")
             else:
-                # Добиваем до баланса
                 extra = _round_to_step(bal - saved_qty, step)
                 if extra >= step and extra * price >= min_amt:
                     mul = choose_multiplier(atr, price)
                     tp  = price + mul * atr
                     st["positions"].append({
-                        "buy_price": price,
-                        "qty": extra,
-                        "tp": tp,
+                        "buy_price": price, "qty": extra, "tp": tp,
                         "timestamp": datetime.datetime.now().isoformat()
                     })
                     lines.append(f"- {sym}: добавлена позиция qty={extra} для выравнивания")
                 else:
                     lines.append(f"- {sym}: баланс>{saved_qty}, но extra слишком мал")
         else:
-            # Позиции нет — создаём синтетическую при наличии баланса
             if bal >= step and bal * price >= min_amt:
                 mul = choose_multiplier(atr, price)
                 tp  = price + mul * atr
                 st["positions"] = [{
-                    "buy_price": price,
-                    "qty": bal,
-                    "tp": tp,
+                    "buy_price": price, "qty": bal, "tp": tp,
                     "timestamp": datetime.datetime.now().isoformat()
                 }]
                 lines.append(f"- {sym}: создана синтетическая позиция qty={bal} по текущей цене")
@@ -370,7 +383,6 @@ def init_positions():
 # ==================== MAIN LOGIC ====================
 def trade():
     global cycle_count, LAST_REPORT_DATE
-    # лимиты пытаемся подгрузить лениво (не падаем при 403)
     limits, limits_ok, buy_blocked_reason = get_limits()
 
     usdt, by = get_balances_cache()
@@ -406,7 +418,7 @@ def trade():
             sell_comm = price * q * TAKER_SELL_FEE
             pnl = (price - b) * q - (buy_comm + sell_comm)
 
-            # Стоп-лосс по твоей логике
+            # SL по % и только если это не «мелочь» (>= MIN_NET_PROFIT)
             if q > 0 and price <= b * (1 - STOP_LOSS_PCT) and abs(pnl) >= MIN_NET_PROFIT:
                 if coin_bal >= q:
                     try:
@@ -424,7 +436,7 @@ def trade():
                 st["avg_count"] = 0
                 break
 
-            # TP по сохранённой цене
+            # TP по сохранённой цене и минимальной прибыли
             if q > 0 and price >= pos["tp"] and pnl >= MIN_NET_PROFIT:
                 if coin_bal >= q:
                     try:
@@ -440,9 +452,8 @@ def trade():
         if st.get("sell_failed"):
             st["positions"] = []
 
-        # --- BUY (если разрешено лимитами) ---
+        # --- BUY (теперь с ослабленным входом, но не «диким») ---
         if sig == "buy" and not st["positions"]:
-            # анти-флуд после стопа
             last_stop = st.get("last_stop_time", "")
             hrs = hours_since(last_stop) if last_stop else 999
             if last_stop and hrs < 4:
@@ -453,16 +464,16 @@ def trade():
                     log_skip(sym, f"Пропуск BUY — {buy_blocked_reason}")
                     send_tg(f"{sym}: ⛔️ Покупки временно заблокированы: {buy_blocked_reason}")
             elif avail >= (limits[sym]["min_amt"] if sym in limits else 10.0):
-                step = limits[sym]["qty_step"]
                 qty = get_qty(sym, price, avail)
                 if qty > 0:
                     cost = price * qty
                     buy_comm = cost * TAKER_BUY_FEE
                     mul = choose_multiplier(atr, price)
                     tp_price = price + mul * atr
+
                     sell_comm = tp_price * qty * TAKER_SELL_FEE
                     est_pnl = (tp_price - price) * qty - (buy_comm + sell_comm)
-                    required_pnl = dynamic_min_profit(atr, price)
+                    required_pnl = max(MIN_NET_PROFIT, dynamic_min_profit(atr, price))
 
                     logging.info(f"[{sym}] mul={mul:.2f}, tp_price={tp_price:.6f}")
                     logging.info(f"[{sym}] est_pnl calc: qty={qty}, cost={cost:.6f}, buy_fee={buy_comm:.6f}, tp_price={tp_price:.6f}, sell_fee={sell_comm:.6f}, est_pnl={est_pnl:.6f}, required={required_pnl:.2f}")
@@ -515,7 +526,7 @@ def send_daily_report():
 # ==================== ENTRY ====================
 if __name__ == "__main__":
     init_state()
-    init_positions()
+    reconcile_positions_on_start()
     while True:
         try:
             trade()
