@@ -1,4 +1,4 @@
-import os, time, math, logging, datetime, requests, json
+import os, time, math, logging, datetime, requests, json, random
 from decimal import Decimal, getcontext
 import pandas as pd
 from dotenv import load_dotenv
@@ -7,7 +7,6 @@ from ta.trend import EMAIndicator, MACD
 from ta.momentum import RSIIndicator
 from ta.volatility import AverageTrueRange
 import redis
-import random
 
 # ==================== ENV ====================
 load_dotenv()
@@ -25,8 +24,8 @@ MAX_TRADE_USDT    = 105.0
 MIN_NET_PROFIT    = 0.7          # минимальная ЧИСТАЯ прибыль на сделку, USD
 
 # Стопы: ATR‑базовые + «аварийный» стоп
-K_SL_ATR            = float(os.getenv("K_SL_ATR", "1.2"))     # SL = buy - K*ATR_entry
-MIN_HOLD_SECONDS    = int(os.getenv("MIN_HOLD_SECONDS", "120"))  # защита от шумового выбивания
+K_SL_ATR            = float(os.getenv("K_SL_ATR", "1.2"))      # SL = buy - K*ATR_entry
+MIN_HOLD_SECONDS    = int(os.getenv("MIN_HOLD_SECONDS", "120"))# защита от шумового выбивания
 EMERGENCY_DROP_PCT  = float(os.getenv("EMERGENCY_DROP_PCT", "0.016"))  # 1.6% — экстренный SL
 EMERGENCY_DROP_ATR  = float(os.getenv("EMERGENCY_DROP_ATR", "2.0"))    # 2*ATR — экстренный SL
 
@@ -271,6 +270,8 @@ def tp_from_required_profit(price, qty, required_pnl):
     return tp
 
 # ==================== RESTORE & RECONCILE ====================
+REQUIRED_POS_KEYS = ["buy_price", "qty", "tp", "sl", "atr_entry", "timestamp", "buy_order_id"]
+
 def _sum_positions_qty(positions):
     return sum(float(p.get("qty", 0.0)) for p in positions)
 
@@ -280,14 +281,38 @@ def _round_to_step(x, step):
 def _approx_qty_equal(q1, q2, step):
     return abs(q1 - q2) < max(step, 1e-9)
 
+def _ensure_pos_fields(sym, pos, price, atr):
+    """
+    Дополняет/чинит недостающие поля позиции (после восстановления из Redis).
+    SL/TP пересчитываются, если не заданы.
+    """
+    pos.setdefault("buy_price", float(price))
+    pos.setdefault("qty", 0.0)
+    pos.setdefault("atr_entry", float(atr))
+    pos.setdefault("timestamp", datetime.datetime.now().isoformat())
+    pos.setdefault("buy_order_id", "restored")
+
+    buy = float(pos["buy_price"])
+    q   = float(pos["qty"])
+    atr_e = float(pos["atr_entry"])
+
+    if "tp" not in pos or pos["tp"] is None:
+        mul = choose_multiplier(atr_e, buy)
+        atr_tp = buy + mul * atr_e
+        req_tp = tp_from_required_profit(buy, max(q, 1e-12), max(MIN_NET_PROFIT, dynamic_min_profit(atr_e, buy)))
+        pos["tp"] = float(max(atr_tp, req_tp))
+
+    if "sl" not in pos or pos["sl"] is None:
+        pos["sl"] = float(buy - K_SL_ATR * atr_e)
+
 def reconcile_positions_on_start():
     """
     Восстановление позиций из Redis БЕЗ перетирания buy_price/TP/SL:
-    - если есть позиции в STATE и фактический баланс ≈ сумме qty → оставляем как есть
+    - если есть позиции в STATE и фактический баланс ≈ сумме qty → оставляем, дополняем недостающие поля
     - если баланс меньше → уменьшаем позиции (LIFO) до баланса
     - если баланс больше → докидываем «добавочную» позицию с текущей ценой/ATR
     - если позиций нет, но баланс есть → создаём синтетическую позицию
-    Шлём Telegram‑сводку о восстановлении.
+    Всё логируется и отправляется в Telegram.
     """
     usdt, by = get_balances_cache()
     summary_lines = []
@@ -301,8 +326,6 @@ def reconcile_positions_on_start():
             continue
         price = df["c"].iloc[-1]
         atr = AverageTrueRange(df["h"], df["l"], df["c"], 14).average_true_range().iloc[-1]
-        mul = choose_multiplier(atr, price)
-
         st = STATE[sym]
         positions = st["positions"]
         bal = get_coin_balance_from(by, sym)
@@ -312,31 +335,31 @@ def reconcile_positions_on_start():
         logging.info(f"[{sym}] restore: balance={bal}, saved_qty={saved_qty}, price={price:.6f}")
 
         if positions:
+            # сначала чиним недостающие поля во всех сохранённых позициях
+            for p in positions:
+                _ensure_pos_fields(sym, p, price, atr)
+
             if _approx_qty_equal(bal, saved_qty, step):
-                # Совпадение — ничего не трогаем
                 qty_view = " + ".join([str(p['qty']) for p in positions])
                 summary_lines.append(f"- {sym}: восстановлены позиции ({qty_view}) без изменений")
             elif bal < step or bal * price < min_amt:
-                # Баланс фактически нулевой — чистим
                 cnt = len(positions)
                 positions.clear()
                 summary_lines.append(f"- {sym}: баланс≈0 → очищено {cnt} сохранённых позиций")
             elif bal < saved_qty:
-                # Уменьшаем позиции LIFO, пока sum == bal
+                # Уменьшаем позиции LIFO до баланса
                 need = bal
                 new_positions = []
-                for p in positions:
-                    pass  # we'll rebuild below preserving order
-                # LIFO:
                 for p in reversed(positions):
                     if need <= 0:
                         break
                     take = min(p["qty"], need)
+                    take = _round_to_step(take, step)
                     if take >= step and take * price >= min_amt:
-                        new_positions.append({
-                            **p,
-                            "qty": _round_to_step(take, step)
-                        })
+                        np = p.copy()
+                        np["qty"] = take
+                        _ensure_pos_fields(sym, np, price, atr)
+                        new_positions.append(np)
                         need -= take
                 new_positions.reverse()
                 st["positions"] = new_positions
@@ -345,6 +368,7 @@ def reconcile_positions_on_start():
                 # Добавим «доп» позицию на разницу
                 extra = _round_to_step(bal - saved_qty, step)
                 if extra >= step and extra * price >= min_amt:
+                    mul = choose_multiplier(atr, price)
                     atr_tp = price + mul * atr
                     required_pnl = max(MIN_NET_PROFIT, dynamic_min_profit(atr, price))
                     req_tp = tp_from_required_profit(price, extra, required_pnl)
@@ -358,10 +382,11 @@ def reconcile_positions_on_start():
                     })
                     summary_lines.append(f"- {sym}: добавлена позиция qty={extra} для выравнивания до баланса={bal}")
                 else:
-                    summary_lines.append(f"- {sym}: баланс больше сохранённого, но extra недостаточен для ордера")
+                    summary_lines.append(f"- {sym}: баланс>{saved_qty}, но extra недостаточен для ордера")
         else:
             # Позиции отсутствуют, но если баланс есть — создаём синтетическую
             if bal >= step and bal * price >= min_amt:
+                mul = choose_multiplier(atr, price)
                 atr_tp = price + mul * atr
                 required_pnl = max(MIN_NET_PROFIT, dynamic_min_profit(atr, price))
                 req_tp = tp_from_required_profit(price, bal, required_pnl)
@@ -375,21 +400,16 @@ def reconcile_positions_on_start():
                 }]
                 summary_lines.append(f"- {sym}: создана синтетическая позиция qty={bal} по текущей цене")
             else:
-                summary_lines.append(f"- {sym}: позиций нет и баланс пуст/мало для минимального ордера")
+                summary_lines.append(f"- {sym}: позиций нет и баланс пуст/мало для min ордера")
 
-        # Итог для суммы:
         total_notional += bal * price
 
     save_state()
     header = "🚀 Бот запущен (восстановление позиций)\n" + "\n".join(summary_lines) + f"\n📊 Номинал по монетам: ${total_notional:.2f}"
     log_msg(header, True)
 
-# ==================== INIT (calls restore) ====================
+# ==================== INIT ====================
 def init_positions():
-    """
-    Теперь init_positions выполняет ТОЛЬКО восстановление/сверку,
-    ничего не перетирая без необходимости.
-    """
     reconcile_positions_on_start()
 
 # ==================== TRADING LOOP ====================
@@ -417,8 +437,10 @@ def trade():
 
         # ---- ПРОДАЖИ / СТОП по позициям
         for pos in list(st["positions"]):
-            b, q = pos["buy_price"], pos["qty"]
-            tp, sl, atr_e, ts = pos["tp"], pos["sl"], pos.get("atr_entry", atr), pos["timestamp"]
+            _ensure_pos_fields(sym, pos, price, atr)  # на всякий случай
+            b, q = float(pos["buy_price"]), float(pos["qty"])
+            tp, sl = float(pos["tp"]), float(pos["sl"])
+            atr_e, ts = float(pos["atr_entry"]), pos["timestamp"]
             cost = b * q
             buy_comm  = cost * TAKER_BUY_FEE
             sell_comm = price * q * TAKER_SELL_FEE
@@ -440,7 +462,7 @@ def trade():
                     pnl = (real_sell - b) * filled - (b * filled * TAKER_BUY_FEE + real_sell * filled * TAKER_SELL_FEE)
                     reason = "emergency-stop" if sl_triggered_emergency else "atr-stop"
                     log_trade(sym, "STOP LOSS SELL", real_sell, filled, pnl,
-                              f"{reason}, SL={sl:.6f}, ATR_entry={atr_e:.6f}, held={held:.1f}s, orderId={order_id}, status={status}")
+                              f"{reason}, TP={tp:.6f}, SL={sl:.6f}, ATR_entry={atr_e:.6f}, held={held:.1f}s, orderId={order_id}, status={status}")
                     st["pnl"] += pnl
                     rest = q - filled
                     if rest > LIMITS[sym]["min_qty"] and rest * price >= LIMITS[sym]["min_amt"]:
@@ -461,7 +483,7 @@ def trade():
                     real_sell = sell_px if sell_px > 0 else price
                     pnl = (real_sell - b) * filled - (b * filled * TAKER_BUY_FEE + real_sell * filled * TAKER_SELL_FEE)
                     log_trade(sym, "TP SELL", real_sell, filled, pnl,
-                              f"take‑profit, TP={tp:.6f}, orderId={order_id}, status={status}")
+                              f"take‑profit, TP={tp:.6f}, SL={sl:.6f}, orderId={order_id}, status={status}")
                     st["pnl"] += pnl
                     rest = q - filled
                     if rest > LIMITS[sym]["min_qty"] and rest * price >= LIMITS[sym]["min_amt"]:
@@ -479,7 +501,7 @@ def trade():
             st["positions"] = []
 
         # ---- ПОКУПКИ
-        if sig == "buy" and not st["positions"]:
+        if sig == "buy" and not st["positions"]):
             last_stop = st.get("last_stop_time", "")
             hrs = (seconds_since(last_stop) / 3600.0) if last_stop else 999
             if last_stop and hrs < 4:
@@ -566,7 +588,9 @@ def send_daily_report():
         st = STATE[s]
         pos_lines = []
         for p in st["positions"]:
-            pos_lines.append(f"{p['qty']} @ {p['buy_price']:.6f} → TP {p['tp']:.6f} / SL {p['sl']:.6f} (ATR={p['atr_entry']:.6f})")
+            pos_lines.append(
+                f"{p['qty']} @ {p['buy_price']:.6f} → TP {p['tp']:.6f} / SL {p['sl']:.6f} (ATR={p['atr_entry']:.6f})"
+            )
         pos_text = "\n    " + "\n    ".join(pos_lines) if pos_lines else " нет открытых позиций"
         lines.append(f"• {s}: PnL={st['pnl']:.2f};{pos_text}")
         total_pnl += st["pnl"]
@@ -576,7 +600,7 @@ def send_daily_report():
 # ==================== MAIN ====================
 if __name__ == "__main__":
     init_state()
-    init_positions()  # теперь только восстановление/сверка без перезаписи TP/buy_price
+    init_positions()  # восстановление/сверка без перезаписи TP/buy_price; дополняем недостающие поля
     while True:
         try:
             trade()
