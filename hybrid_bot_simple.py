@@ -24,8 +24,8 @@ MAX_TRADE_USDT    = 105.0
 MIN_NET_PROFIT    = 0.7          # минимальная ЧИСТАЯ прибыль на сделку, USD
 
 # Стопы: ATR‑базовые + «аварийный» стоп
-K_SL_ATR            = float(os.getenv("K_SL_ATR", "1.2"))      # SL = buy - K*ATR_entry
-MIN_HOLD_SECONDS    = int(os.getenv("MIN_HOLD_SECONDS", "120"))# защита от шумового выбивания
+K_SL_ATR            = float(os.getenv("K_SL_ATR", "1.2"))        # SL = buy - K*ATR_entry
+MIN_HOLD_SECONDS    = int(os.getenv("MIN_HOLD_SECONDS", "120"))  # защита от шумового выбивания
 EMERGENCY_DROP_PCT  = float(os.getenv("EMERGENCY_DROP_PCT", "0.016"))  # 1.6% — экстренный SL
 EMERGENCY_DROP_ATR  = float(os.getenv("EMERGENCY_DROP_ATR", "2.0"))    # 2*ATR — экстренный SL
 
@@ -335,7 +335,7 @@ def reconcile_positions_on_start():
         logging.info(f"[{sym}] restore: balance={bal}, saved_qty={saved_qty}, price={price:.6f}")
 
         if positions:
-            # сначала чиним недостающие поля во всех сохранённых позициях
+            # чиним недостающие поля во всех сохранённых позициях
             for p in positions:
                 _ensure_pos_fields(sym, p, price, atr)
 
@@ -437,7 +437,7 @@ def trade():
 
         # ---- ПРОДАЖИ / СТОП по позициям
         for pos in list(st["positions"]):
-            _ensure_pos_fields(sym, pos, price, atr)  # на всякий случай
+            _ensure_pos_fields(sym, pos, price, atr)  # страховка
             b, q = float(pos["buy_price"]), float(pos["qty"])
             tp, sl = float(pos["tp"]), float(pos["sl"])
             atr_e, ts = float(pos["atr_entry"]), pos["timestamp"]
@@ -501,7 +501,7 @@ def trade():
             st["positions"] = []
 
         # ---- ПОКУПКИ
-        if sig == "buy" and not st["positions"]):
+        if sig == "buy" and not st["positions"]:
             last_stop = st.get("last_stop_time", "")
             hrs = (seconds_since(last_stop) / 3600.0) if last_stop else 999
             if last_stop and hrs < 4:
