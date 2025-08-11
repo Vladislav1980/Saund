@@ -306,7 +306,6 @@ def signal(df):
 
 # ==================== TP MULT LOGIC ====================
 def base_tp_mult(atr, price, atr5_pct_hint):
-    """Базовый множитель как раньше."""
     pct = atr / price if price > 0 else 0
     vol = max(pct, atr5_pct_hint)
     if vol < 0.002:   return 1.55
@@ -320,7 +319,6 @@ def dynamic_min_profit(atr, price):
     return 1.2
 
 def est_pnl_rr(post_price, tp_price, qty):
-    """Подсчёт чистой прибыли и RR для заданного TP."""
     buy_comm  = post_price * qty * MAKER_BUY_FEE
     sell_comm = tp_price  * qty * MAKER_SELL_FEE
     pnl = (tp_price - post_price) * qty - (buy_comm + sell_comm)
@@ -330,12 +328,6 @@ def est_pnl_rr(post_price, tp_price, qty):
     return pnl, rr
 
 def find_tp_price(post_price, atr15, tick, qty, required_min_profit, min_rr, start_mult, max_mult=3.5, step=0.15):
-    """
-    Пытается подобрать TP так, чтобы:
-    - чистая прибыль ≥ required_min_profit
-    - RR ≥ min_rr
-    Повышаем множитель от start_mult до max_mult с шагом step.
-    """
     mult = start_mult
     best = None
     while mult <= max_mult:
@@ -346,7 +338,7 @@ def find_tp_price(post_price, atr15, tick, qty, required_min_profit, min_rr, sta
         if pnl >= required_min_profit and rr >= min_rr:
             return best
         mult = round(mult + step, 4)
-    return best  # вернём лучшее, даже если условия не выполнены
+    return best
 
 # ==================== TRADES & LOGS ====================
 def log_trade(sym, side, price, qty, pnl, info=""):
@@ -480,7 +472,7 @@ def trade():
             f"MACD={info.get('MACD', 0):.6f} SIG={info.get('SIG', 0):.6f} | ATR(5/15m)={atr5_pct*100:.2f}% | tp_mult≈{base_mult:.2f}"
         )
 
-        # 1) Сопровождение открытого BUY (перекат/fill)
+        # 1) сопровождение открытого BUY
         ob = st.get("open_buy")
         if ob:
             oid = ob["orderId"]; ots = ob["ts"]; oprice = ob["price"]; oqty = ob["qty"]
@@ -494,25 +486,16 @@ def trade():
                         place_postonly_buy(sym, oqty, new_price)
                         logging.info(f"{sym}: rolled BUY {oprice} → {new_price}")
             elif not still_open:
-                # ордер исполнен — ставим TP
                 st["open_buy"] = None
                 by_now = get_balances_cache()[1]
                 coin_bal = get_coin_balance_from(by_now, sym)
                 qty = coin_bal if coin_bal > 0 else oqty
                 entry_price = oprice
-
-                # динамический TP под условия
                 required  = max(MIN_NET_PROFIT, dynamic_min_profit(atr15, entry_price))
                 tp_price, pnl, rr, used_mult = find_tp_price(
-                    post_price=entry_price,
-                    atr15=atr15,
-                    tick=tick,
-                    qty=qty,
-                    required_min_profit=required,
-                    min_rr=1.5,
-                    start_mult=base_mult
+                    post_price=entry_price, atr15=atr15, tick=tick, qty=qty,
+                    required_min_profit=required, min_rr=1.0, start_mult=base_mult
                 )
-
                 st["positions"] = [{
                     "buy_price": entry_price,
                     "qty": qty,
@@ -526,7 +509,7 @@ def trade():
                     log_msg(f"{sym}: place TP failed: {e} | price={tp_price}, tick={tick}", True)
                 log_msg(f"✅ BUY filled {sym} @~{entry_price:.8f}, qty≈{qty}. TP={tp_price} (mult≈{used_mult:.2f}, est_pnl≈{pnl:.2f}, RR≈{rr:.2f})", True)
 
-        # 2) Продажи по TP/SL, если позиция есть
+        # 2) продажи по SL (TP лимит уже стоит)
         if st.get("positions"):
             pos = st["positions"][0]
             b, q = pos["buy_price"], pos["qty"]
@@ -548,7 +531,7 @@ def trade():
                     except Exception as e:
                         log_msg(f"{sym}: STOP SELL failed: {e}", True)
 
-        # 3) Новые входы (нет позиции и нет открытого лимитника)
+        # 3) новые входы
         if (sig == "buy") and not st.get("positions") and not st.get("open_buy"):
             if not limits_ok:
                 if should_log_skip(sym, "buy_blocked_limits"):
@@ -569,28 +552,16 @@ def trade():
                 logging.info(f"{sym}: DEBUG_SKIP | qty=0 price={price:.8f} step={lim.get('qty_step')} min_qty={lim.get('min_qty')} min_amt={lim.get('min_amt')}")
                 continue
 
-            # пост‑онли цена у bid вниз на шаг
             post_price = adjust_price(bid, limits[sym]["tick_size"], mode="down")
-
-            # динамический TP перед размещением BUY: оценим, есть ли смысл входить
             required  = max(MIN_NET_PROFIT, dynamic_min_profit(atr15, post_price))
-            candidate = find_tp_price(
-                post_price=post_price,
-                atr15=atr15,
-                tick=limits[sym]["tick_size"],
-                qty=qty,
-                required_min_profit=required,
-                min_rr=1.5,
-                start_mult=base_mult
+            tp_price, est_pnl_val, rr_val, used_mult = find_tp_price(
+                post_price=post_price, atr15=atr15, tick=limits[sym]["tick_size"], qty=qty,
+                required_min_profit=required, min_rr=1.0, start_mult=base_mult
             )
-            tp_price, est_pnl_val, rr_val, used_mult = candidate
-
             logging.info(f"[{sym}] BUY-check qty={qty}, tp={tp_price:.8f}, mult≈{used_mult:.2f}, "
                          f"ppu={tp_price-post_price:.8f}, est_pnl={est_pnl_val:.2f}, "
                          f"required={required:.2f}, RR={rr_val:.2f}, tick={limits[sym]['tick_size']}")
-
-            # Входим только если уже на этапе оценки видим смысл
-            if est_pnl_val >= required and rr_val >= 1.5:
+            if est_pnl_val >= required and rr_val >= 1.0:
                 try:
                     place_postonly_buy(sym, qty, post_price)
                     log_msg(f"BUY (maker) {sym} @ {post_price:.8f}, qty={qty}, плановый TP={tp_price:.8f} (mult≈{used_mult:.2f}) — TP выставится после fill", True)
@@ -599,9 +570,9 @@ def trade():
                 except Exception as e:
                     log_msg(f"{sym}: BUY failed: {e}", True)
             else:
-                logging.info(f"{sym}: DEBUG_SKIP | даже с динамическим TP PnL {est_pnl_val:.2f} < {required:.2f} или RR<{1.5}")
+                logging.info(f"{sym}: DEBUG_SKIP | даже с динамическим TP PnL {est_pnl_val:.2f} < {required:.2f} или RR<1.0")
 
-    # Ежедневный отчёт раз в день 22:30+
+    # ежедневный отчёт 22:30+
     now = datetime.datetime.now()
     if now.hour == 22 and now.minute >= 30 and LAST_REPORT_DATE != now.date():
         send_daily_report()
@@ -615,7 +586,7 @@ if __name__ == "__main__":
     except:
         pass
     reconcile_positions_on_start()
-    log_msg("🟢 Бот работает. Динамический TP (≥$1 и RR≥1.5), maker‑режим.", True)
+    log_msg("🟢 Бот работает. Динамический TP (≥$1 и RR≥1.0), maker‑режим.", True)
     while True:
         try:
             trade()
