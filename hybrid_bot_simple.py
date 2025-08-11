@@ -1,9 +1,8 @@
 # bot.py
 # -*- coding: utf-8 -*-
 
-import os, time, math, logging, datetime, requests, json, traceback
+import os, time, logging, datetime, requests, json, traceback
 from decimal import Decimal, getcontext
-from dataclasses import dataclass, field
 import pandas as pd
 from dotenv import load_dotenv
 from pybit.unified_trading import HTTP
@@ -22,22 +21,22 @@ REDIS_URL   = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
 # ==================== CONFIG ====================
 TG_VERBOSE = True
-TG_DEDUP_WINDOW = 180  # сек: защита от одинаковых повторов
+TG_DEDUP_WINDOW = 180
 SYMBOLS = ["DOGEUSDT", "XRPUSDT"]
 
 RESERVE_BALANCE   = 1.0
 MAX_TRADE_USDT    = 120.0
-MIN_NET_PROFIT    = 1.0
-STOP_LOSS_PCT     = 0.008  # 0.8%
+MIN_NET_PROFIT    = 1.0        # минимум $1 чистыми
+STOP_LOSS_PCT     = 0.008      # 0.8%
 
 # Комиссии (maker) BUY/SELL
 MAKER_BUY_FEE  = 0.0010
 MAKER_SELL_FEE = 0.0018
 
-# Перекат постонли-лимитника каждые N сек
+# Перекат post-only каждые N сек
 ROLL_LIMIT_SECONDS = 45
 
-# Redis кэш лимитов (bump с tick_size)
+# Redis кэш лимитов
 LIMITS_REDIS_KEY = "limits_cache_v2"
 LIMITS_TTL_SEC   = 12 * 60 * 60
 
@@ -99,25 +98,22 @@ def save_state():
     except Exception as e:
         log_msg(f"Redis save failed: {e}", True)
 
-# ---------- NEW: robust state defaults/migration ----------
+# ---------- ROBUST STATE DEFAULTS / MIGRATION ----------
 def _default_state_for(sym: str):
     return {
-        "positions": [],      # [{buy_price, qty, tp, timestamp}]
+        "positions": [],
         "pnl": 0.0,
         "last_stop_time": "",
-        "open_buy": None      # {"orderId", "qty", "price", "ts"} or None
+        "open_buy": None
     }
 
 def ensure_state_consistency():
-    """Guarantee required keys exist; migrate old saved states."""
     for sym in SYMBOLS:
         st = STATE.setdefault(sym, {})
         defaults = _default_state_for(sym)
-        # fill missing keys only
         for k, v in defaults.items():
             if k not in st:
                 st[k] = v
-        # type guards
         if not isinstance(st.get("positions"), list):
             st["positions"] = []
         if st.get("open_buy") is not None and not isinstance(st.get("open_buy"), dict):
@@ -130,11 +126,10 @@ def init_state():
         STATE = json.loads(raw) if raw else {}
     except Exception:
         STATE = {}
-    # ---------- NEW: always normalize structure after load ----------
     ensure_state_consistency()
     log_msg("✅ Состояние загружено из Redis" if raw else "ℹ Начинаем с чистого состояния", True)
 
-# ==================== API HELPERS (подробный лог) ====================
+# ==================== API HELPERS ====================
 def api_call(fn, *args, **kwargs):
     logging.info(f"Request → {fn.__name__.upper()}: {kwargs}")
     wait = 0.35
@@ -217,7 +212,6 @@ def get_kline(sym):
     return df
 
 def get_top_of_book(sym):
-    """Bybit v5 orderbook: get_orderbook(category='spot', symbol=sym, limit=1)"""
     try:
         r = api_call(session.get_orderbook, category="spot", symbol=sym, limit=1)
         res = r["result"]
@@ -256,7 +250,6 @@ def adjust_price(price, tick, mode="nearest"):
     return float(Decimal(str(tick)) * q)
 
 def normalize_sell_qty(sym: str, qty: float, price: float):
-    """Квантуем qty по шагу и фильтруем пыль (ниже лимитов биржи)."""
     limits, ok, _ = get_limits()
     if not ok or sym not in limits:
         return None
@@ -281,6 +274,7 @@ def get_qty(sym, price, usdt):
 
 # ==================== SIGNALS ====================
 def signal(df):
+    """Мягкое '2 из 3' (EMA/RSI/MACD)."""
     if df.empty or len(df) < 50:
         return "none", 0, {}
     ema9  = EMAIndicator(df["c"], 9).ema_indicator()
@@ -290,21 +284,29 @@ def signal(df):
     macd_line, macd_sig = macd.macd(), macd.macd_signal()
     atr5  = AverageTrueRange(df["h"], df["l"], df["c"], 5).average_true_range()
     atr15 = AverageTrueRange(df["h"], df["l"], df["c"], 15).average_true_range()
+
     last = len(df) - 1
     ema9v, ema21v = ema9.iloc[last], ema21.iloc[last]
     rsi, macdv, macds = rsi9.iloc[last], macd_line.iloc[last], macd_sig.iloc[last]
     atr_pct = (atr5.iloc[last] / df["c"].iloc[last]) if df["c"].iloc[last] > 0 else 0.0
-    conds = int(ema9v > ema21v) + int(rsi > 50) + int(macdv > macds)
+
+    rsi_ok  = (rsi > 49.0)
+    ema_ok  = (ema9v > ema21v * 0.999)      # допуск 0.1%
+    macd_ok = (macdv > macds)
+
+    conds = int(ema_ok) + int(rsi_ok) + int(macd_ok)
     info = {
         "EMA9": float(ema9v), "EMA21": float(ema21v),
         "RSI": float(rsi), "MACD": float(macdv), "SIG": float(macds),
         "ATR%": float(atr_pct)
     }
-    if conds >= 2:  # 2 из 3
+    if conds >= 2:
         return "buy", float(atr15.iloc[last]), info
     return "none", float(atr15.iloc[last]), info
 
-def choose_multiplier(atr, price, atr5_pct_hint):
+# ==================== TP MULT LOGIC ====================
+def base_tp_mult(atr, price, atr5_pct_hint):
+    """Базовый множитель как раньше."""
     pct = atr / price if price > 0 else 0
     vol = max(pct, atr5_pct_hint)
     if vol < 0.002:   return 1.55
@@ -316,6 +318,35 @@ def dynamic_min_profit(atr, price):
     if pct < 0.004: return 0.6
     if pct < 0.008: return 0.8
     return 1.2
+
+def est_pnl_rr(post_price, tp_price, qty):
+    """Подсчёт чистой прибыли и RR для заданного TP."""
+    buy_comm  = post_price * qty * MAKER_BUY_FEE
+    sell_comm = tp_price  * qty * MAKER_SELL_FEE
+    pnl = (tp_price - post_price) * qty - (buy_comm + sell_comm)
+    risk = post_price * STOP_LOSS_PCT
+    reward = max(tp_price - post_price, 0.0)
+    rr = (reward / risk) if risk > 0 else 0.0
+    return pnl, rr
+
+def find_tp_price(post_price, atr15, tick, qty, required_min_profit, min_rr, start_mult, max_mult=3.5, step=0.15):
+    """
+    Пытается подобрать TP так, чтобы:
+    - чистая прибыль ≥ required_min_profit
+    - RR ≥ min_rr
+    Повышаем множитель от start_mult до max_mult с шагом step.
+    """
+    mult = start_mult
+    best = None
+    while mult <= max_mult:
+        raw_tp = post_price + mult * atr15
+        tp_price = adjust_price(raw_tp, tick, mode="up")
+        pnl, rr = est_pnl_rr(post_price, tp_price, qty)
+        best = (tp_price, pnl, rr, mult)
+        if pnl >= required_min_profit and rr >= min_rr:
+            return best
+        mult = round(mult + step, 4)
+    return best  # вернём лучшее, даже если условия не выполнены
 
 # ==================== TRADES & LOGS ====================
 def log_trade(sym, side, price, qty, pnl, info=""):
@@ -338,7 +369,6 @@ def reconcile_positions_on_start():
         price = df["c"].iloc[-1]
         bal = get_coin_balance_from(by, sym)
         if bal > 0:
-            # отсекаем пыль, не создаём бессмысленную позицию
             if limits_ok and sym in limits:
                 step = limits[sym]["qty_step"]; min_qty = limits[sym]["min_qty"]; min_amt = limits[sym]["min_amt"]
                 bal_adj = adjust_qty(bal, step)
@@ -347,7 +377,7 @@ def reconcile_positions_on_start():
                     continue
                 bal = bal_adj
             atr5 = AverageTrueRange(df["h"], df["l"], df["c"], 5).average_true_range().iloc[-1]
-            mul  = choose_multiplier(
+            mul  = base_tp_mult(
                 atr=AverageTrueRange(df["h"], df["l"], df["c"], 15).average_true_range().iloc[-1],
                 price=price,
                 atr5_pct_hint=(atr5/price if price>0 else 0)
@@ -365,7 +395,7 @@ def reconcile_positions_on_start():
     save_state()
     log_msg("🚀 Бот запущен (восстановление позиций)\n" + "\n".join(lines) + f"\n📊 Номинал по монетам: ${total_notional:.2f}", True)
 
-# ==================== ORDER HELPERS (postOnly + roll) ====================
+# ==================== ORDER HELPERS ====================
 def place_postonly_buy(sym, qty, price):
     r = api_call(session.place_order, category="spot", symbol=sym,
                  side="Buy", orderType="Limit", qty=str(qty),
@@ -426,18 +456,19 @@ def trade():
     logging.info(f"DEBUG avail={avail:.2f}, per_sym={per_sym:.2f}, limits_ok={limits_ok}")
 
     for sym in SYMBOLS:
-        st = STATE.get(sym) or _default_state_for(sym)  # ---------- NEW: guard ----------
-        STATE[sym] = st  # ensure saved back
+        st = STATE.get(sym) or _default_state_for(sym)
+        STATE[sym] = st
         df = get_kline(sym)
         if df.empty:
             continue
+
         sig, atr15, info = signal(df)
         price = df["c"].iloc[-1]
         bid, ask = get_top_of_book(sym)
         tick = limits.get(sym, {}).get("tick_size", 0.00000001) if limits_ok else 0.00000001
         atr5 = AverageTrueRange(df["h"], df["l"], df["c"], 5).average_true_range().iloc[-1]
         atr5_pct = (atr5 / price) if price > 0 else 0.0
-        tp_mult = choose_multiplier(atr15, price, atr5_pct)
+        base_mult = base_tp_mult(atr15, price, atr5_pct)
         bal_coin = get_coin_balance_from(by, sym)
         bal_val  = bal_coin * price
         pos_open = len(st.get("positions", [])) > 0
@@ -446,11 +477,11 @@ def trade():
             f"[{sym}] sig={sig}, price={price:.6f}, bal_val={bal_val:.2f}, pos={'1' if pos_open else '0'} | "
             f"bid={bid if bid else '?'} ask={ask if ask else '?'} | "
             f"EMA9={info.get('EMA9', 0):.6f} EMA21={info.get('EMA21', 0):.6f} RSI={info.get('RSI', 0):.2f} "
-            f"MACD={info.get('MACD', 0):.6f} SIG={info.get('SIG', 0):.6f} | ATR(5/15m)={atr5_pct*100:.2f}% | tp_mult={tp_mult:.2f}"
+            f"MACD={info.get('MACD', 0):.6f} SIG={info.get('SIG', 0):.6f} | ATR(5/15m)={atr5_pct*100:.2f}% | tp_mult≈{base_mult:.2f}"
         )
 
-        # 1) Сопровождение открытого BUY (перекат)
-        ob = st.get("open_buy")  # ---------- NEW: safe get ----------
+        # 1) Сопровождение открытого BUY (перекат/fill)
+        ob = st.get("open_buy")
         if ob:
             oid = ob["orderId"]; ots = ob["ts"]; oprice = ob["price"]; oqty = ob["qty"]
             still_open = is_order_open(sym, oid)
@@ -469,7 +500,19 @@ def trade():
                 coin_bal = get_coin_balance_from(by_now, sym)
                 qty = coin_bal if coin_bal > 0 else oqty
                 entry_price = oprice
-                tp_price = adjust_price(entry_price + tp_mult * atr15, tick, mode="up")
+
+                # динамический TP под условия
+                required  = max(MIN_NET_PROFIT, dynamic_min_profit(atr15, entry_price))
+                tp_price, pnl, rr, used_mult = find_tp_price(
+                    post_price=entry_price,
+                    atr15=atr15,
+                    tick=tick,
+                    qty=qty,
+                    required_min_profit=required,
+                    min_rr=1.5,
+                    start_mult=base_mult
+                )
+
                 st["positions"] = [{
                     "buy_price": entry_price,
                     "qty": qty,
@@ -481,13 +524,12 @@ def trade():
                     place_tp_postonly(sym, qty, tp_price)
                 except Exception as e:
                     log_msg(f"{sym}: place TP failed: {e} | price={tp_price}, tick={tick}", True)
-                log_msg(f"✅ BUY filled {sym} @~{entry_price:.8f}, qty≈{qty}. TP={tp_price}", True)
+                log_msg(f"✅ BUY filled {sym} @~{entry_price:.8f}, qty≈{qty}. TP={tp_price} (mult≈{used_mult:.2f}, est_pnl≈{pnl:.2f}, RR≈{rr:.2f})", True)
 
         # 2) Продажи по TP/SL, если позиция есть
         if st.get("positions"):
             pos = st["positions"][0]
             b, q = pos["buy_price"], pos["qty"]
-            # --- АНТИПЫЛЬ: если остаток не проходит лимиты — снимаем позицию и НЕ спамим ---
             dust_qty = normalize_sell_qty(sym, q, price)
             if dust_qty is None:
                 if should_log_skip(sym, "dust_skip", interval=1):
@@ -495,15 +537,12 @@ def trade():
                 st["positions"] = []
                 save_state()
             else:
-                # SL
                 if price <= b * (1 - STOP_LOSS_PCT):
                     try:
                         api_call(session.place_order, category="spot", symbol=sym,
                                  side="Sell", orderType="Market", qty=str(dust_qty))
-                        buy_comm  = b * dust_qty * MAKER_BUY_FEE
-                        sell_comm = price * dust_qty * MAKER_SELL_FEE
-                        pnl = (price - b) * dust_qty - (buy_comm + sell_comm)
-                        st["pnl"] = st.get("pnl", 0.0) + pnl  # ---------- NEW: safe add ----------
+                        pnl, _ = est_pnl_rr(b, price, dust_qty)
+                        st["pnl"] = st.get("pnl", 0.0) + pnl
                         log_trade(sym, "STOP SELL", price, dust_qty, pnl, "stop-loss")
                         st["positions"] = []
                     except Exception as e:
@@ -523,36 +562,44 @@ def trade():
             if not bid:
                 logging.info(f"{sym}: DEBUG_SKIP | no orderbook for BUY")
                 continue
+
             qty = get_qty(sym, price, per_sym)
             if qty <= 0:
                 lim = limits.get(sym, {})
                 logging.info(f"{sym}: DEBUG_SKIP | qty=0 price={price:.8f} step={lim.get('qty_step')} min_qty={lim.get('min_qty')} min_amt={lim.get('min_amt')}")
                 continue
-            # Цена постонли — от bid вниз на шаг
+
+            # пост‑онли цена у bid вниз на шаг
             post_price = adjust_price(bid, limits[sym]["tick_size"], mode="down")
-            # TP и RR
-            tp_raw   = post_price + tp_mult * atr15
-            tp_price = adjust_price(tp_raw, limits[sym]["tick_size"], mode="up")
-            buy_comm  = post_price * qty * MAKER_BUY_FEE
-            sell_comm = tp_price  * qty * MAKER_SELL_FEE
-            est_pnl   = (tp_price - post_price) * qty - (buy_comm + sell_comm)
+
+            # динамический TP перед размещением BUY: оценим, есть ли смысл входить
             required  = max(MIN_NET_PROFIT, dynamic_min_profit(atr15, post_price))
-            # Risk/Reward: риск = стоп-дистанция (как у SL), ревард = tp - entry
-            risk  = post_price * STOP_LOSS_PCT
-            reward = max(tp_price - post_price, 0.0)
-            rr = (reward / risk) if risk > 0 else 0.0
-            logging.info(f"[{sym}] BUY-check qty={qty}, tp={tp_price:.8f}, ppu={tp_price-post_price:.8f}, "
-                         f"est_pnl={est_pnl:.2f}, required={required:.2f}, RR={rr:.2f}, tick={limits[sym]['tick_size']}")
-            if est_pnl >= required and rr >= 2.0:
+            candidate = find_tp_price(
+                post_price=post_price,
+                atr15=atr15,
+                tick=limits[sym]["tick_size"],
+                qty=qty,
+                required_min_profit=required,
+                min_rr=1.5,
+                start_mult=base_mult
+            )
+            tp_price, est_pnl_val, rr_val, used_mult = candidate
+
+            logging.info(f"[{sym}] BUY-check qty={qty}, tp={tp_price:.8f}, mult≈{used_mult:.2f}, "
+                         f"ppu={tp_price-post_price:.8f}, est_pnl={est_pnl_val:.2f}, "
+                         f"required={required:.2f}, RR={rr_val:.2f}, tick={limits[sym]['tick_size']}")
+
+            # Входим только если уже на этапе оценки видим смысл
+            if est_pnl_val >= required and rr_val >= 1.5:
                 try:
                     place_postonly_buy(sym, qty, post_price)
-                    log_msg(f"BUY (maker) {sym} @ {post_price:.8f}, qty={qty}, TP={tp_price:.8f} (поставится после fill)", True)
+                    log_msg(f"BUY (maker) {sym} @ {post_price:.8f}, qty={qty}, плановый TP={tp_price:.8f} (mult≈{used_mult:.2f}) — TP выставится после fill", True)
                     avail_local = qty * post_price
                     avail = max(0.0, avail - avail_local)
                 except Exception as e:
                     log_msg(f"{sym}: BUY failed: {e}", True)
             else:
-                logging.info(f"{sym}: DEBUG_SKIP | PnL {est_pnl:.2f} < {required:.2f} или RR<{2.0}")
+                logging.info(f"{sym}: DEBUG_SKIP | даже с динамическим TP PnL {est_pnl_val:.2f} < {required:.2f} или RR<{1.5}")
 
     # Ежедневный отчёт раз в день 22:30+
     now = datetime.datetime.now()
@@ -563,13 +610,12 @@ def trade():
 # ==================== ENTRY ====================
 if __name__ == "__main__":
     init_state()
-    # лимиты поднимем заранее, чтобы стартовые логи были честные
     try:
         _ = get_limits()
     except:
         pass
     reconcile_positions_on_start()
-    log_msg("🟢 Бот работает. Maker‑режим, фильтры мягкие, TP≥$1 чистыми.", True)
+    log_msg("🟢 Бот работает. Динамический TP (≥$1 и RR≥1.5), maker‑режим.", True)
     while True:
         try:
             trade()
