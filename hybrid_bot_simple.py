@@ -1,7 +1,7 @@
 # bot.py
 # -*- coding: utf-8 -*-
 import os, time, math, logging, datetime, requests, json
-from decimal import Decimal, getcontext, ROUND_FLOOR, ROUND_HALF_UP, ROUND_CEILING
+from decimal import Decimal, getcontext
 from dataclasses import dataclass, field
 import pandas as pd
 from dotenv import load_dotenv
@@ -22,23 +22,26 @@ REDIS_URL   = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 # ==================== CONFIG ====================
 TG_VERBOSE = True
 
-# Фокус на двух волатильных монетах
+# Фокус на двух более волатильных монетах
 SYMBOLS = ["DOGEUSDT", "XRPUSDT"]
 
-RESERVE_BALANCE   = 1.0
-MAX_TRADE_USDT    = 120.0      # потолок на сделку
-MIN_NET_PROFIT    = 1.0        # ≥ $1 чистыми после комиссий
-STOP_LOSS_PCT     = 0.008      # 0.8% от цены входа
-
-# Комиссии пользователя: maker BUY 0.10%, maker SELL 0.18%
+RESERVE_BALANCE   = 1.0          # запас USDT не трогаем
+MAX_TRADE_USDT    = 120.0        # максимум на один вход
+MIN_NET_PROFIT    = 1.0          # минимальная чистая прибыль в $
+# комиссии пользователя (спот): maker BUY 0.10%, maker SELL 0.18%
 MAKER_BUY_FEE  = 0.0010
 MAKER_SELL_FEE = 0.0018
 
-# Перекат лимитника: переустанавливаем ближе к рынку каждые N секунд
+# Перекат лимитника (вход и лимит‑стоп)
 ROLL_LIMIT_SECONDS = 45
 
-# Redis кэш лимитов (добавили tick_size -> bump version)
-LIMITS_REDIS_KEY = "limits_cache_v2"
+# Риск-менеджмент
+STOP_MODE        = "limit"   # "off" | "limit" | "market" (market не советую)
+STOP_LOSS_ATR_K  = 1.2       # расстояние стопа = k * ATR(15)
+RR_MIN           = 2.0       # минимальный Risk/Reward
+
+# Redis кэш лимитов
+LIMITS_REDIS_KEY = "limits_cache_v2"   # bump: v2 включает tick_size
 LIMITS_TTL_SEC   = 12 * 60 * 60
 
 # Прецизионная математика
@@ -64,8 +67,10 @@ _BUY_BLOCKED_REASON = ""
 def send_tg(msg: str):
     if TG_VERBOSE and TG_TOKEN and CHAT_ID:
         try:
-            requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-                          data={"chat_id": CHAT_ID, "text": msg})
+            requests.post(
+                f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                data={"chat_id": CHAT_ID, "text": msg}
+            )
         except Exception as e:
             logging.error("Telegram send failed: " + str(e))
 
@@ -74,16 +79,13 @@ def log_msg(msg, tg=False):
     if tg:
         send_tg(msg)
 
-def should_log_skip(sym, key, minutes=10):
+def should_log_skip(sym, key, interval_min=10):
     now = datetime.datetime.now()
     last = SKIP_LOG_TIMESTAMPS.get((sym, key))
-    if last and (now - last).total_seconds() < minutes * 60:
+    if last and (now - last).total_seconds() < interval_min * 60:
         return False
     SKIP_LOG_TIMESTAMPS[(sym, key)] = now
     return True
-
-def log_skip(sym, msg):
-    logging.info(f"{sym}: {msg}")
 
 def save_state():
     try:
@@ -96,8 +98,8 @@ def ensure_state_consistency():
         STATE.setdefault(sym, {
             "positions": [],      # [{buy_price, qty, tp, timestamp}]
             "pnl": 0.0,
-            "last_stop_time": 0.0,
-            "open_buy": None      # {"orderId", "qty", "price", "ts"}
+            "open_buy": None,     # {"orderId","qty","price","ts"}
+            "open_stop": None     # {"orderId","qty","price","ts"}
         })
 
 def init_state():
@@ -112,13 +114,11 @@ def api_call(fn, *args, **kwargs):
     wait = 0.35
     for attempt in range(6):
         try:
+            logging.info(f"Request → {fn.__name__.upper()}: {kwargs}")
             return fn(*args, **kwargs)
         except Exception as e:
             err = str(e)
-            logging.warning(
-                f"API retry {fn.__name__} attempt={attempt+1} wait={wait:.2f}s error={err}\n"
-                f"Request → {fn.__name__} {kwargs}"
-            )
+            logging.warning(f"API retry {fn.__name__} attempt={attempt+1} wait={wait:.2f}s error={err}")
             time.sleep(wait)
             wait = min(wait * 2.0, 8.0)
     raise RuntimeError(f"API call failed after retries: {fn.__name__}")
@@ -194,14 +194,14 @@ def get_kline(sym):
 
 def get_top_of_book(sym):
     """
-    Bybit v5 orderbook: session.get_orderbook(category='spot', symbol=sym, limit=1)
-    Ответ: result: {'a': [['price','size']], 'b': [['price','size']]} — строки.
+    Bybit v5 orderbook limit=1:
+    result: {'a': [['price','size']], 'b': [['price','size']]} — строки.
     """
     try:
         r = api_call(session.get_orderbook, category="spot", symbol=sym, limit=1)
         res = r["result"]
-        bids = res.get("b") or res.get("bids") or res.get("B") or []
-        asks = res.get("a") or res.get("asks") or res.get("A") or []
+        bids = res.get("b") or res.get("bids") or []
+        asks = res.get("a") or res.get("asks") or []
         bid = float(bids[0][0]) if bids and bids[0] else None
         ask = float(asks[0][0]) if asks and asks[0] else None
         return bid, ask
@@ -227,54 +227,23 @@ def adjust_price(price, tick, mode="nearest"):
         return price
     q = Decimal(str(price)) / Decimal(str(tick))
     if mode == "down":
-        q = q.to_integral_value(rounding=ROUND_FLOOR)
+        q = q.to_integral_value(rounding="ROUND_FLOOR")
     elif mode == "up":
-        q = q.to_integral_value(rounding=ROUND_CEILING)
+        q = q.to_integral_value(rounding="ROUND_CEILING")
     else:
-        q = q.to_integral_value(rounding=ROUND_HALF_UP)
+        q = q.to_integral_value(rounding="ROUND_HALF_UP")
     return float(Decimal(str(tick)) * q)
 
-def _dec_places(step: float) -> int:
-    d = Decimal(str(step)).normalize()
-    return max(0, -d.as_tuple().exponent)
-
-def fmt_qty_by_step(qty: float, step: float) -> str:
-    """Округляет вниз к шагу и форматирует строкой с правильным числом знаков."""
-    dq = Decimal(str(qty))
-    ds = Decimal(str(step))
-    norm = (dq / ds).to_integral_value(rounding=ROUND_FLOOR) * ds
-    places = _dec_places(step)
-    norm = norm.quantize(Decimal('1') if places == 0 else Decimal('1.' + '0'*places))
-    s = format(norm, 'f')
-    if '.' in s:
-        s = s.rstrip('0').rstrip('.')
-    return s
-
-def normalize_qty_for_sell(sym: str, qty: float, price: float) -> tuple[float, str]:
-    """Возвращает (qty_ok, reason). qty_ok=0 если после нормализации не проходит лимиты."""
+def round_qty_for(sym, qty):
     limits, ok, _ = get_limits()
     if not ok or sym not in limits:
-        return 0.0, "limits_unavailable"
-
-    step   = limits[sym]["qty_step"]
-    min_q  = limits[sym]["min_qty"]
-    min_a  = limits[sym]["min_amt"]
-
-    s_qty = float(Decimal(fmt_qty_by_step(qty, step)))
-    if s_qty < min_q:
-        return 0.0, f"qty<{min_q}"
-    if s_qty * price < min_a:
-        # попробуем «дотянуть» до min_amt, но не превышая исходный qty
-        need = min_a / max(price, 1e-9)
-        steps = math.ceil((need - s_qty) / step)
-        if steps > 0:
-            s_qty = s_qty + steps * step
-        if s_qty > qty:
-            # откат — продаём то, что есть (после округления), если проходит min_amt
-            s_qty = float(Decimal(fmt_qty_by_step(qty, step)))
-            if s_qty * price < min_a:
-                return 0.0, "amount<min_amt"
-    return s_qty, ""
+        return qty
+    step = limits[sym]["qty_step"]
+    q = adjust_qty(qty, step)
+    # защита от «слишком мало»
+    if q < limits[sym]["min_qty"]:
+        return 0.0
+    return q
 
 def get_qty(sym, price, usdt):
     limits, ok, _ = get_limits()
@@ -288,35 +257,31 @@ def get_qty(sym, price, usdt):
 
 # ==================== SIGNALS ====================
 def signal(df):
+    """
+    BUY если «2 из 3»: (EMA9>EMA21), (RSI>55), (MACD>signal).
+    Возвращаем ("buy"/"none", ATR15, info)
+    """
     if df.empty or len(df) < 50:
         return "none", 0, {}
     ema9  = EMAIndicator(df["c"], 9).ema_indicator()
     ema21 = EMAIndicator(df["c"], 21).ema_indicator()
     rsi9  = RSIIndicator(df["c"], 9).rsi()
-    macd  = MACD(close=df["c"])
-    macd_line, macd_sig = macd.macd(), macd.macd_signal()
+    macd  = MACD(close=df["c"]); macd_line, macd_sig = macd.macd(), macd.macd_signal()
 
     atr5  = AverageTrueRange(df["h"], df["l"], df["c"], 5).average_true_range()
     atr15 = AverageTrueRange(df["h"], df["l"], df["c"], 15).average_true_range()
 
-    last = len(df) - 1
-    ema9v, ema21v = ema9.iloc[last], ema21.iloc[last]
-    rsi, macdv, macds = rsi9.iloc[last], macd_line.iloc[last], macd_sig.iloc[last]
-    atr_pct = (atr5.iloc[last] / df["c"].iloc[last]) if df["c"].iloc[last] > 0 else 0.0
+    i = len(df) - 1
+    ema9v, ema21v = float(ema9.iloc[i]), float(ema21.iloc[i])
+    rsi = float(rsi9.iloc[i])
+    m, s = float(macd_line.iloc[i]), float(macd_sig.iloc[i])
+    atr5_pct = (float(atr5.iloc[i]) / float(df["c"].iloc[i])) if df["c"].iloc[i] > 0 else 0.0
 
-    # Мягче: 2 из 3 (EMA, RSI>50, MACD>sig) или крест вверх
-    two_of_three_buy = ((ema9v > ema21v) + (rsi > 50) + (macdv > macds)) >= 2
-    prev_cross = (ema9.iloc[last-1] <= ema21.iloc[last-1]) and (ema9v > ema21v)
+    conds = int(ema9v > ema21v) + int(rsi > 55) + int(m > s)
+    buy = conds >= 2
 
-    info = {
-        "EMA9": float(ema9v), "EMA21": float(ema21v),
-        "RSI": float(rsi), "MACD": float(macdv), "SIG": float(macds),
-        "ATR%": float(atr_pct)
-    }
-
-    if two_of_three_buy or prev_cross:
-        return "buy", float(atr15.iloc[last]), info
-    return "none", float(atr15.iloc[last]), info
+    info = {"EMA9": ema9v, "EMA21": ema21v, "RSI": rsi, "MACD": m, "SIG": s, "ATR%": atr5_pct}
+    return ("buy" if buy else "none"), float(atr15.iloc[i]), info
 
 def choose_multiplier(atr, price, atr5_pct_hint):
     pct = atr / price if price > 0 else 0
@@ -344,10 +309,6 @@ def log_trade(sym, side, price, qty, pnl, info=""):
 
 # ==================== RESTORE ====================
 def reconcile_positions_on_start():
-    """
-    Восстанавливаем только видимые балансы: если есть монеты на споте — создаём
-    "синхр. позицию" от текущей цены (для корректного TP).
-    """
     usdt, by = get_balances_cache()
     limits, limits_ok, _ = get_limits()
     total_notional = 0.0
@@ -355,51 +316,44 @@ def reconcile_positions_on_start():
 
     for sym in SYMBOLS:
         df = get_kline(sym)
-        if df.empty:
+        if df.empty: 
             continue
         price = df["c"].iloc[-1]
         bal = get_coin_balance_from(by, sym)
         if bal > 0:
-            tick = limits.get(sym, {}).get("tick_size", 0.00000001) if limits_ok else 0.00000001
+            # округлим позиционный qty вниз до шага — пригодится для ордеров
+            if limits_ok and sym in limits:
+                bal = round_qty_for(sym, bal)
             atr5 = AverageTrueRange(df["h"], df["l"], df["c"], 5).average_true_range().iloc[-1]
-            mul  = choose_multiplier(
-                atr=AverageTrueRange(df["h"], df["l"], df["c"], 15).average_true_range().iloc[-1],
-                price=price, atr5_pct_hint=(atr5/price if price>0 else 0)
-            )
-            tp   = adjust_price(price + mul * atr5, tick, mode="up")
-
-            # нормализуем qty, чтобы TP/SL не падали на "too many decimals"
-            q_ok, why = normalize_qty_for_sell(sym, bal, price)
-            if q_ok <= 0:
-                lines.append(f"- {sym}: баланс {bal} не проходит лимиты ({why})")
-                STATE[sym]["positions"] = []
-            else:
-                STATE[sym]["positions"] = [{
-                    "buy_price": price, "qty": q_ok, "tp": tp,
-                    "timestamp": datetime.datetime.now().isoformat()
-                }]
-                lines.append(f"- {sym}: синхр. позиция qty={q_ok} по ~{price:.6f}")
-                total_notional += q_ok * price
+            atr15= AverageTrueRange(df["h"], df["l"], df["c"], 15).average_true_range().iloc[-1]
+            mul  = choose_multiplier(atr=atr15, price=price, atr5_pct_hint=(atr5/price if price>0 else 0))
+            tick = limits.get(sym, {}).get("tick_size", 0.00000001) if limits_ok else 0.00000001
+            tp   = adjust_price(price + mul * atr15, tick, mode="up")
+            STATE[sym]["positions"] = [{
+                "buy_price": price, "qty": bal, "tp": tp,
+                "timestamp": datetime.datetime.now().isoformat()
+            }]
+            lines.append(f"- {sym}: синхр. позиция qty={bal} по ~{price:.6f}")
+            total_notional += bal * price
         else:
             lines.append(f"- {sym}: позиций нет, баланса мало")
 
     save_state()
-    log_msg("🚀 Бот запущен (восстановление позиций)\n" + "\n".join(lines) +
-            f"\n📊 Номинал по монетам: ${total_notional:.2f}", True)
+    log_msg("🚀 Бот запущен (восстановление позиций)\n" + "\n".join(lines) + f"\n📊 Номинал по монетам: ${total_notional:.2f}", True)
 
 # ==================== ORDER HELPERS (postOnly + roll) ====================
 def place_postonly_buy(sym, qty, price):
-    """Ставим постонли BUY по price."""
     limits, ok, _ = get_limits()
-    step = limits.get(sym, {}).get("qty_step", 1.0) if ok else 1.0
-    qty_str = fmt_qty_by_step(qty, step)
+    qty_adj = round_qty_for(sym, qty)
+    if qty_adj <= 0:
+        raise RuntimeError(f"postonly_buy qty adj=0 (orig {qty}) step={limits.get(sym,{}).get('qty_step')}")
     r = api_call(session.place_order, category="spot", symbol=sym,
-                 side="Buy", orderType="Limit", qty=qty_str,
+                 side="Buy", orderType="Limit", qty=str(qty_adj),
                  price=str(price), timeInForce="PostOnly")
     oid = r["result"]["orderId"]
-    STATE[sym]["open_buy"] = {"orderId": oid, "qty": float(qty_str), "price": price, "ts": time.time()}
+    STATE[sym]["open_buy"] = {"orderId": oid, "qty": qty_adj, "price": price, "ts": time.time()}
     save_state()
-    log_msg(f"{sym}: postOnly BUY placed id={oid} price={price} qty={qty_str}", True)
+    log_msg(f"{sym}: postOnly BUY placed id={oid} price={price} qty={qty_adj}", True)
     return oid
 
 def cancel_order(sym, order_id):
@@ -418,14 +372,14 @@ def is_order_open(sym, order_id):
         return False
 
 def place_tp_postonly(sym, qty, price):
-    limits, ok, _ = get_limits()
-    step = limits.get(sym, {}).get("qty_step", 1.0) if ok else 1.0
-    qty_str = fmt_qty_by_step(qty, step)
+    qty_adj = round_qty_for(sym, qty)
+    if qty_adj <= 0:
+        raise RuntimeError(f"tp qty adj=0 (orig {qty})")
     r = api_call(session.place_order, category="spot", symbol=sym,
-                 side="Sell", orderType="Limit", qty=qty_str,
+                 side="Sell", orderType="Limit", qty=str(qty_adj),
                  price=str(price), timeInForce="PostOnly")
     oid = r["result"]["orderId"]
-    log_msg(f"{sym}: TP postOnly placed id={oid} price={price} qty={qty_str}", True)
+    log_msg(f"{sym}: TP postOnly placed id={oid} price={price} qty={qty_adj}", True)
     return oid
 
 # ==================== MAIN LOGIC ====================
@@ -451,11 +405,14 @@ def trade():
         bid, ask = get_top_of_book(sym)
         tick = limits.get(sym, {}).get("tick_size", 0.00000001) if limits_ok else 0.00000001
 
+        # ATR% для мультипликатора (подсказка по волатильности)
         atr5 = AverageTrueRange(df["h"], df["l"], df["c"], 5).average_true_range().iloc[-1]
         atr5_pct = (atr5 / price) if price > 0 else 0.0
         tp_mult = choose_multiplier(atr15, price, atr5_pct)
 
         bal_coin = get_coin_balance_from(by, sym)
+        # округлим для корректных ордеров
+        bal_coin = round_qty_for(sym, bal_coin)
         bal_val  = bal_coin * price
         pos_open = len(st["positions"]) > 0
 
@@ -480,80 +437,107 @@ def trade():
                         place_postonly_buy(sym, oqty, new_price)
                         logging.info(f"{sym}: rolled BUY {oprice} → {new_price}")
             elif not still_open:
-                # ордер исполнен — ставим TP
+                # ордер исполнен — ставим TP для всей позиции
                 st["open_buy"] = None
                 by_now = get_balances_cache()[1]
                 coin_bal = get_coin_balance_from(by_now, sym)
-                qty_raw = coin_bal if coin_bal > 0 else oqty
-                q_ok, why = normalize_qty_for_sell(sym, qty_raw, price)
-                if q_ok <= 0:
-                    log_msg(f"{sym}: after BUY fill qty invalid for TP ({why}), raw={qty_raw}", True)
-                else:
-                    entry_price = oprice
-                    tp_price = adjust_price(entry_price + tp_mult * atr15, tick, mode="up")
-                    st["positions"] = [{
-                        "buy_price": entry_price,
-                        "qty": q_ok,
-                        "tp": tp_price,
-                        "timestamp": datetime.datetime.now().isoformat()
-                    }]
-                    save_state()
-                    try:
-                        place_tp_postonly(sym, q_ok, tp_price)
-                    except Exception as e:
-                        log_msg(f"{sym}: place TP failed: {e} | price={tp_price}, tick={tick}", True)
-                    log_msg(f"✅ BUY filled {sym} @~{entry_price:.8f}, qty≈{q_ok}. TP={tp_price}", True)
+                coin_bal = round_qty_for(sym, coin_bal)
+                qty = coin_bal if coin_bal > 0 else oqty
+                entry_price = oprice
+                tp_price = adjust_price(entry_price + tp_mult * atr15, tick, mode="up")
+                st["positions"] = [{
+                    "buy_price": entry_price,
+                    "qty": qty,
+                    "tp": tp_price,
+                    "timestamp": datetime.datetime.now().isoformat()
+                }]
+                save_state()
+                try:
+                    place_tp_postonly(sym, qty, tp_price)
+                except Exception as e:
+                    log_msg(f"{sym}: place TP failed: {e} | price={tp_price}, tick={tick}", True)
+                log_msg(f"✅ BUY filled {sym} @~{entry_price:.8f}, qty≈{qty}. TP={tp_price}", True)
 
         # 2) Продажи по TP/SL, если позиция есть
         if st["positions"]:
             pos = st["positions"][0]
-            b, q = pos["buy_price"], pos["qty"]
+            b, q = float(pos["buy_price"]), float(pos["qty"])
+            q = round_qty_for(sym, q)
+            # лимит‑стоп от волатильности
+            sl_level = b - STOP_LOSS_ATR_K * atr15
 
-            # SL условие
-            if price <= b * (1 - STOP_LOSS_PCT):
-                try:
-                    q_ok, why = normalize_qty_for_sell(sym, q, price)
-                    if q_ok <= 0:
-                        # анти‑спам: раз в 10 минут
-                        if time.time() - st.get("last_stop_time", 0) > 600:
-                            log_msg(f"{sym}: STOP SELL skipped — qty invalid ({why}). raw={q}, price={price}", True)
-                            st["last_stop_time"] = time.time()
-                            save_state()
-                    else:
-                        limits, ok, _ = get_limits()
-                        step = limits.get(sym, {}).get("qty_step", 1.0) if ok else 1.0
-                        qty_str = fmt_qty_by_step(q_ok, step)
-                        api_call(session.place_order, category="spot", symbol=sym,
-                                 side="Sell", orderType="Market", qty=qty_str)
-                        buy_comm  = b * q_ok * MAKER_BUY_FEE
-                        sell_comm = price * q_ok * MAKER_SELL_FEE
-                        pnl = (price - b) * q_ok - (buy_comm + sell_comm)
-                        st["pnl"] += pnl
-                        log_trade(sym, "STOP SELL", price, q_ok, pnl, "stop-loss")
-                        st["positions"] = []
-                        st["last_stop_time"] = time.time()
-                        save_state()
-                except Exception as e:
-                    if time.time() - st.get("last_stop_time", 0) > 600:
-                        log_msg(f"{sym}: STOP SELL failed: {e}", True)
-                        st["last_stop_time"] = time.time()
-                        save_state()
-            else:
-                # если цена >= tp — даём рынку добить лимит, иначе — ничего
+            if STOP_MODE == "off":
                 pass
+            elif STOP_MODE == "market":
+                if price <= sl_level:
+                    try:
+                        q_m = round_qty_for(sym, q)
+                        api_call(session.place_order, category="spot", symbol=sym,
+                                 side="Sell", orderType="Market", qty=str(q_m))
+                        buy_comm  = b * q_m * MAKER_BUY_FEE
+                        sell_comm = price * q_m * MAKER_SELL_FEE
+                        pnl = (price - b) * q_m - (buy_comm + sell_comm)
+                        st["pnl"] += pnl
+                        log_trade(sym, "STOP SELL", price, q_m, pnl, "market stop-loss")
+                        st["positions"] = []
+                    except Exception as e:
+                        log_msg(f"{sym}: STOP SELL failed: {e}", True)
+            else:  # limit-эвакуация с перекатом
+                ob_stop = st.get("open_stop")
+                if price <= sl_level and not ob_stop:
+                    new_bid, _ = get_top_of_book(sym)
+                    if new_bid:
+                        sl_price = adjust_price(new_bid, tick, mode="down")
+                        try:
+                            q_s = round_qty_for(sym, q)
+                            r = api_call(session.place_order, category="spot", symbol=sym,
+                                         side="Sell", orderType="Limit", qty=str(q_s),
+                                         price=str(sl_price), timeInForce="PostOnly")
+                            st["open_stop"] = {"orderId": r["result"]["orderId"], "price": sl_price, "qty": q_s, "ts": time.time()}
+                            save_state()
+                            log_msg(f"{sym}: LIMIT-STOP placed @{sl_price} qty={q_s}", True)
+                        except Exception as e:
+                            log_msg(f"{sym}: LIMIT-STOP place failed: {e} | price={sl_price}, tick={tick}", True)
+                elif ob_stop:
+                    if is_order_open(sym, ob_stop["orderId"]):
+                        if time.time() - ob_stop["ts"] >= ROLL_LIMIT_SECONDS:
+                            new_bid, _ = get_top_of_book(sym)
+                            if new_bid:
+                                new_price = adjust_price(new_bid, tick, mode="down")
+                                if new_price != ob_stop["price"]:
+                                    cancel_order(sym, ob_stop["orderId"])
+                                    try:
+                                        r = api_call(session.place_order, category="spot", symbol=sym,
+                                                     side="Sell", orderType="Limit", qty=str(ob_stop["qty"]),
+                                                     price=str(new_price), timeInForce="PostOnly")
+                                        st["open_stop"] = {"orderId": r["result"]["orderId"], "price": new_price,
+                                                           "qty": ob_stop["qty"], "ts": time.time()}
+                                        save_state()
+                                        logging.info(f"{sym}: LIMIT-STOP rolled {ob_stop['price']} → {new_price}")
+                                    except Exception as e:
+                                        log_msg(f"{sym}: LIMIT-STOP roll failed: {e}", True)
+                    else:
+                        # стоп исполнился
+                        st["open_stop"] = None
+                        sell_px = ob_stop["price"]
+                        q_s = ob_stop["qty"]
+                        buy_comm  = b * q_s * MAKER_BUY_FEE
+                        sell_comm = sell_px * q_s * MAKER_SELL_FEE
+                        pnl = (sell_px - b) * q_s - (buy_comm + sell_comm)
+                        st["pnl"] += pnl
+                        log_trade(sym, "STOP SELL", sell_px, q_s, pnl, "limit evac")
+                        st["positions"] = []
 
         # 3) Новые входы (если нет позиции и нет открытого лимитника)
         if (sig == "buy") and not st["positions"] and not st["open_buy"]:
             if not limits_ok:
                 if should_log_skip(sym, "buy_blocked_limits"):
-                    log_skip(sym, f"Пропуск BUY — {buy_blocked_reason}")
-                    send_tg(f"{sym}: ⛔️ Покупки блокированы: {buy_blocked_reason}")
+                    log_msg(f"{sym}: ⛔️ Покупки блокированы: {buy_blocked_reason}", True)
                 continue
             if avail < limits[sym]["min_amt"]:
                 if should_log_skip(sym, "skip_funds"):
-                    log_skip(sym, "Пропуск BUY — не хватает свободного USDT")
+                    logging.info(f"{sym}: Пропуск BUY — свободного USDT мало")
                 continue
-
             if not bid:
                 logging.info(f"{sym}: DEBUG_SKIP | no orderbook for BUY")
                 continue
@@ -565,29 +549,34 @@ def trade():
                 continue
 
             post_price = adjust_price(bid, limits[sym]["tick_size"], mode="down")
-            tp_raw = post_price + tp_mult * atr15
+            tp_raw   = post_price + tp_mult * atr15
             tp_price = adjust_price(tp_raw, limits[sym]["tick_size"], mode="up")
 
-            # Чистая прибыль ≥ $1 с учётом maker‑комиссий
+            # риск для RR (в $) — даже если стоп выключен, оцениваем на основе ATR
+            risk_abs = STOP_LOSS_ATR_K * atr15 * qty
+
             buy_comm  = post_price * qty * MAKER_BUY_FEE
             sell_comm = tp_price  * qty * MAKER_SELL_FEE
             est_pnl   = (tp_price - post_price) * qty - (buy_comm + sell_comm)
+
             required  = max(MIN_NET_PROFIT, dynamic_min_profit(atr15, post_price))
+            rr        = (est_pnl / risk_abs) if risk_abs > 0 else 999.0
 
-            logging.info(f"[{sym}] BUY-check qty={qty}, tp={tp_price:.8f}, ppu={tp_price-post_price:.8f}, "
-                         f"est_pnl={est_pnl:.2f}, required={required:.2f}, tick={limits[sym]['tick_size']}")
+            logging.info(f"[{sym}] BUY-check qty={qty}, tp={tp_price:.8f}, ppu={(tp_price-post_price):.8f}, "
+                         f"est_pnl={est_pnl:.2f}, required={required:.2f}, RR={rr:.2f}, "
+                         f"sl_level={post_price - STOP_LOSS_ATR_K*atr15:.8f}, tick={limits[sym]['tick_size']}")
 
-            if est_pnl >= required:
+            if est_pnl >= required and rr >= RR_MIN:
                 try:
                     place_postonly_buy(sym, qty, post_price)
-                    log_msg(f"BUY (maker) {sym} @ {post_price:.8f}, qty={qty}, TP={tp_price:.8f} (будет поставлен после fill)", True)
-                    # уменьшить локально доступ — «резерв»
+                    log_msg(f"BUY (maker) {sym} @ {post_price:.8f}, qty={qty}, TP={tp_price:.8f} (TP поставим после fill)", True)
+                    # «резервируем» часть средств локально
                     avail_local = qty * post_price
                     avail = max(0.0, avail - avail_local)
                 except Exception as e:
                     log_msg(f"{sym}: BUY failed: {e}", True)
             else:
-                logging.info(f"{sym}: DEBUG_SKIP | ожидаемый PnL {est_pnl:.2f} < требуемого {required:.2f}")
+                logging.info(f"{sym}: DEBUG_SKIP | PnL {est_pnl:.2f} < {required:.2f} or RR {rr:.2f} < {RR_MIN:.2f}")
 
     # Ежедневный отчёт
     now = datetime.datetime.now()
@@ -614,6 +603,11 @@ def send_daily_report():
 # ==================== ENTRY ====================
 if __name__ == "__main__":
     init_state()
+    # прогружаем лимиты заранее (и кешируем)
+    try:
+        get_limits()
+    except Exception:
+        pass
     reconcile_positions_on_start()
     log_msg("🟢 Бот работает. Maker‑режим, фильтры мягкие, TP≥$1 чистыми.", True)
     while True:
