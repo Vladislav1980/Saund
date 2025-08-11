@@ -21,19 +21,24 @@ REDIS_URL   = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
 # ==================== CONFIG ====================
 TG_VERBOSE = True
-TG_DEDUP_WINDOW = 180
-SYMBOLS = ["DOGEUSDT", "XRPUSDT"]
+TG_DEDUP_WINDOW = 180  # сек
+
+SYMBOLS = [
+    "DOGEUSDT", "XRPUSDT",
+    "SOLUSDT", "ARBUSDT",
+    "LINKUSDT", "TONUSDT"
+]
 
 RESERVE_BALANCE   = 1.0
 MAX_TRADE_USDT    = 120.0
-MIN_NET_PROFIT    = 1.0        # минимум $1 чистыми
-STOP_LOSS_PCT     = 0.008      # 0.8%
+MIN_NET_PROFIT    = 1.0         # минимум $1 чистыми
+STOP_LOSS_PCT     = 0.008       # 0.8%
 
-# Комиссии (maker) BUY/SELL
+# Комиссии (maker)
 MAKER_BUY_FEE  = 0.0010
 MAKER_SELL_FEE = 0.0018
 
-# Перекат post-only каждые N сек
+# Перекат post-only
 ROLL_LIMIT_SECONDS = 45
 
 # Redis кэш лимитов
@@ -98,7 +103,7 @@ def save_state():
     except Exception as e:
         log_msg(f"Redis save failed: {e}", True)
 
-# ---------- ROBUST STATE DEFAULTS / MIGRATION ----------
+# ---------- ROBUST STATE ----------
 def _default_state_for(sym: str):
     return {
         "positions": [],
@@ -137,13 +142,31 @@ def api_call(fn, *args, **kwargs):
         try:
             return fn(*args, **kwargs)
         except Exception as e:
-            err = str(e)
-            logging.warning(f"API retry {fn.__name__} attempt={attempt+1} wait={wait:.2f}s error={err}")
+            # вытащим retCode/retMsg если есть
+            msg = str(e)
+            try:
+                d = getattr(e, "args", [{}])[0]
+                if isinstance(d, dict):
+                    rc = d.get("retCode"); rm = d.get("retMsg")
+                    if rc is not None:
+                        msg = f"{msg} (retCode={rc}, retMsg={rm})"
+            except Exception:
+                pass
+            logging.warning(f"API retry {fn.__name__} attempt={attempt+1} wait={wait:.2f}s error={msg}")
             time.sleep(wait)
             wait = min(wait * 2.0, 8.0)
     raise RuntimeError(f"API call failed after retries: {fn.__name__}")
 
-# ==================== LIMITS (lazy + Redis cache) ====================
+def get_open_orders_map(sym, order_id=None):
+    try:
+        r = session.get_open_orders(category="spot", symbol=sym, orderId=order_id)
+        arr = r["result"]["list"]
+        m = {item["orderId"]: item for item in arr}
+        return m
+    except Exception:
+        return {}
+
+# ==================== LIMITS ====================
 def _load_symbol_limits_from_api():
     r = api_call(session.get_instruments_info, category="spot")
     lst = r["result"]["list"]
@@ -274,7 +297,6 @@ def get_qty(sym, price, usdt):
 
 # ==================== SIGNALS ====================
 def signal(df):
-    """Мягкое '2 из 3' (EMA/RSI/MACD)."""
     if df.empty or len(df) < 50:
         return "none", 0, {}
     ema9  = EMAIndicator(df["c"], 9).ema_indicator()
@@ -291,15 +313,13 @@ def signal(df):
     atr_pct = (atr5.iloc[last] / df["c"].iloc[last]) if df["c"].iloc[last] > 0 else 0.0
 
     rsi_ok  = (rsi > 49.0)
-    ema_ok  = (ema9v > ema21v * 0.999)      # допуск 0.1%
+    ema_ok  = (ema9v > ema21v * 0.999)   # допуск 0.1%
     macd_ok = (macdv > macds)
 
     conds = int(ema_ok) + int(rsi_ok) + int(macd_ok)
-    info = {
-        "EMA9": float(ema9v), "EMA21": float(ema21v),
-        "RSI": float(rsi), "MACD": float(macdv), "SIG": float(macds),
-        "ATR%": float(atr_pct)
-    }
+    info = {"EMA9": float(ema9v), "EMA21": float(ema21v),
+            "RSI": float(rsi), "MACD": float(macdv), "SIG": float(macds),
+            "ATR%": float(atr_pct)}
     if conds >= 2:
         return "buy", float(atr15.iloc[last]), info
     return "none", float(atr15.iloc[last]), info
@@ -340,7 +360,53 @@ def find_tp_price(post_price, atr15, tick, qty, required_min_profit, min_rr, sta
         mult = round(mult + step, 4)
     return best
 
-# ==================== TRADES & LOGS ====================
+# ==================== ORDER HELPERS ====================
+def place_tp_postonly(sym, qty, price):
+    r = api_call(session.place_order, category="spot", symbol=sym,
+                 side="Sell", orderType="Limit", qty=str(qty),
+                 price=str(price), timeInForce="PostOnly")
+    oid = r["result"]["orderId"]
+    log_msg(f"{sym}: TP postOnly placed id={oid} price={price} qty={qty}", True)
+    return oid
+
+def try_cancel_order(sym, order_id):
+    # проверяем открытые — если нет, не дергаем cancel
+    m = get_open_orders_map(sym, order_id=order_id)
+    if order_id not in m:
+        logging.info(f"{sym}: cancel skip — order {order_id} not open")
+        return
+    try:
+        api_call(session.cancel_order, category="spot", symbol=sym, orderId=order_id)
+        log_msg(f"{sym}: order {order_id} canceled", True)
+    except Exception as e:
+        log_msg(f"{sym}: cancel failed {order_id}: {e}", True)
+
+def place_postonly_buy_safe(sym, qty, ref_bid, tick, max_tries=3):
+    """
+    Пытаемся поставить PostOnly BUY. Если биржа ругается (слишком близко / taker),
+    сдвигаем цену ещё на 1 тик вниз и повторяем до max_tries.
+    """
+    err_last = None
+    price = adjust_price(ref_bid, tick, mode="down")
+    for i in range(max_tries):
+        try:
+            r = api_call(session.place_order, category="spot", symbol=sym,
+                         side="Buy", orderType="Limit", qty=str(qty),
+                         price=str(price), timeInForce="PostOnly")
+            oid = r["result"]["orderId"]
+            STATE[sym]["open_buy"] = {"orderId": oid, "qty": qty, "price": price, "ts": time.time()}
+            save_state()
+            log_msg(f"{sym}: postOnly BUY placed id={oid} price={price} qty={qty}", True)
+            return oid, price
+        except Exception as e:
+            err_last = str(e)
+            logging.info(f"{sym}: PostOnly BUY attempt {i+1}/{max_tries} failed: {err_last}")
+            # сдвиг вниз ещё на тик и короткий backoff
+            price = adjust_price(price - tick, tick, mode="down")
+            time.sleep(0.35 * (i + 1))
+    raise RuntimeError(f"{sym}: place_order failed after {max_tries} tries: {err_last}")
+
+# ==================== TRADES & LOGИ ====================
 def log_trade(sym, side, price, qty, pnl, info=""):
     msg = f"{side} {sym} @ {price:.8f}, qty={qty}, PnL={pnl:.2f}. {info}"
     log_msg(msg, True)
@@ -387,55 +453,6 @@ def reconcile_positions_on_start():
     save_state()
     log_msg("🚀 Бот запущен (восстановление позиций)\n" + "\n".join(lines) + f"\n📊 Номинал по монетам: ${total_notional:.2f}", True)
 
-# ==================== ORDER HELPERS ====================
-def place_postonly_buy(sym, qty, price):
-    r = api_call(session.place_order, category="spot", symbol=sym,
-                 side="Buy", orderType="Limit", qty=str(qty),
-                 price=str(price), timeInForce="PostOnly")
-    oid = r["result"]["orderId"]
-    STATE[sym]["open_buy"] = {"orderId": oid, "qty": qty, "price": price, "ts": time.time()}
-    save_state()
-    log_msg(f"{sym}: postOnly BUY placed id={oid} price={price} qty={qty}", True)
-    return oid
-
-def cancel_order(sym, order_id):
-    try:
-        api_call(session.cancel_order, category="spot", symbol=sym, orderId=order_id)
-        log_msg(f"{sym}: order {order_id} canceled", True)
-    except Exception as e:
-        log_msg(f"{sym}: cancel failed {order_id}: {e}", True)
-
-def is_order_open(sym, order_id):
-    try:
-        r = api_call(session.get_open_orders, category="spot", symbol=sym, orderId=order_id)
-        arr = r["result"]["list"]
-        return len(arr) > 0
-    except Exception:
-        return False
-
-def place_tp_postonly(sym, qty, price):
-    r = api_call(session.place_order, category="spot", symbol=sym,
-                 side="Sell", orderType="Limit", qty=str(qty),
-                 price=str(price), timeInForce="PostOnly")
-    oid = r["result"]["orderId"]
-    log_msg(f"{sym}: TP postOnly placed id={oid} price={price} qty={qty}", True)
-    return oid
-
-# ==================== DAILY REPORT ====================
-def send_daily_report():
-    lines = ["📊 Ежедневный отчёт:"]
-    total_pnl = 0.0
-    for s in SYMBOLS:
-        st = STATE.get(s, _default_state_for(s))
-        pos_lines = []
-        for p in st.get("positions", []):
-            pos_lines.append(f"{p['qty']} @ {p['buy_price']:.6f} → TP {p['tp']:.6f}")
-        pos_text = "\n    " + "\n    ".join(pos_lines) if pos_lines else " нет открытых позиций"
-        lines.append(f"• {s}: PnL={st.get('pnl', 0.0):.2f};{pos_text}")
-        total_pnl += st.get("pnl", 0.0)
-    lines.append(f"Σ Итоговый PnL: {total_pnl:.2f}")
-    send_tg("\n".join(lines))
-
 # ==================== MAIN LOGIC ====================
 LAST_REPORT_DATE = None
 
@@ -472,20 +489,25 @@ def trade():
             f"MACD={info.get('MACD', 0):.6f} SIG={info.get('SIG', 0):.6f} | ATR(5/15m)={atr5_pct*100:.2f}% | tp_mult≈{base_mult:.2f}"
         )
 
-        # 1) сопровождение открытого BUY
+        # 1) сопровождение открытого BUY (перекат)
         ob = st.get("open_buy")
         if ob:
             oid = ob["orderId"]; ots = ob["ts"]; oprice = ob["price"]; oqty = ob["qty"]
-            still_open = is_order_open(sym, oid)
+            still_open = oid in get_open_orders_map(sym, order_id=oid)
             if still_open and time.time() - ots >= ROLL_LIMIT_SECONDS:
                 nbid, _ = get_top_of_book(sym)
                 if nbid:
                     new_price = adjust_price(nbid, tick, mode="down")
                     if new_price != oprice:
-                        cancel_order(sym, oid)
-                        place_postonly_buy(sym, oqty, new_price)
-                        logging.info(f"{sym}: rolled BUY {oprice} → {new_price}")
+                        try:
+                            try_cancel_order(sym, oid)
+                            # вместо немедленного падения — безопасная постановка
+                            place_postonly_buy_safe(sym, oqty, nbid, tick)
+                            logging.info(f"{sym}: rolled BUY {oprice} → {new_price}")
+                        except Exception as e:
+                            log_msg(f"{sym}: roll place failed — {e}. Оставляем без изменений, попробуем позже.", True)
             elif not still_open:
+                # ордер исполнен — ставим TP
                 st["open_buy"] = None
                 by_now = get_balances_cache()[1]
                 coin_bal = get_coin_balance_from(by_now, sym)
@@ -509,7 +531,7 @@ def trade():
                     log_msg(f"{sym}: place TP failed: {e} | price={tp_price}, tick={tick}", True)
                 log_msg(f"✅ BUY filled {sym} @~{entry_price:.8f}, qty≈{qty}. TP={tp_price} (mult≈{used_mult:.2f}, est_pnl≈{pnl:.2f}, RR≈{rr:.2f})", True)
 
-        # 2) продажи по SL (TP лимит уже стоит)
+        # 2) SL (TP уже стоит)
         if st.get("positions"):
             pos = st["positions"][0]
             b, q = pos["buy_price"], pos["qty"]
@@ -563,7 +585,7 @@ def trade():
                          f"required={required:.2f}, RR={rr_val:.2f}, tick={limits[sym]['tick_size']}")
             if est_pnl_val >= required and rr_val >= 1.0:
                 try:
-                    place_postonly_buy(sym, qty, post_price)
+                    place_postonly_buy_safe(sym, qty, bid, limits[sym]["tick_size"])
                     log_msg(f"BUY (maker) {sym} @ {post_price:.8f}, qty={qty}, плановый TP={tp_price:.8f} (mult≈{used_mult:.2f}) — TP выставится после fill", True)
                     avail_local = qty * post_price
                     avail = max(0.0, avail - avail_local)
@@ -586,7 +608,7 @@ if __name__ == "__main__":
     except:
         pass
     reconcile_positions_on_start()
-    log_msg("🟢 Бот работает. Динамический TP (≥$1 и RR≥1.0), maker‑режим.", True)
+    log_msg("🟢 Бот работает. Динамический TP (≥$1 и RR≥1.0), maker‑режим. Пары: DOGE/XRP/SOL/ARB/LINK/TON", True)
     while True:
         try:
             trade()
