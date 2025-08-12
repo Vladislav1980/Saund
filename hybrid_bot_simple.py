@@ -2,9 +2,10 @@
 # Bybit Spot bot (v3.1):
 # - Вход "2 из 3" (EMA/RSI/MACD), смягчённые пороги
 # - Net PnL >= $1 после обеих комиссий (taker 0.0018)
-# - Плавающий бюджет 150–230 USDT
+# - Плавающий бюджет 150–230 USDT, с ЖЁСТКИМ минимумом $150 на ЛЮБОЙ ордер
+# - Safety-buffer $2, чтобы не ловить 170131 (Insufficient balance) на грани
 # - Redis + файл состояния, дневной отчёт
-# - Подробные логи в файл, в Telegram только события
+# - Подробные логи в файл; в Telegram только события (старт/восстановление/BUY/SELL/ошибки/дневной)
 # - Анти rate-limit: кэш /wallet-balance + backoff + антиспам ошибок
 
 import os, time, math, logging, datetime, json, random, traceback
@@ -34,23 +35,31 @@ REDIS_KEY = os.getenv("REDIS_KEY", "bybit_spot_bot_state_v3_1")
 
 SYMBOLS = ["TONUSDT", "DOGEUSDT", "XRPUSDT"]
 
+# Fees (market => taker)
 TAKER_FEE_SPOT = 0.0018
 MAKER_FEE_SPOT = 0.0010  # not used
 
+# Money management
 RESERVE_BALANCE = 1.0
 MIN_TRADE_USDT = 150.0
 MAX_TRADE_USDT = 230.0
 FLOAT_BUDGET_MODE = "signal"   # "signal" | "random" | "fixed_max" | "fixed_min"
+ENFORCE_MIN_PER_ORDER = True   # строго не входить, если бюджет < MIN_TRADE_USDT
+SAFETY_BUFFER_USDT = 2.0       # чтобы не упереться в ноль и не словить 170131
+MAX_ORDERS_PER_CYCLE = 0       # 0 = без лимита; >0 = ограничить кол-во новых ордеров за цикл
 
+# Risk / logic
 TRAIL_MULTIPLIER = 1.5
 MAX_DRAWDOWN = 0.15
 MAX_AVERAGES = 3
 STOP_LOSS_PCT = 0.03
 LAST_SELL_REENTRY_PCT = 0.003  # 0.3%
 
+# Profit (NET)
 MIN_PROFIT_PCT  = 0.005
 MIN_NET_ABS_USD = 1.0
 
+# Ops
 INTERVAL = "1"
 LOOP_SLEEP = 60
 STATE_FILE = "state.json"
@@ -203,7 +212,7 @@ def _safe_call(func, *args, **kwargs):
 _wallet_cache = {"ts": 0.0, "coins": None}
 
 def get_wallet_cached(force=False):
-    """Кэшируем /wallet-balance, чтобы не бить лимит. Обновляем раз в WALLET_CACHE_TTL сек."""
+    """Кэшируем /wallet-balance. Обновляем раз в WALLET_CACHE_TTL сек."""
     if not force and _wallet_cache["coins"] is not None and time.time() - _wallet_cache["ts"] < WALLET_CACHE_TTL:
         return _wallet_cache["coins"]
     r = _safe_call(session.get_wallet_balance, accountType="UNIFIED")
@@ -385,6 +394,8 @@ def send_daily_report():
 
 def trade_cycle():
     global LAST_REPORT_DATE, cycle_count, _last_error_ts
+    orders_this_cycle = 0
+
     try:
         coins = get_wallet_cached(force=True)   # 1 вызов на цикл
         usdt = get_balance_usdt_from(coins)
@@ -400,6 +411,11 @@ def trade_cycle():
     log(f"💰 Баланс USDT={usdt:.2f} | Доступно={avail:.2f}")
 
     for sym in SYMBOLS:
+        # ограничение на кол-во новых ордеров (по желанию)
+        if MAX_ORDERS_PER_CYCLE > 0 and orders_this_cycle >= MAX_ORDERS_PER_CYCLE:
+            log("⏸ Лимит ордеров на цикл достигнут — пропускаем оставшиеся символы")
+            break
+
         try:
             df = get_kline(sym)
             if df.empty:
@@ -416,6 +432,7 @@ def trade_cycle():
             log(f"[{sym}] 🔎 Сигнал={sig.upper()} (conf={confidence:.2f}), price={price:.6f}, "
                 f"balance={coin_bal:.8f} (~{value:.2f} USDT) | {info_ind}")
 
+            # обновление макс. просадки
             if state["positions"]:
                 avg_entry = sum(p["buy_price"] * p["qty"] for p in state["positions"]) / \
                             sum(p["qty"] for p in state["positions"])
@@ -423,6 +440,7 @@ def trade_cycle():
                 if curr_dd > state["max_drawdown"]:
                     state["max_drawdown"] = curr_dd
 
+            # ----- управление открытыми -----
             new_positions = []
             for pos in state["positions"]:
                 b = pos["buy_price"]
@@ -435,6 +453,7 @@ def trade_cycle():
                 pnl_net = proceeds_usdt - cost_usdt
                 min_net_req = max(MIN_NET_ABS_USD, price * q_net * MIN_PROFIT_PCT)
 
+                # STOP-LOSS
                 if price <= b * (1 - STOP_LOSS_PCT):
                     _safe_call(session.place_order, category="spot", symbol=sym, side="Sell",
                                orderType="Market", qty=str(q_net))
@@ -446,6 +465,7 @@ def trade_cycle():
                     state["avg_count"] = 0
                     continue
 
+                # TAKE-PROFIT
                 if price >= tp and pnl_net >= min_net_req:
                     _safe_call(session.place_order, category="spot", symbol=sym, side="Sell",
                                orderType="Market", qty=str(q_net))
@@ -476,59 +496,77 @@ def trade_cycle():
                     avg_price = sum(p["qty"] * p["buy_price"] for p in state["positions"]) / total_q
                     drawdown = (price - avg_price) / avg_price
                     if drawdown < 0 and abs(drawdown) <= MAX_DRAWDOWN:
+                        # бюджет (с проверками минимума и фактического доступного)
                         budget = choose_trade_budget(confidence, avail)
-                        qty_gross = qty_from_budget(sym, price, budget)
-                        if qty_gross > 0 and qty_gross * price <= (usdt - RESERVE_BALANCE + 1e-9):
-                            _safe_call(session.place_order, category="spot", symbol=sym, side="Buy",
-                                       orderType="Market", qty=str(qty_gross))
-                            qty_net = qty_gross * (1 - TAKER_FEE_SPOT)
-                            tp = price + TRAIL_MULTIPLIER * atr
-                            STATE[sym]["positions"].append({
-                                "buy_price": price, "qty": qty_net,
-                                "buy_qty_gross": qty_gross, "tp": tp
-                            })
-                            state["count"] += 1
-                            state["avg_count"] += 1
-                            log_trade(sym, "BUY (avg)", price, qty_net, 0.0,
-                                      reason=(f"drawdown={drawdown:.4f}, conf={confidence:.2f}, "
-                                              f"budget={budget:.2f}, qty_gross={qty_gross:.8f}, qty_net={qty_net:.8f}"))
-                            tg_event(f"🟢 {sym} BUY(avg) @ {price:.6f}, qty={qty_net:.8f}")
-                            # обновим кэш кошелька после сделки
-                            coins = get_wallet_cached(force=True)
-                            usdt = get_balance_usdt_from(coins)
-                            avail = max(0.0, usdt - RESERVE_BALANCE)
+                        if ENFORCE_MIN_PER_ORDER and budget < MIN_TRADE_USDT:
+                            log(f"[{sym}] ❌ Не усредняем: бюджет {budget:.2f} < {MIN_TRADE_USDT}")
                         else:
-                            log(f"[{sym}] ❌ Не усредняем: фильтры/средства (budget={budget:.2f})")
+                            coins = get_wallet_cached()
+                            usdt_now  = get_balance_usdt_from(coins)
+                            real_avail = max(0.0, usdt_now - RESERVE_BALANCE - SAFETY_BUFFER_USDT)
+                            use_usdt = min(budget, real_avail, MAX_TRADE_USDT)
+                            if use_usdt < MIN_TRADE_USDT:
+                                log(f"[{sym}] ❌ Не усредняем: доступно {real_avail:.2f} < {MIN_TRADE_USDT} (с запасом)")
+                            else:
+                                qty_gross = qty_from_budget(sym, price, use_usdt)
+                                if qty_gross > 0:
+                                    _safe_call(session.place_order, category="spot", symbol=sym, side="Buy",
+                                               orderType="Market", qty=str(qty_gross))
+                                    qty_net = qty_gross * (1 - TAKER_FEE_SPOT)
+                                    tp = price + TRAIL_MULTIPLIER * atr
+                                    STATE[sym]["positions"].append({
+                                        "buy_price": price, "qty": qty_net,
+                                        "buy_qty_gross": qty_gross, "tp": tp
+                                    })
+                                    state["count"] += 1
+                                    state["avg_count"] += 1
+                                    orders_this_cycle += 1
+                                    log_trade(sym, "BUY (avg)", price, qty_net, 0.0,
+                                              reason=(f"drawdown={drawdown:.4f}, conf={confidence:.2f}, "
+                                                      f"use_usdt={use_usdt:.2f}, qty_gross={qty_gross:.8f}, qty_net={qty_net:.8f}"))
+                                    tg_event(f"🟢 {sym} BUY(avg) @ {price:.6f}, qty={qty_net:.8f}")
+                                    # обновим кэш после сделки
+                                    get_wallet_cached(force=True)
+                                else:
+                                    log(f"[{sym}] ❌ Не усредняем: не прошли бирж. фильтры (min_amt/min_qty)")
                     else:
                         log(f"[{sym}] 🔸Не усредняем: drawdown {drawdown:.4f} вне (-{MAX_DRAWDOWN})")
+
                 # fresh entry
                 elif not state["positions"]:
                     if state["last_sell_price"] and abs(price - state["last_sell_price"]) / price < LAST_SELL_REENTRY_PCT:
                         log(f"[{sym}] 🔸Не покупаем: близко к последней продаже ({state['last_sell_price']:.6f})")
                     else:
                         budget = choose_trade_budget(confidence, avail)
-                        qty_gross = qty_from_budget(sym, price, budget)
-                        if budget >= MIN_TRADE_USDT and qty_gross > 0 and \
-                           qty_gross * price <= (usdt - RESERVE_BALANCE + 1e-9):
-                            _safe_call(session.place_order, category="spot", symbol=sym, side="Buy",
-                                       orderType="Market", qty=str(qty_gross))
-                            qty_net = qty_gross * (1 - TAKER_FEE_SPOT)
-                            tp = price + TRAIL_MULTIPLIER * atr
-                            STATE[sym]["positions"].append({
-                                "buy_price": price, "qty": qty_net,
-                                "buy_qty_gross": qty_gross, "tp": tp
-                            })
-                            state["count"] += 1
-                            log_trade(sym, "BUY", price, qty_net, 0.0,
-                                      reason=(f"conf={confidence:.2f}, budget={budget:.2f}, "
-                                              f"qty_gross={qty_gross:.8f}, qty_net={qty_net:.8f}, {info_ind}"))
-                            tg_event(f"🟢 {sym} BUY @ {price:.6f}, qty={qty_net:.8f}")
-                            coins = get_wallet_cached(force=True)
-                            usdt = get_balance_usdt_from(coins)
-                            avail = max(0.0, usdt - RESERVE_BALANCE)
+                        if ENFORCE_MIN_PER_ORDER and budget < MIN_TRADE_USDT:
+                            log(f"[{sym}] ❌ Не покупаем: бюджет {budget:.2f} < {MIN_TRADE_USDT}")
                         else:
-                            log(f"[{sym}] ❌ Не покупаем: бюджет/фильтры/средства "
-                                f"(avail≈{avail:.2f}, budget={budget:.2f}, qty_gross={qty_gross:.8f})")
+                            coins = get_wallet_cached()
+                            usdt_now  = get_balance_usdt_from(coins)
+                            real_avail = max(0.0, usdt_now - RESERVE_BALANCE - SAFETY_BUFFER_USDT)
+                            use_usdt = min(budget, real_avail, MAX_TRADE_USDT)
+                            if use_usdt < MIN_TRADE_USDT:
+                                log(f"[{sym}] ❌ Не покупаем: доступно {real_avail:.2f} < {MIN_TRADE_USDT} (с запасом)")
+                            else:
+                                qty_gross = qty_from_budget(sym, price, use_usdt)
+                                if qty_gross > 0:
+                                    _safe_call(session.place_order, category="spot", symbol=sym, side="Buy",
+                                               orderType="Market", qty=str(qty_gross))
+                                    qty_net = qty_gross * (1 - TAKER_FEE_SPOT)
+                                    tp = price + TRAIL_MULTIPLIER * atr
+                                    STATE[sym]["positions"].append({
+                                        "buy_price": price, "qty": qty_net,
+                                        "buy_qty_gross": qty_gross, "tp": tp
+                                    })
+                                    state["count"] += 1
+                                    orders_this_cycle += 1
+                                    log_trade(sym, "BUY", price, qty_net, 0.0,
+                                              reason=(f"conf={confidence:.2f}, use_usdt={use_usdt:.2f}, "
+                                                      f"qty_gross={qty_gross:.8f}, qty_net={qty_net:.8f}, {info_ind}"))
+                                    tg_event(f"🟢 {sym} BUY @ {price:.6f}, qty={qty_net:.8f}")
+                                    get_wallet_cached(force=True)
+                                else:
+                                    log(f"[{sym}] ❌ Не покупаем: не прошли бирж. фильтры (min_amt/min_qty)")
             else:
                 if not state["positions"]:
                     log(f"[{sym}] 🔸Нет покупки: сигнал {sig}, confidence={confidence:.2f}")
