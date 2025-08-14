@@ -1,511 +1,580 @@
 # -*- coding: utf-8 -*-
-"""
-trade_v3_2.py  — монолитная версия
-Bybit Spot (v5, UNIFIED). Подпись, time-sync, anti-spam TG, cooldown,
-afford-qty, защита SELL/TP, trailing TP, компактные логи, файл состояния.
+# Bybit Spot bot (v3.1):
+# - Вход "2 из 3" (EMA/RSI/MACD), смягчённые пороги
+# - Net PnL >= $1 после обеих комиссий (taker 0.0018)
+# - Плавающий бюджет 150–230 USDT
+# - Redis + файл состояния, дневной отчёт
+# - Подробные логи в файл, в Telegram только события
+# - Анти rate-limit: кэш /wallet-balance + backoff + антиспам ошибок
 
-Python 3.10+
-pip install requests
-
-© you
-"""
-import os
-import hmac
-import json
-import time
-import math
-import hashlib
-import random
-import threading
-from datetime import datetime, timezone
-from typing import Dict, Any, Optional, Tuple, List
-
+import os, time, math, logging, datetime, json, random, traceback
+import pandas as pd
 import requests
+from dotenv import load_dotenv
+from pybit.unified_trading import HTTP
+from ta.trend import EMAIndicator, MACD
+from ta.momentum import RSIIndicator
+from ta.volatility import AverageTrueRange
 
-# =========================
-# CONFIG — заполняйте здесь
-# =========================
-BYBIT_API_KEY    = "YOUR_BYBIT_API_KEY"
-BYBIT_API_SECRET = "YOUR_BYBIT_API_SECRET"
-BYBIT_BASE       = "https://api.bybit.com"
+try:
+    import redis
+except Exception:
+    redis = None
 
-# Торгуемые символы (spot)
-SYMBOLS = ["XRPUSDT", "DOGEUSDT", "TONUSDT"]
+# ==================== CONFIG ====================
 
-ACCOUNT_TYPE = "UNIFIED"   # важно для приватных методов v5 (баланс и т.п.)
-RECV_WINDOW  = 5000        # ms
+load_dotenv()
+API_KEY = os.getenv("BYBIT_API_KEY")
+API_SECRET = os.getenv("BYBIT_API_SECRET")
+TG_TOKEN = os.getenv("TG_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
 
-# Бюджет на сделку в USDT
-BUDGET_MIN   = 150.0
-BUDGET_MAX   = 230.0
+REDIS_URL = os.getenv("REDIS_URL", "")
+REDIS_KEY = os.getenv("REDIS_KEY", "bybit_spot_bot_state_v3_1")
 
-# Комиссия тейкера (в долях), для грубой оценки
-TAKER_FEE = 0.0018
+SYMBOLS = ["TONUSDT", "DOGEUSDT", "XRPUSDT"]
 
-# Индикативные параметры TP/SL/trailing
-BASE_TP_PCT    = 0.0060    # 0.60% базовая цель
-TRAIL_X        = 1.5       # усиливаем трейл от локального максимума
-STOP_LOSS_PCT  = 0.030     # 3% от средней входа (жёсткая защита)
+TAKER_FEE_SPOT = 0.0018
+MAKER_FEE_SPOT = 0.0010  # not used
 
-# Кулдаун между ордерами по одному символу (сек)
-COOLDOWN_SEC   = 20
+RESERVE_BALANCE = 1.0
+MIN_TRADE_USDT = 150.0
+MAX_TRADE_USDT = 230.0
+FLOAT_BUDGET_MODE = "signal"   # "signal" | "random" | "fixed_max" | "fixed_min"
 
-# Сколько исторических свечей тянуть (для EMA/RSI, если нужно)
-KLINE_LIMIT    = 120
-KLINE_INTERVAL = "1"        # 1m
+TRAIL_MULTIPLIER = 1.5
+MAX_DRAWDOWN = 0.15
+MAX_AVERAGES = 3
+STOP_LOSS_PCT = 0.03
+LAST_SELL_REENTRY_PCT = 0.003  # 0.3%
 
-# Telegram
-TG_TOKEN       = "YOUR_TELEGRAM_BOT_TOKEN"
-TG_CHAT_ID     = "YOUR_TELEGRAM_CHAT_ID"
+MIN_PROFIT_PCT  = 0.005
+MIN_NET_ABS_USD = 1.0
 
-# Файлы
-STATE_FILE     = "trade_state.json"
-LIMITS_FILE    = "symbol_limits.json"
+INTERVAL = "1"
+LOOP_SLEEP = 60
+STATE_FILE = "state.json"
 
-# Лимиты по умолчанию (если не успели подтянуть с биржи)
-DEFAULT_LIMITS = {
-    "XRPUSDT":  {"min_qty": 0.44, "qty_step": 0.01, "min_amt": 5.0},
-    "DOGEUSDT": {"min_qty": 3.0,  "qty_step": 1.0,  "min_amt": 5.0},
-    "TONUSDT":  {"min_qty": 0.38, "qty_step": 0.01, "min_amt": 5.0},
-}
+# Daily report (server local time)
+DAILY_REPORT_HOUR = 22
+DAILY_REPORT_MINUTE = 30
 
-# =========================
-# Глобалы (смещение времени, кэш лимитов и т.п.)
-# =========================
-TIME_OFFSET_MS = 0      # serverTime - localTime
-session = requests.Session()
-session.headers.update({"Content-Type": "application/json"})
+# Rate-limit helpers
+WALLET_CACHE_TTL = 5.0             # сек — кэш /wallet-balance
+REQUEST_BACKOFF_BASE = 3.0         # стартовая пауза при 403/10006
+REQUEST_BACKOFF_MAX  = 45.0        # максимум паузы
+ERROR_TG_COOLDOWN = 120.0          # антиспам ошибок в ТГ (сек)
 
-_error_cache: Dict[str, float] = {}   # анти-спам ошибок
-_last_trade_at: Dict[str, float] = {} # cooldown
-_symbol_limits: Dict[str, Dict[str, float]] = {}  # min_qty/qty_step/min_amt
-_state_lock = threading.Lock()
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(message)s",
+    handlers=[logging.FileHandler("bot.log", encoding="utf-8"), logging.StreamHandler()]
+)
 
-
-# ==============
-# Утилиты/сервис
-# ==============
-def now_ms() -> int:
-    return int(time.time() * 1000)
-
-def ts_with_offset() -> int:
-    # Всегда используем serverTime + offset
-    return now_ms() + TIME_OFFSET_MS
-
-def jdump(obj: Any) -> str:
-    return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
-
-def log(msg: str) -> None:
-    print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | {msg}", flush=True)
-
-def tg_send(text: str) -> None:
-    if not TG_TOKEN or not TG_CHAT_ID:
+def send_tg(msg: str):
+    if not TG_TOKEN or not CHAT_ID:
         return
     try:
-        url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-        payload = {"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
-        session.post(url, json=payload, timeout=7)
+        requests.post(
+            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+            data={"chat_id": CHAT_ID, "text": msg}
+        )
     except Exception:
-        pass
+        logging.error("Telegram send failed")
 
-def anti_spam(key: str, window_sec: int = 60) -> bool:
-    """Возвращает True, если уже недавно слали такое — тогда подавим."""
-    now = time.time()
-    last = _error_cache.get(key, 0)
-    if now - last < window_sec:
-        return True
-    _error_cache[key] = now
-    return False
+def log(msg: str):
+    logging.info(msg)
 
-# ============
-# Подпись v5
-# ============
-def sign_v5(params: Dict[str, Any]) -> str:
-    """Bybit v5: сортируем по ключу (ascii), склеиваем key=value&..., HMAC SHA256(secret)."""
-    items = []
-    for k in sorted(params.keys()):
-        v = params[k]
-        if v is None:
-            continue
-        items.append(f"{k}={v}")
-    qs = "&".join(items)
-    return hmac.new(BYBIT_API_SECRET.encode(), qs.encode(), hashlib.sha256).hexdigest()
+def tg_event(msg: str):
+    send_tg(msg)
 
-def bybit_private_get(path: str, params: Dict[str, Any]) -> Dict[str, Any]:
-    p = dict(params)
-    p["apiKey"]     = BYBIT_API_KEY
-    p["timestamp"]  = ts_with_offset()
-    p["recvWindow"] = RECV_WINDOW
-    sig = sign_v5(p)
-    p["sign"] = sig
-    url = BYBIT_BASE + path
-    r = session.get(url, params=p, timeout=10)
-    return r.json()
+session = HTTP(api_key=API_KEY, api_secret=API_SECRET, recv_window=15000)
 
-def bybit_private_post(path: str, params: Dict[str, Any]) -> Dict[str, Any]:
-    p = dict(params)
-    p["apiKey"]     = BYBIT_API_KEY
-    p["timestamp"]  = ts_with_offset()
-    p["recvWindow"] = RECV_WINDOW
-    sig = sign_v5(p)
-    p["sign"] = sig
-    url = BYBIT_BASE + path
-    r = session.post(url, json=p, timeout=10)
-    return r.json()
+STATE = {}
+LIMITS = {}
+LAST_REPORT_DATE = None
+cycle_count = 0
 
-def bybit_public_get(path: str, params: Dict[str, Any]) -> Dict[str, Any]:
-    url = BYBIT_BASE + path
-    r = session.get(url, params=params, timeout=10)
-    return r.json()
+_last_error_ts = 0.0  # для антиспама
 
-# ======================
-# Time sync (serverTime)
-# ======================
-def sync_time() -> None:
-    global TIME_OFFSET_MS
+def _default_symbol_state():
+    return {
+        "positions": [],     # {buy_price, qty (net), buy_qty_gross, tp}
+        "pnl": 0.0,
+        "count": 0,
+        "avg_count": 0,
+        "last_sell_price": 0.0,
+        "max_drawdown": 0.0
+    }
+
+def state_to_json():
+    return json.dumps(STATE, ensure_ascii=False)
+
+def save_state_file():
     try:
-        data = bybit_public_get("/v5/market/time", {})
-        st = int(data.get("time", int(time.time()*1000)))
-        local = now_ms()
-        TIME_OFFSET_MS = st - local
-        log(f"⏱  Time sync: server={st}, local={local}, offset={TIME_OFFSET_MS} ms")
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            f.write(state_to_json())
     except Exception as e:
-        log(f"⚠️  time sync failed: {e}")
+        logging.error(f"save_state_file error: {e}")
 
-# ==========================
-# Символьные лимиты (filters)
-# ==========================
-def load_limits_cache() -> None:
-    global _symbol_limits
-    _symbol_limits = DEFAULT_LIMITS.copy()
-    if os.path.exists(LIMITS_FILE):
-        try:
-            with open(LIMITS_FILE, "r", encoding="utf-8") as f:
-                cached = json.load(f)
-                _symbol_limits.update(cached)
-        except Exception:
-            pass
-
-def save_limits_cache() -> None:
-    try:
-        with open(LIMITS_FILE, "w", encoding="utf-8") as f:
-            json.dump(_symbol_limits, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
-
-def fetch_symbol_limit(symbol: str) -> None:
-    """Тянем market/instruments-info и забираем minOrderQty / minOrderAmt / qtyStep."""
-    try:
-        data = bybit_public_get("/v5/market/instruments-info",
-                                {"category": "spot", "symbol": symbol})
-        rows = (data.get("result") or {}).get("list") or []
-        if not rows:
-            return
-        info = rows[0]
-        lot = info.get("lotSizeFilter", {})
-        min_qty  = float(lot.get("minOrderQty", _symbol_limits.get(symbol, DEFAULT_LIMITS.get(symbol, {})).get("min_qty", 0.0)))
-        qty_step = float(lot.get("qtyStep",     _symbol_limits.get(symbol, DEFAULT_LIMITS.get(symbol, {})).get("qty_step", 1.0)))
-        min_amt  = float((info.get("priceFilter") or {}).get("minOrderAmt",
-                        _symbol_limits.get(symbol, DEFAULT_LIMITS.get(symbol, {})).get("min_amt", 5.0)))
-        _symbol_limits[symbol] = {"min_qty": min_qty, "qty_step": qty_step, "min_amt": min_amt}
-        save_limits_cache()
-        log(f"ℹ️  {symbol} limits: { _symbol_limits[symbol] }")
-    except Exception as e:
-        log(f"⚠️  fetch limits failed for {symbol}: {e}")
-
-# ===========
-# Балансы/клиния
-# ===========
-def get_usdt_balance() -> float:
-    try:
-        data = bybit_private_get("/v5/account/wallet-balance",
-                                 {"accountType": ACCOUNT_TYPE, "coin": "USDT"})
-        if data.get("retCode") == 0:
-            result = data.get("result") or {}
-            l = (result.get("list") or [])
-            if l:
-                # В UNIFIED у coin: [{'coin':'USDT', 'walletBalance': '...', ...}]
-                coins = l[0].get("coin", [])
-                for c in coins:
-                    if c.get("coin") == "USDT":
-                        return float(c.get("availableToWithdraw") or c.get("walletBalance") or 0.0)
-        else:
-            _maybe_report_wallet_error(data)
-    except Exception as e:
-        _maybe_report_wallet_error({"retMsg": str(e)})
-    return 0.0
-
-def get_price(symbol: str) -> Optional[float]:
-    try:
-        data = bybit_public_get("/v5/market/tickers", {"category": "spot", "symbol": symbol})
-        if data.get("retCode") == 0:
-            rows = (data.get("result") or {}).get("list") or []
-            if rows:
-                return float(rows[0]["lastPrice"])
-    except Exception:
-        pass
-    return None
-
-# ==========================================
-# Индикативные сигналы (очень лёгкая логика)
-# ==========================================
-def ema(series: List[float], span: int) -> float:
-    k = 2 / (span + 1.0)
-    e = series[0]
-    for v in series[1:]:
-        e = v * k + e * (1 - k)
-    return e
-
-def fetch_signal(symbol: str) -> Tuple[str, float, Dict[str, float]]:
-    """
-    Возвращает ('BUY'|'SELL'|'HOLD', confidence, metrics)
-    """
-    try:
-        data = bybit_public_get("/v5/market/kline",
-                                {"category": "spot", "symbol": symbol, "interval": KLINE_INTERVAL, "limit": KLINE_LIMIT})
-        if data.get("retCode") != 0:
-            return "HOLD", 0.0, {}
-        rows = (data.get("result") or {}).get("list") or []
-        closes = [float(r[4]) for r in rows][-60:]  # close
-        if len(closes) < 20:
-            return "HOLD", 0.0, {}
-        ema9  = ema(closes[-30:], 9)
-        ema21 = ema(closes[-60:], 21)
-        price = closes[-1]
-        # простенький сигнальчик:
-        if price > ema9 > ema21:
-            return "BUY", 0.6, {"price": price, "EMA9": ema9, "EMA21": ema21}
-        elif price < ema9 < ema21:
-            return "SELL", 0.6, {"price": price, "EMA9": ema9, "EMA21": ema21}
-        else:
-            return "HOLD", 0.0, {"price": price, "EMA9": ema9, "EMA21": ema21}
-    except Exception:
-        return "HOLD", 0.0, {}
-
-# ===============
-# Файл состояния
-# ===============
-def _load_state() -> Dict[str, Any]:
-    if not os.path.exists(STATE_FILE):
-        return {"pos": {}, "cooldown": {}, "last_error": {}}
+def load_state_file():
+    global STATE
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+            STATE = json.load(f)
+        return True
     except Exception:
-        return {"pos": {}, "cooldown": {}, "last_error": {}}
+        return False
 
-def _save_state(st: Dict[str, Any]) -> None:
-    with _state_lock:
-        with open(STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(st, f, ensure_ascii=False, indent=2)
+def redis_client():
+    if not REDIS_URL or redis is None:
+        return None
+    try:
+        return redis.Redis.from_url(REDIS_URL, decode_responses=True, socket_timeout=5)
+    except Exception as e:
+        logging.error(f"Redis connect error: {e}")
+        return None
 
-def get_state() -> Dict[str, Any]:
-    with _state_lock:
-        return _load_state()
+def save_state():
+    rc = redis_client()
+    if rc:
+        try:
+            rc.set(REDIS_KEY, state_to_json())
+        except Exception as e:
+            logging.error(f"Redis save error: {e}")
+    save_state_file()
 
-def update_pos(symbol: str, qty: float, avg: float, tp: Optional[float]) -> None:
-    st = get_state()
-    st.setdefault("pos", {})
-    st["pos"][symbol] = {"qty": qty, "avg": avg, "tp": tp}
-    _save_state(st)
+def init_state():
+    global STATE
+    restored_from = "FRESH"
+    rc = redis_client()
+    if rc:
+        try:
+            raw = rc.get(REDIS_KEY)
+            if raw:
+                STATE = json.loads(raw)
+                restored_from = "REDIS"
+        except Exception as e:
+            logging.error(f"Redis load error: {e}")
+    if not STATE:
+        if load_state_file():
+            restored_from = "FILE"
+        else:
+            STATE = {}
 
-def get_pos(symbol: str) -> Dict[str, float]:
-    st = get_state().get("pos", {})
-    return st.get(symbol, {"qty": 0.0, "avg": 0.0, "tp": None})
+    for sym in SYMBOLS:
+        STATE.setdefault(sym, _default_symbol_state())
 
-def set_cooldown(symbol: str) -> None:
-    st = get_state()
-    st.setdefault("cooldown", {})
-    st["cooldown"][symbol] = time.time()
-    _save_state(st)
+    log(f"🚀 Старт бота. Восстановление состояния: {restored_from}")
+    tg_event(f"🚀 Старт бота. Восстановление состояния: {restored_from}")
 
-def cooldown_active(symbol: str) -> bool:
-    st = get_state().get("cooldown", {})
-    t = st.get(symbol, 0.0)
-    return (time.time() - t) < COOLDOWN_SEC
+    if restored_from != "FRESH":
+        lines = []
+        for sym in SYMBOLS:
+            s = STATE[sym]
+            cur_q = sum(p.get("qty", 0.0) for p in s["positions"])
+            lines.append(f"{sym}: позиций={len(s['positions'])}, qty={cur_q:.6f}, pnl_acc={s['pnl']:.2f}")
+        tg_event("♻️ Восстановление позиций:\n" + "\n".join(lines))
 
-# =====================
-# Ордеры и afford-qty
-# =====================
-def _round_step(value: float, step: float) -> float:
-    if step <= 0:
-        return value
-    return math.floor(value / step) * step
+    save_state()
 
-def _afford_qty(symbol: str, price: float, want_usdt: float) -> float:
-    lim = _symbol_limits.get(symbol, DEFAULT_LIMITS.get(symbol, {}))
-    min_qty  = float(lim.get("min_qty", 0.0))
-    qty_step = float(lim.get("qty_step", 1.0))
-    min_amt  = float(lim.get("min_amt", 5.0))
-    # учитываем комиссию
-    gross_qty = (want_usdt * (1.0 - TAKER_FEE)) / max(price, 1e-9)
-    qty = max(min_qty, _round_step(gross_qty, qty_step))
-    # minAmt — сумма в USDT
-    if qty * price < min_amt:
-        qty = _round_step((min_amt / price), qty_step)
-    return max(0.0, qty)
+# ---------- Bybit helpers (backoff + wallet cache) ----------
 
-def place_order(symbol: str, side: str, qty: float) -> Dict[str, Any]:
-    params = {
-        "category": "spot",
-        "symbol": symbol,
-        "side": "Buy" if side.upper() == "BUY" else "Sell",
-        "orderType": "Market",
-        "qty": f"{qty:.8f}",
-    }
-    data = bybit_private_post("/v5/order/create", params)
-    if data.get("retCode") != 0:
-        _maybe_report_wallet_error(data)
-    return data
-
-def _maybe_report_wallet_error(data: Dict[str, Any]) -> None:
-    # Анти-спам: одинаковые retCode/retMsg минуту не спамим
-    key = f"{data.get('retCode')}|{data.get('retMsg')}"
-    if anti_spam(key, 60):
-        return
-    txt = f"Ошибка цикла: {data.get('retMsg')} (retCode={data.get('retCode')})"
-    log(f"loop error: {jdump(data)}")
-    tg_send(txt)
-
-# ====================
-# Защита SELL и TP/SL
-# ====================
-def calc_tp_from(avg: float) -> float:
-    return avg * (1.0 + BASE_TP_PCT)
-
-def need_sell(symbol: str, price: float) -> Tuple[bool, Optional[str]]:
-    """Продаём если:
-       - достигли/превысили TP (включая трейлинг)
-       - сработал SL (жёсткая защита)
-       - НО не продаём «ниже нуля» если TP не достигнут.
-    """
-    p = get_pos(symbol)
-    qty = float(p.get("qty", 0.0))
-    if qty <= 0:
-        return False, None
-
-    avg = float(p.get("avg", 0.0))
-    # SL
-    if price <= avg * (1.0 - STOP_LOSS_PCT):
-        return True, "SL"
-
-    # trailing TP
-    curr_tp = p.get("tp")
-    base_tp = calc_tp_from(avg)
-    if curr_tp is None:
-        curr_tp = base_tp
-
-    # если цена росла — сдвигаем (усиливаем) TP
-    if price > curr_tp:
-        # от последнего high трейлим
-        new_tp = price / (1.0 + (BASE_TP_PCT / TRAIL_X))
-        if new_tp > curr_tp:
-            curr_tp = new_tp
-            update_pos(symbol, qty, avg, curr_tp)
-
-    # если достигли tp — продаём
-    if price >= curr_tp:
-        return True, "TP"
-
-    # защита от продажи в минус
-    if price < avg:
-        return False, None
-
-    return False, None
-
-# ==========
-# Основной цикл
-# ==========
-def trading_loop():
-    load_limits_cache()
-    for s in SYMBOLS:
-        fetch_symbol_limit(s)
-
-    sync_time()
-
-    log("🚀 Бот запускается...")
-    tg_send("🚀 Старт бота. Состояние: FRESH")
-
+def _safe_call(func, *args, **kwargs):
+    """Обёртка с бэкоффом для частых эндпойнтов."""
+    delay = REQUEST_BACKOFF_BASE
     while True:
         try:
-            # периодически обновлять смещение времени
-            if random.random() < 0.02:
-                sync_time()
+            return func(*args, **kwargs)
+        except Exception as e:
+            msg = str(e)
+            is_rate = ("403" in msg or "rate limit" in msg.lower() or "10006" in msg)
+            if not is_rate:
+                raise
+            global _last_error_ts
+            now = time.time()
+            if now - _last_error_ts > ERROR_TG_COOLDOWN:
+                tg_event(f"⚠️ Rate limit/403. Бэкофф {delay:.0f}s. Детали: {msg}")
+                _last_error_ts = now
+            log(f"Rate limit/403 -> sleep {delay:.0f}s; err: {msg}")
+            time.sleep(delay)
+            delay = min(REQUEST_BACKOFF_MAX, delay * 1.7)
 
-            usdt = get_usdt_balance()
-            log(f"💰 Баланс USDT={usdt:.2f}")
+_wallet_cache = {"ts": 0.0, "coins": None}
 
-            for symbol in SYMBOLS:
-                # Прайс
-                price = get_price(symbol)
-                if price is None:
+def get_wallet_cached(force=False):
+    """Кэшируем /wallet-balance, чтобы не бить лимит. Обновляем раз в WALLET_CACHE_TTL сек."""
+    if not force and _wallet_cache["coins"] is not None and time.time() - _wallet_cache["ts"] < WALLET_CACHE_TTL:
+        return _wallet_cache["coins"]
+    r = _safe_call(session.get_wallet_balance, accountType="UNIFIED")
+    coins = r["result"]["list"][0]["coin"]
+    _wallet_cache["coins"] = coins
+    _wallet_cache["ts"] = time.time()
+    return coins
+
+def get_balance_usdt_from(coins):
+    return float(next(c["walletBalance"] for c in coins if c["coin"]=="USDT"))
+
+def get_coin_balance_from(coins, sym):
+    coin = sym.replace("USDT","")
+    return float(next((c["walletBalance"] for c in coins if c["coin"]==coin), 0.0))
+
+# ==================== BYBIT MARKET DATA ====================
+
+def load_symbol_limits():
+    data = session.get_instruments_info(category="spot")["result"]["list"]
+    for item in data:
+        if item["symbol"] in SYMBOLS:
+            f = item.get("lotSizeFilter", {})
+            LIMITS[item["symbol"]] = {
+                "min_qty": float(f.get("minOrderQty", 0.0)),
+                "qty_step": float(f.get("qtyStep", 1.0)),
+                "min_amt": float(item.get("minOrderAmt", 10.0))
+            }
+
+def adjust_qty(qty, step):
+    try:
+        exponent = int(f"{float(step):e}".split("e")[-1])
+        return math.floor(qty * 10**abs(exponent)) / 10**abs(exponent)
+    except Exception:
+        return qty
+
+def get_kline(sym):
+    r = _safe_call(session.get_kline, category="spot", symbol=sym, interval=INTERVAL, limit=100)
+    df = pd.DataFrame(r["result"]["list"], columns=["ts","o","h","l","c","vol","turn"])
+    df[["o","h","l","c","vol"]] = df[["o","h","l","c","vol"]].astype(float)
+    return df
+
+# ==================== SIGNALS (2 of 3) ====================
+
+def _last_cross(series_fast, series_slow, lookback=3):
+    cross = 0
+    for i in range(1, min(lookback+1, len(series_fast))):
+        if series_fast.iloc[-i-1] <= series_slow.iloc[-i-1] and series_fast.iloc[-i] > series_slow.iloc[-i]:
+            cross = 1; break
+        if series_fast.iloc[-i-1] >= series_slow.iloc[-i-1] and series_fast.iloc[-i] < series_slow.iloc[-i]:
+            cross = -1; break
+    return cross
+
+def calc_signal(df):
+    if df.empty or len(df) < 50:
+        return "none", 0.0, "insufficient data", 0.0
+
+    df["ema9"] = EMAIndicator(df["c"], 9).ema_indicator()
+    df["ema21"] = EMAIndicator(df["c"], 21).ema_indicator()
+    df["rsi"] = RSIIndicator(df["c"], 9).rsi()
+    df["atr"] = AverageTrueRange(df["h"], df["l"], df["c"], 14).average_true_range()
+    macd_obj = MACD(close=df["c"])
+    df["macd"], df["macd_signal"] = macd_obj.macd(), macd_obj.macd_signal()
+
+    last = df.iloc[-1]
+    info = (f"EMA9={last['ema9']:.4f}, EMA21={last['ema21']:.4f}, "
+            f"RSI={last['rsi']:.2f}, MACD={last['macd']:.4f}, SIG={last['macd_signal']:.4f}")
+
+    buy_pts = 0; sell_pts = 0
+    if last["ema9"] > last["ema21"]: buy_pts += 1
+    if last["ema9"] < last["ema21"]: sell_pts += 1
+    if last["rsi"] > 45: buy_pts += 1
+    if last["rsi"] < 55: sell_pts += 1
+    if last["macd"] > last["macd_signal"]: buy_pts += 1
+    if last["macd"] < last["macd_signal"]: sell_pts += 1
+
+    macd_cross = _last_cross(df["macd"], df["macd_signal"], lookback=3)
+
+    sig = "none"
+    if buy_pts >= 2 or macd_cross == 1: sig = "buy"
+    if sell_pts >= 2 or macd_cross == -1:
+        if sig == "buy":
+            if last["ema9"] < last["ema21"]: sig = "sell"
+            elif last["ema9"] > last["ema21"]: sig = "buy"
+            else: sig = "none"
+        else:
+            sig = "sell"
+
+    ema_gap = abs(last["ema9"] - last["ema21"]) / max(abs(last["ema21"]), 1e-12)
+    ema_score = max(0.0, min(1.0, ema_gap * 10))
+    if sig == "buy":
+        pts_part = buy_pts / 3.0
+        rsi_part = max(0.0, min(1.0, (last["rsi"] - 45) / 25))
+    elif sig == "sell":
+        pts_part = sell_pts / 3.0
+        rsi_part = max(0.0, min(1.0, (55 - last["rsi"]) / 25))
+    else:
+        pts_part = 0.0; rsi_part = 0.0
+    confidence = max(0.0, min(1.0, 0.5*pts_part + 0.3*ema_score + 0.2*rsi_part))
+    return sig, float(last["atr"]), info, confidence
+
+# ==================== POSITION / ORDERS ====================
+
+def choose_trade_budget(confidence: float, avail_usdt: float) -> float:
+    bmin, bmax = MIN_TRADE_USDT, MAX_TRADE_USDT
+    if FLOAT_BUDGET_MODE == "signal":
+        budget = bmin + (bmax - bmin) * max(0.0, min(1.0, confidence))
+    elif FLOAT_BUDGET_MODE == "random":
+        budget = random.uniform(bmin, bmax)
+    elif FLOAT_BUDGET_MODE == "fixed_max":
+        budget = bmax
+    else:
+        budget = bmin
+    return max(0.0, min(budget, avail_usdt))
+
+def qty_from_budget(sym: str, price: float, budget_usdt: float) -> float:
+    if sym not in LIMITS: return 0.0
+    step = LIMITS[sym]["qty_step"]
+    q = adjust_qty(budget_usdt / price, step)
+    if q < LIMITS[sym]["min_qty"] or q * price < LIMITS[sym]["min_amt"]:
+        return 0.0
+    return q
+
+def log_trade(sym, side, price, qty, pnl, reason=""):
+    usdt_val = price * qty
+    msg = (f"{side} {sym} @ {price:.6f}, qty={qty:.8f}, USDT≈{usdt_val:.2f}, "
+           f"PnL(net)={pnl:.2f} | {reason}")
+    log(msg)
+    with open("trades.csv", "a", encoding="utf-8") as f:
+        f.write(f"{datetime.datetime.now()},{sym},{side},{price},{qty},{usdt_val},{pnl},{reason}\n")
+    save_state()
+
+def init_positions_from_balance():
+    for sym in SYMBOLS:
+        try:
+            df = get_kline(sym)
+            if df.empty: continue
+            price = df["c"].iloc[-1]
+            coins = get_wallet_cached(force=True)
+            bal = get_coin_balance_from(coins, sym)
+            if price and bal * price >= LIMITS.get(sym, {}).get("min_amt", 0):
+                qty_net = adjust_qty(bal, LIMITS[sym]["qty_step"])
+                atr = AverageTrueRange(df["h"], df["l"], df["c"], 14).average_true_range().iloc[-1]
+                tp = price + TRAIL_MULTIPLIER * atr
+                STATE[sym]["positions"].append({
+                    "buy_price": price,
+                    "qty": qty_net,
+                    "buy_qty_gross": qty_net / (1 - TAKER_FEE_SPOT),
+                    "tp": tp
+                })
+                log(f"♻️ [{sym}] Восстановлена позиция qty={qty_net:.8f}, price={price:.6f}, tp={tp:.6f}")
+        except Exception as e:
+            log(f"[{sym}] Ошибка восстановления позиций: {e}")
+            tg_event(f"[{sym}] Ошибка восстановления позиций: {e}")
+    save_state()
+
+def send_daily_report():
+    try:
+        coins = get_wallet_cached(force=True)
+        by_coin = {c["coin"]: float(c["walletBalance"]) for c in coins}
+        usdt = by_coin.get("USDT", 0.0)
+        lines = [f"📊 Daily Report {datetime.datetime.now().date()}",
+                 f"USDT: {usdt:.2f}"]
+        for sym in SYMBOLS:
+            base = sym.replace("USDT","")
+            bal = by_coin.get(base, 0.0)
+            price = float(get_kline(sym)["c"].iloc[-1])
+            val = price * bal
+            s = STATE[sym]
+            cur_pos = sum(p["qty"] for p in s["positions"])
+            dd = s.get("max_drawdown", 0.0)
+            lines.append(f"{sym}: balance={bal:.6f} (~{val:.2f} USDT), "
+                         f"trades={s['count']}, pnl={s['pnl']:.2f}, maxDD={dd*100:.2f}%, curPosQty={cur_pos:.6f}")
+        tg_event("\n".join(lines))
+    except Exception as e:
+        log(f"Ошибка формирования отчёта: {e}")
+        tg_event(f"Ошибка формирования отчёта: {e}")
+
+# ==================== CORE ====================
+
+def trade_cycle():
+    global LAST_REPORT_DATE, cycle_count, _last_error_ts
+    try:
+        coins = get_wallet_cached(force=True)   # 1 вызов на цикл
+        usdt = get_balance_usdt_from(coins)
+    except Exception as e:
+        log(f"Ошибка получения баланса USDT: {e}")
+        now = time.time()
+        if now - _last_error_ts > ERROR_TG_COOLDOWN:
+            tg_event(f"Ошибка получения баланса USDT: {e}")
+            _last_error_ts = now
+        return
+
+    avail = max(0.0, usdt - RESERVE_BALANCE)
+    log(f"💰 Баланс USDT={usdt:.2f} | Доступно={avail:.2f}")
+
+    for sym in SYMBOLS:
+        try:
+            df = get_kline(sym)
+            if df.empty:
+                log(f"[{sym}] ❗Нет данных по свечам — пропускаем")
+                continue
+
+            sig, atr, info_ind, confidence = calc_signal(df)
+            price = df["c"].iloc[-1]
+            state = STATE[sym]
+            limits = LIMITS[sym]
+            coin_bal = get_coin_balance_from(coins, sym)  # из кэша
+            value = coin_bal * price
+
+            log(f"[{sym}] 🔎 Сигнал={sig.upper()} (conf={confidence:.2f}), price={price:.6f}, "
+                f"balance={coin_bal:.8f} (~{value:.2f} USDT) | {info_ind}")
+
+            if state["positions"]:
+                avg_entry = sum(p["buy_price"] * p["qty"] for p in state["positions"]) / \
+                            sum(p["qty"] for p in state["positions"])
+                curr_dd = (avg_entry - price) / avg_entry
+                if curr_dd > state["max_drawdown"]:
+                    state["max_drawdown"] = curr_dd
+
+            new_positions = []
+            for pos in state["positions"]:
+                b = pos["buy_price"]
+                q_net = adjust_qty(pos["qty"], limits["qty_step"])
+                tp = pos["tp"]
+                buy_gross = pos.get("buy_qty_gross", q_net / (1 - TAKER_FEE_SPOT))
+
+                cost_usdt = b * buy_gross
+                proceeds_usdt = price * q_net * (1 - TAKER_FEE_SPOT)
+                pnl_net = proceeds_usdt - cost_usdt
+                min_net_req = max(MIN_NET_ABS_USD, price * q_net * MIN_PROFIT_PCT)
+
+                if price <= b * (1 - STOP_LOSS_PCT):
+                    _safe_call(session.place_order, category="spot", symbol=sym, side="Sell",
+                               orderType="Market", qty=str(q_net))
+                    reason = (f"STOP-LOSS: price {price:.6f} ≤ {b*(1-STOP_LOSS_PCT):.6f}; pnl_net={pnl_net:.2f}")
+                    log_trade(sym, "SELL", price, q_net, pnl_net, reason)
+                    tg_event(f"❗{sym} SELL (SL) @ {price:.6f}, qty={q_net:.8f}, pnl={pnl_net:.2f}")
+                    state["pnl"] += pnl_net
+                    state["last_sell_price"] = price
+                    state["avg_count"] = 0
                     continue
 
-                # Позиция
-                pos = get_pos(symbol)
-                qty = float(pos.get("qty", 0.0))
-                avg = float(pos.get("avg", 0.0))
+                if price >= tp and pnl_net >= min_net_req:
+                    _safe_call(session.place_order, category="spot", symbol=sym, side="Sell",
+                               orderType="Market", qty=str(q_net))
+                    reason = (f"TP HIT: price {price:.6f} ≥ tp {tp:.6f} и pnl_net {pnl_net:.2f} ≥ {min_net_req:.2f}")
+                    log_trade(sym, "SELL", price, q_net, pnl_net, reason)
+                    tg_event(f"✅ {sym} SELL @ {price:.6f}, qty={q_net:.8f}, pnl={pnl_net:.2f}")
+                    state["pnl"] += pnl_net
+                    state["last_sell_price"] = price
+                    state["avg_count"] = 0
+                else:
+                    new_tp = max(tp, price + TRAIL_MULTIPLIER * atr)
+                    if new_tp != tp:
+                        log(f"[{sym}] 📈 TP: {tp:.6f} → {new_tp:.6f}")
+                    pos["tp"] = new_tp
+                    new_positions.append(pos)
+                    if price < tp:
+                        log(f"[{sym}] 🔸Не продаём: цена {price:.6f} < TP {tp:.6f}")
+                    elif pnl_net < min_net_req:
+                        log(f"[{sym}] 🔸Не продаём: pnl_net {pnl_net:.2f} < требуемого {min_net_req:.2f}")
 
-                # Сигнал
-                signal, conf, m = fetch_signal(symbol)
-                conf = round(conf, 2)
-                ema9  = m.get("EMA9", 0.0)
-                ema21 = m.get("EMA21", 0.0)
+            state["positions"] = new_positions
 
-                # Логи скромные
-                act = "HOLD"
-                if qty > 0:
-                    act = "HOLD"
-                log(f"[{symbol}] 🔎 {act} (conf={conf:.2f}), price={price:.6f}, "
-                    f"balance={qty:.6f} (~{qty*price:.2f} USDT) | EMA9={ema9:.4f}, EMA21={ema21:.4f}")
-
-                # Пробуем sell (TP/SL)
-                if qty > 0:
-                    to_sell, reason = need_sell(symbol, price)
-                    if to_sell and not cooldown_active(symbol):
-                        # продаём всё
-                        sell_qty = _round_step(qty, _symbol_limits.get(symbol, {}).get("qty_step", 1.0))
-                        if sell_qty > 0:
-                            data = place_order(symbol, "SELL", sell_qty)
-                            if data.get("retCode") == 0:
-                                pnl = (price - avg) * sell_qty
-                                tg_send(f"✅ {symbol} SELL @ {price:.6f}, qty={sell_qty:.6f}, pnl={pnl:.2f}  [{reason}]")
-                                update_pos(symbol, 0.0, 0.0, None)
-                                set_cooldown(symbol)
-                            else:
-                                _maybe_report_wallet_error(data)
-
-                # Покупка
-                if qty <= 0 and signal == "BUY" and conf >= 0.5 and not cooldown_active(symbol):
-                    if usdt >= BUDGET_MIN:
-                        want = min(BUDGET_MAX, usdt)
-                        buy_qty = _afford_qty(symbol, price, want)
-                        if buy_qty * price >= _symbol_limits.get(symbol, DEFAULT_LIMITS.get(symbol, {})).get("min_amt", 5.0):
-                            data = place_order(symbol, "BUY", buy_qty)
-                            if data.get("retCode") == 0:
-                                update_pos(symbol, buy_qty, price, calc_tp_from(price))
-                                tg_send(f"🟢 {symbol} BUY @ {price:.6f}, qty={buy_qty:.6f}")
-                                set_cooldown(symbol)
-                            else:
-                                _maybe_report_wallet_error(data)
+            # ----- ENTRIES -----
+            if sig == "buy":
+                # averaging
+                if state["positions"] and state["avg_count"] < MAX_AVERAGES:
+                    total_q = sum(p["qty"] for p in state["positions"])
+                    avg_price = sum(p["qty"] * p["buy_price"] for p in state["positions"]) / total_q
+                    drawdown = (price - avg_price) / avg_price
+                    if drawdown < 0 and abs(drawdown) <= MAX_DRAWDOWN:
+                        budget = choose_trade_budget(confidence, avail)
+                        qty_gross = qty_from_budget(sym, price, budget)
+                        if qty_gross > 0 and qty_gross * price <= (usdt - RESERVE_BALANCE + 1e-9):
+                            _safe_call(session.place_order, category="spot", symbol=sym, side="Buy",
+                                       orderType="Market", qty=str(qty_gross))
+                            qty_net = qty_gross * (1 - TAKER_FEE_SPOT)
+                            tp = price + TRAIL_MULTIPLIER * atr
+                            STATE[sym]["positions"].append({
+                                "buy_price": price, "qty": qty_net,
+                                "buy_qty_gross": qty_gross, "tp": tp
+                            })
+                            state["count"] += 1
+                            state["avg_count"] += 1
+                            log_trade(sym, "BUY (avg)", price, qty_net, 0.0,
+                                      reason=(f"drawdown={drawdown:.4f}, conf={confidence:.2f}, "
+                                              f"budget={budget:.2f}, qty_gross={qty_gross:.8f}, qty_net={qty_net:.8f}"))
+                            tg_event(f"🟢 {sym} BUY(avg) @ {price:.6f}, qty={qty_net:.8f}")
+                            # обновим кэш кошелька после сделки
+                            coins = get_wallet_cached(force=True)
+                            usdt = get_balance_usdt_from(coins)
+                            avail = max(0.0, usdt - RESERVE_BALANCE)
+                        else:
+                            log(f"[{sym}] ❌ Не усредняем: фильтры/средства (budget={budget:.2f})")
                     else:
-                        log(f"[{symbol}] бюджет < {BUDGET_MIN}, пропускаем")
-
-            time.sleep(5)
+                        log(f"[{sym}] 🔸Не усредняем: drawdown {drawdown:.4f} вне (-{MAX_DRAWDOWN})")
+                # fresh entry
+                elif not state["positions"]:
+                    if state["last_sell_price"] and abs(price - state["last_sell_price"]) / price < LAST_SELL_REENTRY_PCT:
+                        log(f"[{sym}] 🔸Не покупаем: близко к последней продаже ({state['last_sell_price']:.6f})")
+                    else:
+                        budget = choose_trade_budget(confidence, avail)
+                        qty_gross = qty_from_budget(sym, price, budget)
+                        if budget >= MIN_TRADE_USDT and qty_gross > 0 and \
+                           qty_gross * price <= (usdt - RESERVE_BALANCE + 1e-9):
+                            _safe_call(session.place_order, category="spot", symbol=sym, side="Buy",
+                                       orderType="Market", qty=str(qty_gross))
+                            qty_net = qty_gross * (1 - TAKER_FEE_SPOT)
+                            tp = price + TRAIL_MULTIPLIER * atr
+                            STATE[sym]["positions"].append({
+                                "buy_price": price, "qty": qty_net,
+                                "buy_qty_gross": qty_gross, "tp": tp
+                            })
+                            state["count"] += 1
+                            log_trade(sym, "BUY", price, qty_net, 0.0,
+                                      reason=(f"conf={confidence:.2f}, budget={budget:.2f}, "
+                                              f"qty_gross={qty_gross:.8f}, qty_net={qty_net:.8f}, {info_ind}"))
+                            tg_event(f"🟢 {sym} BUY @ {price:.6f}, qty={qty_net:.8f}")
+                            coins = get_wallet_cached(force=True)
+                            usdt = get_balance_usdt_from(coins)
+                            avail = max(0.0, usdt - RESERVE_BALANCE)
+                        else:
+                            log(f"[{sym}] ❌ Не покупаем: бюджет/фильтры/средства "
+                                f"(avail≈{avail:.2f}, budget={budget:.2f}, qty_gross={qty_gross:.8f})")
+            else:
+                if not state["positions"]:
+                    log(f"[{sym}] 🔸Нет покупки: сигнал {sig}, confidence={confidence:.2f}")
 
         except Exception as e:
-            _maybe_report_wallet_error({"retMsg": f"loop exception: {e}", "retCode": "EXC"})
-            time.sleep(2)
+            tb = traceback.format_exc(limit=2)
+            log(f"[{sym}] Ошибка цикла: {e}\n{tb}")
+            now = time.time()
+            if now - _last_error_ts > ERROR_TG_COOLDOWN:
+                tg_event(f"[{sym}] Ошибка цикла: {e}")
+                _last_error_ts = now
 
-# ===========
-# ENTRYPOINT
-# ===========
+    save_state()
+    cycle_count += 1
+
+    now = datetime.datetime.now()
+    if (now.hour == DAILY_REPORT_HOUR and now.minute >= DAILY_REPORT_MINUTE and
+            LAST_REPORT_DATE != now.date()):
+        send_daily_report()
+        globals()['LAST_REPORT_DATE'] = now.date()
+
+# ==================== MAIN ====================
+
 if __name__ == "__main__":
-    # Быстрая валидация ключей
-    if not BYBIT_API_KEY or not BYBIT_API_SECRET:
-        log("❌ Заполните BYBIT_API_KEY / BYBIT_API_SECRET в CONFIG!")
-        raise SystemExit(1)
+    try:
+        init_state()
+        load_symbol_limits()
+        init_positions_from_balance()
+        tg_event(f"⚙️ Параметры: TAKER_FEE={TAKER_FEE_SPOT}, "
+                 f"BUDGET=[{MIN_TRADE_USDT};{MAX_TRADE_USDT}] mode={FLOAT_BUDGET_MODE}, "
+                 f"TRAILx={TRAIL_MULTIPLIER}, SL={STOP_LOSS_PCT*100:.2f}%, "
+                 f"DD={MAX_DRAWDOWN*100:.0f}%, reentry>{LAST_SELL_REENTRY_PCT*100:.1f}%")
 
-    # Пингуем время один раз перед стартом (критично для подписи v5)
-    sync_time()
-    trading_loop()
+        while True:
+            try:
+                trade_cycle()
+            except Exception as e:
+                tb = traceback.format_exc(limit=2)
+                log(f"Global cycle error: {e}\n{tb}")
+                now = time.time()
+                if now - _last_error_ts > ERROR_TG_COOLDOWN:
+                    tg_event(f"Global cycle error: {e}")
+                    _last_error_ts = now
+            time.sleep(LOOP_SLEEP)
+
+    except Exception as e:
+        tb = traceback.format_exc()
+        log(f"Fatal error on start: {e}\n{tb}")
+        tg_event(f"Fatal error on start: {e}")
