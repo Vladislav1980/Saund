@@ -1,10 +1,9 @@
 # -*- coding: utf-8 -*-
-# Bybit Spot bot (trade_v3_redis_profit_only.py)
-# - State в Redis; если пусто — пробуем восстановить из истории сделок (универсально под разные версии pybit)
-# - Любая продажа только с net-прибылью ≥ $1: REQUIRE_PROFIT_ON_ANY_SELL = True
-# - Слияние усреднений в одну позицию (чтобы не было дублей SELL)
-# - Сигналы по закрытой свече; TP по ATR + опциональный трейлинг; жёсткий SL, но работает только если есть прибыль
-# - Подробные логи причин «почему купил/продал/не продал», TG: старт/restore/buy/sell/отчёт
+# Bybit Spot bot (trade_v3_redis_profit_strict.py)
+# - State в Redis; если пусто — восстановление из истории сделок (совместимо с разными pybit)
+# - ПРОДАЖА ТОЛЬКО С ПРИБЫЛЬЮ: netPnL >= min_net_required (>= $1 после 2×taker)
+# - TP по ATR + опциональный трейлинг по ATR; SL есть, но тоже только при прибыли
+# - Слияние усреднений в одну позицию; подробные логи и TG-уведомления
 
 import os, time, math, logging, datetime, json, traceback
 import pandas as pd
@@ -27,27 +26,27 @@ REDIS_URL  = os.getenv("REDIS_URL")
 
 SYMBOLS = ["TONUSDT", "DOGEUSDT", "XRPUSDT"]
 
-# Комиссии (твои с Bybit скрина: тейкер 0.1800%)
-TAKER_FEE = 0.0018  # 0.18% за сторону; в PnL учитываем 2× (вход+выход)
+# Комиссии (по твоему скрину)
+TAKER_FEE = 0.0018  # 0.18% на сторону
 
 # Риск/параметры
 RESERVE_BALANCE   = 1.0     # USDT, не трогаем
 MAX_TRADE_USDT    = 35.0    # бюджет на один вход
 MAX_DRAWDOWN      = 0.10    # усреднение до -10%
 MAX_AVERAGES      = 3
-STOP_LOSS_PCT     = 0.03    # 3% от входа (будет применяться только с прибылью в profit-only режиме)
+STOP_LOSS_PCT     = 0.03    # 3% от входа (сработает ТОЛЬКО при прибыли)
 MIN_PROFIT_PCT    = 0.005   # 0.5% от ноторнала как альтернатива порогу прибыли
-MIN_ABS_PNL       = 3.0     # альтернативный порог в $ (legacy)
-MIN_NET_PROFIT    = 1.50    # альтернативный порог в $
+MIN_ABS_PNL       = 3.0     # альтернатива в $ (legacy)
+MIN_NET_PROFIT    = 1.50    # альтернатива в $
 MIN_NET_ABS_USD   = 1.00    # ЖЁСТКИЙ пол: net ≥ $1 всегда
 
-# Продажа только при прибыли (распространяется на TP/Trail/SL)
+# Продажа только при прибыли (везде: TP/Trail/SL)
 REQUIRE_PROFIT_ON_ANY_SELL = True
 
 # TP/TS по ATR
 TP_ATR_MULT       = 1.2
 TRAIL_MULTIPLIER  = 1.5
-USE_TRAILING      = True     # трейлинг работает, но продаст только если netPnL ≥ need
+USE_TRAILING      = True
 
 # Прочее
 INTERVAL = "1"   # минутки
@@ -288,7 +287,6 @@ def append_pos(sym, price, qty_gross, atr):
             "tp": tp, "peak": peak, "trail": trail, "hard_sl": hard_sl
         }]
     else:
-        # слияние в одну средневзвешенную позицию
         p = s["positions"][0]
         new_qty = p["qty"] + qty_net
         if new_qty <= 0:
@@ -473,7 +471,7 @@ def trade_cycle():
                     if dd > state["max_drawdown"]:
                         state["max_drawdown"] = dd
 
-            # -------- SELL / TP / SL / TRAIL ----------
+            # -------- SELL / TP / SL / TRAIL (только при прибыли) ----------
             new_pos = []
             for p in state["positions"]:
                 b   = p["buy_price"]
@@ -488,22 +486,21 @@ def trade_cycle():
 
                 pnl  = net_pnl(price, b, q_n, q_g)
                 need = min_net_required(price, q_n)
-
-                # Флаг: продавать только с прибылью
                 require_ok = (pnl >= need) if REQUIRE_PROFIT_ON_ANY_SELL else True
 
-                # SL (работает только если есть прибыль при REQUIRE_PROFIT_ON_ANY_SELL)
-                if price <= hard_sl and require_ok:
-                    _safe_call(session.place_order, category="spot", symbol=sym,
-                               side="Sell", orderType="Market", qty=str(q_n))
-                    msg = (f"❗SL SELL {sym} @ {price:.6f}, qty={q_n:.8f}, netPnL={pnl:.2f} "
-                           f"| need>={need:.2f}, SL={hard_sl:.6f}")
-                    log_event(msg, to_tg=True)
-                    state["pnl"] += pnl; state["last_sell_price"] = price; state["avg_count"] = 0
-                    coins = get_wallet(True); coin_bal = coin_balance(coins, sym)
-                    continue
-                elif price <= hard_sl and not require_ok:
-                    logging.info(f"[{sym}] ⏸ Skip SL: netPnL={pnl:.2f} < need={need:.2f}")
+                # SL
+                if price <= hard_sl:
+                    if require_ok:
+                        _safe_call(session.place_order, category="spot", symbol=sym,
+                                   side="Sell", orderType="Market", qty=str(q_n))
+                        msg = (f"❗SL SELL {sym} @ {price:.6f}, qty={q_n:.8f}, netPnL={pnl:.2f} "
+                               f"| need>={need:.2f}, SL={hard_sl:.6f}")
+                        log_event(msg, to_tg=True)
+                        state["pnl"] += pnl; state["last_sell_price"] = price; state["avg_count"] = 0
+                        coins = get_wallet(True); coin_bal = coin_balance(coins, sym)
+                        continue
+                    else:
+                        logging.info(f"[{sym}] ⏸ Skip SL: netPnL={pnl:.2f} < need={need:.2f}")
 
                 # Trailing
                 if USE_TRAILING:
@@ -513,17 +510,18 @@ def trade_cycle():
                     if abs(new_trail - p.get("trail", 0)) > 1e-12:
                         logging.info(f"[{sym}] 📈 Trail: {p.get('trail')} → {new_trail}")
                         p["trail"] = new_trail
-                    if price <= p["trail"] and require_ok:
-                        _safe_call(session.place_order, category="spot", symbol=sym,
-                                   side="Sell", orderType="Market", qty=str(q_n))
-                        msg = (f"🟠 TRAIL SELL {sym} @ {price:.6f}, qty={q_n:.8f}, netPnL={pnl:.2f} "
-                               f"| need>={need:.2f}, trail={p['trail']:.6f}")
-                        log_event(msg, to_tg=True)
-                        state["pnl"] += pnl; state["last_sell_price"] = price; state["avg_count"] = 0
-                        coins = get_wallet(True); coin_bal = coin_balance(coins, sym)
-                        continue
-                    elif price <= p["trail"] and not require_ok:
-                        logging.info(f"[{sym}] ⏸ Skip TRAIL: netPnL={pnl:.2f} < need={need:.2f}")
+                    if price <= p["trail"]:
+                        if require_ok:
+                            _safe_call(session.place_order, category="spot", symbol=sym,
+                                       side="Sell", orderType="Market", qty=str(q_n))
+                            msg = (f"🟠 TRAIL SELL {sym} @ {price:.6f}, qty={q_n:.8f}, netPnL={pnl:.2f} "
+                                   f"| need>={need:.2f}, trail={p['trail']:.6f}")
+                            log_event(msg, to_tg=True)
+                            state["pnl"] += pnl; state["last_sell_price"] = price; state["avg_count"] = 0
+                            coins = get_wallet(True); coin_bal = coin_balance(coins, sym)
+                            continue
+                        else:
+                            logging.info(f"[{sym}] ⏸ Skip TRAIL: netPnL={pnl:.2f} < need={need:.2f}")
 
                 # Take Profit
                 if price >= tp and pnl >= need:
@@ -608,7 +606,7 @@ def trade_cycle():
 # ===================== RUN =====================
 
 if __name__ == "__main__":
-    log_event("🚀 Bot starting (v3.redis.profitOnly)", to_tg=True)
+    log_event("🚀 Bot starting (v3.redis.profitStrict)", to_tg=True)
     init_state()
     load_symbol_limits()
     restore_positions_if_needed()
