@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
-# Bybit Spot bot (trade_v3_redis_profit_strict.py)
-# - State в Redis; если пусто — восстановление из истории сделок (совместимо с разными pybit)
-# - ПРОДАЖА ТОЛЬКО С ПРИБЫЛЬЮ: netPnL >= min_net_required (>= $1 после 2×taker)
-# - TP по ATR + опциональный трейлинг по ATR; SL есть, но тоже только при прибыли
+# Bybit Spot bot (trade_v3_redis_profitStrict_slipfix.py)
+# - State в Redis; если пусто — восстановление из истории сделок
+# - ПРОДАЖА ТОЛЬКО ПРИ ПРИБЫЛИ: netPnL >= min_net_required (>= $1 после 2× taker)
+# - TP/Trail/SL по ATR, но SL и Trail тоже продают только если есть прибыль
 # - Слияние усреднений в одну позицию; подробные логи и TG-уведомления
+# - FIX: Insufficient balance (170131) — запас на проскальзывание, подгонка qty под баланс,
+#        единоразовый retry и анти-спам cooldown
 
 import os, time, math, logging, datetime, json, traceback
 import pandas as pd
@@ -26,19 +28,19 @@ REDIS_URL  = os.getenv("REDIS_URL")
 
 SYMBOLS = ["TONUSDT", "DOGEUSDT", "XRPUSDT"]
 
-# Комиссии (по твоему скрину)
+# комиссии по твоему скрину
 TAKER_FEE = 0.0018  # 0.18% на сторону
 
 # Риск/параметры
-RESERVE_BALANCE   = 1.0     # USDT, не трогаем
-MAX_TRADE_USDT    = 35.0    # бюджет на один вход
-MAX_DRAWDOWN      = 0.10    # усреднение до -10%
+RESERVE_BALANCE   = 1.0      # USDT, не трогаем
+MAX_TRADE_USDT    = 35.0     # бюджет на один вход
+MAX_DRAWDOWN      = 0.10     # усреднение до -10%
 MAX_AVERAGES      = 3
-STOP_LOSS_PCT     = 0.03    # 3% от входа (сработает ТОЛЬКО при прибыли)
-MIN_PROFIT_PCT    = 0.005   # 0.5% от ноторнала как альтернатива порогу прибыли
-MIN_ABS_PNL       = 3.0     # альтернатива в $ (legacy)
-MIN_NET_PROFIT    = 1.50    # альтернатива в $
-MIN_NET_ABS_USD   = 1.00    # ЖЁСТКИЙ пол: net ≥ $1 всегда
+STOP_LOSS_PCT     = 0.03     # 3% от входа (но сработает только при прибыли)
+MIN_PROFIT_PCT    = 0.005    # 0.5% от ноторнала как альтернатива порогу прибыли
+MIN_ABS_PNL       = 3.0      # альтернатива в $ (legacy)
+MIN_NET_PROFIT    = 1.50     # альтернатива в $
+MIN_NET_ABS_USD   = 1.00     # ЖЁСТКИЙ пол: net ≥ $1 всегда
 
 # Продажа только при прибыли (везде: TP/Trail/SL)
 REQUIRE_PROFIT_ON_ANY_SELL = True
@@ -47,6 +49,11 @@ REQUIRE_PROFIT_ON_ANY_SELL = True
 TP_ATR_MULT       = 1.2
 TRAIL_MULTIPLIER  = 1.5
 USE_TRAILING      = True
+
+# FIX 170131: запас и анти-спам
+SLIPPAGE_BUFFER   = 0.006   # 0.6% запас на проскальзывание/округления/латентность
+BUY_FAIL_COOLDOWN = 300.0   # 5 минут кулдаун на символ после 170131
+_last_buy_fail = {}         # sym -> ts
 
 # Прочее
 INTERVAL = "1"   # минутки
@@ -246,8 +253,25 @@ def can_place_buy(sym: str, q: float, price: float, usdt_free: float) -> bool:
     lm = LIMITS[sym]
     if q < lm["min_qty"] or q*price < lm["min_amt"]:
         return False
-    need = q * price * (1 + TAKER_FEE)
+    # учтём комиссию и запас
+    need = q * price * (1 + TAKER_FEE + SLIPPAGE_BUFFER)
     return need <= max(0.0, usdt_free - RESERVE_BALANCE + 1e-9)
+
+def fit_buy_qty_with_balance(sym: str, price: float, usdt_free: float, q_init: float) -> float:
+    """Подгоняет qty вниз по шагу так, чтобы уложиться в баланс + комиссия + запас."""
+    if sym not in LIMITS:
+        return 0.0
+    lm = LIMITS[sym]
+    step = lm["qty_step"]
+    q = max(0.0, q_init)
+    if q <= 0:
+        return 0.0
+    while q >= lm["min_qty"]:
+        need = q * price * (1 + TAKER_FEE + SLIPPAGE_BUFFER)
+        if need <= max(0.0, usdt_free - RESERVE_BALANCE + 1e-9) and q * price >= lm["min_amt"]:
+            return round_step(q, step)
+        q = round_step(q - step, step)
+    return 0.0
 
 def can_place_sell(sym: str, q_net: float, price: float, coin_bal_now: float) -> bool:
     if q_net <= 0: return False
@@ -325,7 +349,7 @@ def daily_report():
     except Exception as e:
         logging.info(f"daily_report error: {e}")
 
-# ===================== RESTORE FROM TRADES (универсально) =====================
+# ===================== RESTORE FROM TRADES =====================
 
 def _fetch_fills(sym, days=30, page_size=200):
     """Пытается достать сделки из разных версий pybit; отдаёт [{'side','price','qty'}]."""
@@ -534,7 +558,7 @@ def trade_cycle():
                     coins = get_wallet(True); coin_bal = coin_balance(coins, sym)
                     continue
 
-                # Обновить TP (не «убегает»)
+                # Обновить TP
                 new_tp = max(tp, b + TP_ATR_MULT*atr_last)
                 if abs(new_tp - tp) > 1e-12:
                     logging.info(f"[{sym}] 🎯 TP: {tp:.6f} → {new_tp:.6f}")
@@ -544,6 +568,55 @@ def trade_cycle():
             state["positions"] = new_pos
 
             # -------- BUY / AVERAGE ----------
+            def _attempt_buy(q_gross, context_text):
+                nonlocal usdt, avail
+                if not can_place_buy(sym, q_gross, price, usdt):
+                    logging.info(f"[{sym}] ❌ Skip {context_text}: can_place_buy=False "
+                                 f"(min_amt={lm['min_amt']}, min_qty={lm['min_qty']})")
+                    return False
+                # свежие данные
+                coins_now = get_wallet(True)
+                usdt_now = usdt_balance(coins_now)
+                df_latest = get_kline(sym)
+                price_now = float(df_latest['c'].iloc[-1]) if not df_latest.empty else price
+                # подгонка qty
+                q_fit = fit_buy_qty_with_balance(sym, price_now, usdt_now, q_gross)
+                if q_fit <= 0:
+                    logging.info(f"[{sym}] ❌ Skip {context_text}: q_fit<=0 после подгонки под баланс/лимиты")
+                    return False
+                # попытка BUY
+                try:
+                    _safe_call(session.place_order, category="spot", symbol=sym,
+                               side="Buy", orderType="Market", qty=str(q_fit))
+                except Exception as e:
+                    msg = str(e)
+                    if "170131" in msg:
+                        now_ts = time.time()
+                        if now_ts - _last_buy_fail.get(sym, 0.0) < BUY_FAIL_COOLDOWN:
+                            logging.info(f"[{sym}] ⏸ Buy cooldown after 170131")
+                            return False
+                        _last_buy_fail[sym] = now_ts
+                        # Retry на 1 шаг меньше
+                        q_retry = fit_buy_qty_with_balance(sym, price_now, usdt_now,
+                                                           round_step(q_fit - lm["qty_step"], lm["qty_step"]))
+                        if q_retry >= lm["min_qty"] and q_retry * price_now >= lm["min_amt"]:
+                            logging.info(f"[{sym}] Retry BUY after 170131 with qty={q_retry}")
+                            _safe_call(session.place_order, category="spot", symbol=sym,
+                                       side="Buy", orderType="Market", qty=str(q_retry))
+                            q_fit = q_retry
+                        else:
+                            logging.info(f"[{sym}] ❌ Retry not possible after 170131 (qty too small)")
+                            return False
+                    else:
+                        raise
+                # успех — фиксируем позицию
+                atr_use = atr_sig if 'atr_sig' in locals() else AverageTrueRange(df_latest["h"],df_latest["l"],df_latest["c"],14).average_true_range().iloc[-1]
+                append_pos(sym, price_now, q_fit, atr_use)
+                state["count"] += 1
+                send_tg(f"🟢 BUY{context_text} {sym} @ {price_now:.6f}, qty_net={q_fit*(1-TAKER_FEE):.8f}")
+                coins = get_wallet(True); usdt = usdt_balance(coins); avail = max(0.0, usdt-RESERVE_BALANCE)
+                return True
+
             if sig == "buy":
                 if state["positions"] and state["avg_count"] < MAX_AVERAGES:
                     total_q = sum(x["qty"] for x in state["positions"])
@@ -551,18 +624,10 @@ def trade_cycle():
                     dd = (price - avg_price)/avg_price
                     if dd < 0 and abs(dd) <= MAX_DRAWDOWN:
                         q_gross = budget_qty(sym, price, avail)
-                        if q_gross <= 0:
-                            logging.info(f"[{sym}] ❌ Skip avg: бюджет/лимиты (avail={avail:.2f})")
-                        elif can_place_buy(sym, q_gross, price, usdt):
-                            _safe_call(session.place_order, category="spot", symbol=sym,
-                                       side="Buy", orderType="Market", qty=str(q_gross))
-                            append_pos(sym, price, q_gross, atr_sig)
-                            state["count"] += 1; state["avg_count"] += 1
-                            log_event(f"🟢 BUY(avg) {sym} @ {price:.6f}, qty_net={(q_gross*(1-TAKER_FEE)):.8f} "
-                                      f"| reason=sig=buy, dd={dd:.4f}, {sig_info}", to_tg=True)
-                            coins = get_wallet(True); usdt = usdt_balance(coins); avail = max(0.0, usdt-RESERVE_BALANCE)
+                        if q_gross > 0 and _attempt_buy(q_gross, "(avg)"):
+                            state["avg_count"] += 1
                         else:
-                            logging.info(f"[{sym}] ❌ Skip avg: can_place_buy=False")
+                            logging.info(f"[{sym}] ❌ Skip avg: бюджет/лимиты или 170131")
                     else:
                         logging.info(f"[{sym}] 🔸Skip avg: dd {dd:.4f} вне (-{MAX_DRAWDOWN:.2f})")
                 elif not state["positions"]:
@@ -570,18 +635,10 @@ def trade_cycle():
                         logging.info(f"[{sym}] 🔸Skip buy: близко к последней продаже")
                     else:
                         q_gross = budget_qty(sym, price, avail)
-                        if q_gross <= 0:
-                            logging.info(f"[{sym}] ❌ Skip buy: бюджет/мин-лимиты (avail={avail:.2f})")
-                        elif can_place_buy(sym, q_gross, price, usdt):
-                            _safe_call(session.place_order, category="spot", symbol=sym,
-                                       side="Buy", orderType="Market", qty=str(q_gross))
-                            append_pos(sym, price, q_gross, atr_sig)
-                            state["count"] += 1
-                            log_event(f"🟢 BUY {sym} @ {price:.6f}, qty_net={(q_gross*(1-TAKER_FEE)):.8f} "
-                                      f"| reason=sig=buy, {sig_info}", to_tg=True)
-                            coins = get_wallet(True); usdt = usdt_balance(coins); avail = max(0.0, usdt-RESERVE_BALANCE)
+                        if q_gross > 0:
+                            _attempt_buy(q_gross, "")
                         else:
-                            logging.info(f"[{sym}] ❌ Skip buy: can_place_buy=False")
+                            logging.info(f"[{sym}] ❌ Skip buy: бюджет/мин-лимиты (avail={avail:.2f})")
             else:
                 if not state["positions"]:
                     logging.info(f"[{sym}] 🔸No buy: signal={sig}, info=({sig_info})")
@@ -606,13 +663,14 @@ def trade_cycle():
 # ===================== RUN =====================
 
 if __name__ == "__main__":
-    log_event("🚀 Bot starting (v3.redis.profitStrict)", to_tg=True)
+    log_event("🚀 Bot starting (v3.redis.profitStrict.slipfix)", to_tg=True)
     init_state()
     load_symbol_limits()
     restore_positions_if_needed()
     send_tg(f"⚙️ Params: TAKER={TAKER_FEE}, MAX_TRADE={MAX_TRADE_USDT}, "
             f"TPxATR={TP_ATR_MULT}, TRAILx={TRAIL_MULTIPLIER}, SL={STOP_LOSS_PCT*100:.1f}%, "
-            f"DD={MAX_DRAWDOWN*100:.0f}%, ProfitOnly={REQUIRE_PROFIT_ON_ANY_SELL} | Redis={'ON' if rds else 'OFF'}")
+            f"DD={MAX_DRAWDOWN*100:.0f}%, ProfitOnly={REQUIRE_PROFIT_ON_ANY_SELL} | "
+            f"Redis={'ON' if rds else 'OFF'} | SlipBuf={SLIPPAGE_BUFFER*100:.2f}%")
 
     while True:
         try:
