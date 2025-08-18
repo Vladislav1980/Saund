@@ -5,7 +5,7 @@
 # — FIX 170131: market BUY с marketUnit="baseCoin" + умный ретрай и SLIP_BUFFER
 # — Redis-состояние (+ файл как резерв), восстановление позиций, подробные логи и TG
 
-mport os, time, math, logging, datetime, json, traceback
+import os, time, math, logging, datetime, json, traceback
 import pandas as pd
 import requests
 from dotenv import load_dotenv
