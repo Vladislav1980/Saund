@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
-# Bybit Spot bot — v3.redis.profitStrict.onlyProfit
-# — Только прибыльные продажи: netPnL >= $1 после 2х комиссий (ProfitOnly)
+# Bybit Spot bot — v3.redis.profitStrict.onlyProfit (patched)
+# — Только прибыльные продажи: netPnL >= $1.50 после 2х комиссий (ProfitOnly)
 # — Трейл и SL НЕ закрывают в минус: если нет net >= need — держим
 # — FIX 170131: market BUY с marketUnit="baseCoin" + умный ретрай и SLIP_BUFFER
 # — Redis-состояние (+ файл как резерв), восстановление позиций, подробные логи и TG
+# — ДОП. ПОКУПКИ при наличии депозита (аккуратная «пирамидка») — опционально
 
 import os, time, math, logging, datetime, json, traceback
 import pandas as pd
@@ -32,21 +33,28 @@ except Exception:
 # ============ CONFIG ============
 SYMBOLS = ["TONUSDT", "DOGEUSDT", "XRPUSDT"]
 
-# комиссии с твоего скрина (Bybit Spot: тейкер 0.18%)
+# комиссии (Bybit Spot: тейкер 0.18% — для маркет-ордеров)
 TAKER_FEE = 0.0018
 
 RESERVE_BALANCE = 1.0       # USDT, не трогаем
-MAX_TRADE_USDT  = 35.0      # бюджет на покупку
+MAX_TRADE_USDT  = 35.0      # бюджет на одну покупку
 TRAIL_MULTIPLIER= 1.5
 MAX_DRAWDOWN    = 0.10      # усреднение до -10%
 MAX_AVERAGES    = 3
-STOP_LOSS_PCT   = 0.03      # SL, НО продаём только при net>=1$
+STOP_LOSS_PCT   = 0.03      # SL, НО продаём только при net>=need
 MIN_PROFIT_PCT  = 0.005     # 0.5% от ноторнала (доп. фильтр)
 MIN_ABS_PNL     = 3.0
-MIN_NET_PROFIT  = 1.50
+MIN_NET_PROFIT  = 1.50      # ← требуемый net-минимум ($) после 2х комиссий
 MIN_NET_ABS_USD = 1.00
 SLIP_BUFFER     = 0.006     # 0.6% запас на проскальзывание/округления
 PROFIT_ONLY     = True      # ключевое правило: продаём только при net>=need
+
+# --- Доп. покупки при наличии депозита (аккуратная «пирамидка») ---
+ENABLE_EXTRA_SLOTS      = True     # False — как раньше (только усреднение в просадке)
+MAX_SLOTS_PER_SYMBOL    = 4        # всего «лотов» на символ (включая усреднения)
+MAX_EXPOSURE_PER_SYMBOL = 0.0      # потолок USDT на символ; 0.0 = без потолка
+EXTRA_REBUY_COOLDOWN_S  = 300      # минимум секунд между доп. покупками по символу
+EXTRA_REBUY_GAP_PCT     = 0.006    # не ближе 0.6% к последней покупке
 
 INTERVAL = "1"
 STATE_FILE = "state.json"
@@ -70,7 +78,7 @@ def send_tg(msg: str):
     if not TG_TOKEN or not CHAT_ID: return
     try:
         requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-                      data={"chat_id": CHAT_ID, "text": msg})
+                      data={"chat_id": CHAT_ID, "text": msg}, timeout=8)
     except Exception as e:
         logging.error(f"TG send failed: {e}")
 
@@ -119,7 +127,8 @@ def init_state():
         STATE.setdefault(s, {
             "positions": [],  # [{buy_price, qty(net), buy_qty_gross, tp}]
             "pnl": 0.0, "count": 0, "avg_count": 0,
-            "last_sell_price": 0.0, "max_drawdown": 0.0
+            "last_sell_price": 0.0, "max_drawdown": 0.0,
+            "last_buy_ts": 0.0,       # ← добавлено для extra-слотов
         })
     _save_state()
 
@@ -226,8 +235,8 @@ def append_pos(sym, price, qty_gross, tp):
     _save_state()
 
 def net_pnl(price, buy_price, qty_net, buy_qty_gross) -> float:
-    cost  = buy_price * buy_qty_gross
-    proceeds = price * qty_net * (1 - TAKER_FEE)
+    cost  = buy_price * buy_qty_gross                      # покупка (уже с fee в gross)
+    proceeds = price * qty_net * (1 - TAKER_FEE)           # продажа минус fee
     return proceeds - cost
 
 def min_net_required(price, qty_net) -> float:
@@ -407,8 +416,11 @@ def trade_cycle():
                     new_pos.append(p)
             state["positions"] = new_pos
 
-            # ===== BUY / AVERAGE =====
+            # ===== BUY / AVERAGE / EXTRA =====
             if sig == "buy":
+                did_buy = False
+
+                # A) averaging (в просадке)
                 if state["positions"] and state["avg_count"] < MAX_AVERAGES:
                     total_q = sum(x["qty"] for x in state["positions"])
                     avg_price = sum(x["qty"]*x["buy_price"] for x in state["positions"]) / total_q
@@ -419,14 +431,49 @@ def trade_cycle():
                             if _attempt_buy(sym, q_gross):
                                 tp = price + TRAIL_MULTIPLIER*atr
                                 append_pos(sym, price, q_gross, tp)
-                                state["count"] += 1; state["avg_count"] += 1
+                                state["count"] += 1
+                                state["avg_count"] += 1
+                                state["last_buy_ts"] = time.time()   # ← отметка времени
                                 send_tg(f"🟢 BUY(avg) {sym} @ {price:.6f}, qty_net={q_gross*(1-TAKER_FEE):.8f} | dd={dd:.4f}")
                                 coins = get_wallet(True); usdt = usdt_balance(coins); avail = max(0.0, usdt-RESERVE_BALANCE)
+                                did_buy = True
                         else:
                             logging.info(f"[{sym}] ❌ Skip avg: бюджет/лимиты/баланс")
                     else:
                         logging.info(f"[{sym}] 🔸Skip avg: dd={dd:.4f} вне (-{MAX_DRAWDOWN:.2f})")
-                elif not state["positions"]:
+
+                # B) extra-slot (без просадки, если есть депозит)
+                if not did_buy and ENABLE_EXTRA_SLOTS and state["positions"]:
+                    slots_now = len(state["positions"])
+                    if slots_now < MAX_SLOTS_PER_SYMBOL:
+                        sym_value_now = value
+                        if MAX_EXPOSURE_PER_SYMBOL <= 0.0 or sym_value_now < MAX_EXPOSURE_PER_SYMBOL:
+                            ok_time = (time.time() - state.get("last_buy_ts", 0)) >= EXTRA_REBUY_COOLDOWN_S
+                            last_buy_pr = max((p["buy_price"] for p in state["positions"]), default=0.0)
+                            ok_gap = (last_buy_pr == 0.0) or (abs(price - last_buy_pr) / price >= EXTRA_REBUY_GAP_PCT)
+
+                            if ok_time and ok_gap:
+                                q_gross = budget_qty(sym, price, avail)
+                                if can_place_buy(sym, q_gross, price, usdt):
+                                    if _attempt_buy(sym, q_gross):
+                                        tp = price + TRAIL_MULTIPLIER*atr
+                                        append_pos(sym, price, q_gross, tp)
+                                        state["count"] += 1
+                                        state["last_buy_ts"] = time.time()
+                                        send_tg(f"🟢 BUY(extra) {sym} @ {price:.6f}, qty_net={q_gross*(1-TAKER_FEE):.8f} "
+                                                f"| slots={slots_now+1}/{MAX_SLOTS_PER_SYMBOL}")
+                                        coins = get_wallet(True); usdt = usdt_balance(coins); avail = max(0.0, usdt-RESERVE_BALANCE)
+                                        did_buy = True
+                                else:
+                                    logging.info(f"[{sym}] ❌ Skip extra: бюджет/лимиты/баланс")
+                            else:
+                                if not ok_time:
+                                    logging.info(f"[{sym}] ⏳ Skip extra: cooldown {EXTRA_REBUY_COOLDOWN_S}s")
+                                if not ok_gap:
+                                    logging.info(f"[{sym}] ↔️ Skip extra: цена близко к последней покупке (<{EXTRA_REBUY_GAP_PCT*100:.2f}%)")
+
+                # C) fresh entry (если позиций нет)
+                if not state["positions"]:
                     if state["last_sell_price"] and abs(price - state["last_sell_price"])/price < 0.003:
                         logging.info(f"[{sym}] 🔸Skip buy: близко к последней продаже")
                     else:
@@ -436,6 +483,7 @@ def trade_cycle():
                                 tp = price + TRAIL_MULTIPLIER*atr
                                 append_pos(sym, price, q_gross, tp)
                                 state["count"] += 1
+                                state["last_buy_ts"] = time.time()   # ← отметка времени
                                 send_tg(f"🟢 BUY {sym} @ {price:.6f}, qty_net={q_gross*(1-TAKER_FEE):.8f}")
                                 coins = get_wallet(True); usdt = usdt_balance(coins); avail = max(0.0, usdt-RESERVE_BALANCE)
                         else:
@@ -462,13 +510,14 @@ def trade_cycle():
 
 # ============ RUN ============
 if __name__ == "__main__":
-    log_event("🚀 Bot starting (v3.redis.profitStrict.onlyProfit)")
+    log_event("🚀 Bot starting (v3.redis.profitStrict.onlyProfit + extra-slots)")
     init_state()
     load_symbol_limits()
     restore_positions()
     send_tg(f"⚙️ Params: TAKER={TAKER_FEE}, MAX_TRADE={MAX_TRADE_USDT}, "
             f"TRAILx={TRAIL_MULTIPLIER}, SL={STOP_LOSS_PCT*100:.1f}%, DD={MAX_DRAWDOWN*100:.0f}%, "
-            f"ProfitOnly={PROFIT_ONLY}, Redis={'ON' if rds else 'OFF'}, SlipBuf={SLIP_BUFFER*100:.2f}%")
+            f"ProfitOnly={PROFIT_ONLY}, Redis={'ON' if rds else 'OFF'}, SlipBuf={SLIP_BUFFER*100:.2f}%, "
+            f"ExtraSlots={'ON' if ENABLE_EXTRA_SLOTS else 'OFF'}")
 
     while True:
         try:
