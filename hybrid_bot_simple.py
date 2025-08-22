@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
-# Bybit Spot bot — v3.redis.profitStrict.onlyProfit + softer Volume/OB + partial TP
-# - продаём ТОЛЬКО в профит (ProfitOnly)
-# - минимум после комиссий: $1.50 (MIN_NET_ABS_USD)
-# - частичный TP: продаём кусок позиции на $1.5 net, если вся позиция не дотягивает
-# - объёмный фильтр и guard по стакану смягчены и не мешают усреднению
+# Bybit Spot bot — v3.redis.profitStrict.onlyProfit + Volume & OrderBook guards (soft)
+# - Продаём ТОЛЬКО если netPnL >= $1.5 (после комиссий)
+# - Фильтры:
+#   * Volume guard (ослаблен) + умный байпас после серии блокировок
+#   * OrderBook guard (спред/импакт VWAP) — тоже ослаблен
+# - Логика TP/SL/Trail прежняя
 
 import os, time, math, logging, datetime, json, traceback
 import pandas as pd
@@ -22,7 +23,6 @@ TG_TOKEN   = os.getenv("TG_TOKEN") or ""
 CHAT_ID    = os.getenv("CHAT_ID") or ""
 REDIS_URL  = os.getenv("REDIS_URL") or ""
 
-# --- optional Redis ---
 try:
     import redis
     rds = redis.from_url(REDIS_URL, decode_responses=True) if REDIS_URL else None
@@ -32,36 +32,40 @@ except Exception:
 # ============ CONFIG ============
 SYMBOLS = ["TONUSDT", "DOGEUSDT", "XRPUSDT"]
 
+# комиссии (тейкер)
 TAKER_FEE = 0.0018
 
-RESERVE_BALANCE = 1.0
-MAX_TRADE_USDT  = 35.0
+RESERVE_BALANCE = 1.0       # USDT, не трогаем
+MAX_TRADE_USDT  = 35.0      # бюджет на покупку
 TRAIL_MULTIPLIER= 1.5
-MAX_DRAWDOWN    = 0.10
+MAX_DRAWDOWN    = 0.10      # усреднение до -10%
 MAX_AVERAGES    = 3
-STOP_LOSS_PCT   = 0.03
+STOP_LOSS_PCT   = 0.03      # SL, НО продаём только при net>=need
 
-MIN_PROFIT_PCT  = 0.005           # доп. порог (% от нотионала)
+# Порог «продаём только в плюс»
+MIN_PROFIT_PCT  = 0.005     # мин. % фильтр от ноторнала
 MIN_ABS_PNL     = 0.0
-MIN_NET_PROFIT  = 1.50            # исторический ключ
-MIN_NET_ABS_USD = 1.50            # минимум после комиссий — по твоей просьбе
+MIN_NET_PROFIT  = 1.50
+MIN_NET_ABS_USD = 1.50      # ← гарантированный минимум net в $ после комиссий
 
 SLIP_BUFFER     = 0.006
 PROFIT_ONLY     = True
 
-# --- объёмы (смягчено) ---
+# --- ДОП. ФИЛЬТРЫ (ослаблены, можно выключить) ---
 USE_VOLUME_FILTER   = True
 VOL_MA_WINDOW       = 20
-VOL_FACTOR_MIN      = 0.4          # было 0.7
-MIN_CANDLE_NOTIONAL = 15.0         # было 50
+VOL_FACTOR_MIN      = 0.40     # было 0.70 → 0.40 (мягче)
+MIN_CANDLE_NOTIONAL = 20.0     # было 50 → 20$
 
-# --- стакан (смягчено) ---
+# Умный байпас объёма: если подряд N блокировок по символу — разрешить 1 маленький вход
+VOL_BLOCK_SERIES_MAX = 6       # после 6 блокировок подряд
+BYPASS_SLOT_USDT     = 8.0     # размер «малого» слота при байпасе
+_bypass_counters = {s: 0 for s in SYMBOLS}
+
 USE_ORDERBOOK_GUARD = True
 OB_LIMIT_DEPTH      = 25
-MAX_SPREAD_BP_STRICT= 15           # для первого входа
-MAX_IMPACT_BP_STRICT= 40
-MAX_SPREAD_BP_SOFT  = 35           # для усреднений
-MAX_IMPACT_BP_SOFT  = 80
+MAX_SPREAD_BP       = 25       # было 15 → 25 б.п. (0.25%) — мягче
+MAX_IMPACT_BP       = 35       # было 20 → 35 б.п. (0.35%) — мягче
 
 INTERVAL = "1"
 STATE_FILE = "state.json"
@@ -100,7 +104,7 @@ LAST_REPORT_DATE = None
 _last_err_ts = 0.0
 _wallet_cache = {"ts": 0.0, "coins": None}
 
-def _state_key(): return "bybit_spot_state_v3_ob_partial"
+def _state_key(): return "bybit_spot_state_v3_ob_soft"
 def _save_state():
     s = json.dumps(STATE, ensure_ascii=False)
     try:
@@ -136,7 +140,7 @@ def init_state():
         })
     _save_state()
 
-# ============ HELPERS ============
+# ============ BYBIT HELPERS ============
 def _safe_call(func, *args, **kwargs):
     delay = REQUEST_BACKOFF
     while True:
@@ -205,36 +209,56 @@ def signal(df):
         return "sell", float(atr), info
     return "none", float(atr), info
 
-# ---- Volume filter ----
-def volume_ok(df, *, for_average: bool) -> bool:
-    if not USE_VOLUME_FILTER: return True
-    if for_average:           # не мешаем усреднениям
+# ---- Volume filter & bypass ----
+def _volume_pass(df, sym: str) -> bool:
+    if not USE_VOLUME_FILTER: 
+        _bypass_counters[sym] = 0
         return True
-    if len(df) < max(VOL_MA_WINDOW, 20): return True
-    vol_ma = df["vol"].rolling(VOL_MA_WINDOW).mean().iloc[-2]  # по закрытой
+    if len(df) < max(VOL_MA_WINDOW, 20):
+        _bypass_counters[sym] = 0
+        return True
+
+    vol_ma = df["vol"].rolling(VOL_MA_WINDOW).mean().iloc[-2]
     last_vol = df["vol"].iloc[-1]
     last_close = df["c"].iloc[-1]
     notional = last_vol * last_close
-    if pd.isna(vol_ma): return True
-    if last_vol < VOL_FACTOR_MIN * vol_ma:
-        logging.info("⏸ Volume guard: last_vol<%.1f*MA" % VOL_FACTOR_MIN)
-        return False
-    if notional < MIN_CANDLE_NOTIONAL:
-        logging.info(f"⏸ Volume guard: notional {notional:.2f} < ${MIN_CANDLE_NOTIONAL:.2f}")
-        return False
-    return True
+
+    ok = True
+    reason = ""
+    if pd.isna(vol_ma):
+        ok = True
+    elif last_vol < VOL_FACTOR_MIN * vol_ma:
+        ok = False; reason = f"last_vol<{VOL_FACTOR_MIN}*MA"
+    elif notional < MIN_CANDLE_NOTIONAL:
+        ok = False; reason = f"notional {notional:.2f} < ${MIN_CANDLE_NOTIONAL:.2f}"
+
+    if ok:
+        if _bypass_counters[sym] > 0:
+            logging.info(f"[{sym}] ▶ Volume guard reset (series was {_bypass_counters[sym]})")
+        _bypass_counters[sym] = 0
+        return True
+
+    _bypass_counters[sym] += 1
+    logging.info(f"[{sym}] ⏸ Volume guard: {reason} | series={_bypass_counters[sym]}")
+    return False
+
+def allow_volume_bypass(sym: str) -> bool:
+    if not USE_VOLUME_FILTER: return False
+    if _bypass_counters.get(sym, 0) >= VOL_BLOCK_SERIES_MAX:
+        logging.info(f"[{sym}] ✅ Volume BYPASS: series={_bypass_counters[sym]} >= {VOL_BLOCK_SERIES_MAX}")
+        _bypass_counters[sym] = 0
+        return True
+    return False
 
 # ---- Orderbook guard ----
-def orderbook_ok(sym: str, side: str, qty_base: float, ref_price: float, *, soft=False) -> bool:
+def orderbook_ok(sym: str, side: str, qty_base: float, ref_price: float) -> bool:
     if not USE_ORDERBOOK_GUARD: return True
     try:
         ob = _safe_call(session.get_orderbook, category="spot", symbol=sym, limit=OB_LIMIT_DEPTH)["result"]
         best_ask = float(ob["a"][0][0]); best_bid = float(ob["b"][0][0])
         spread = (best_ask - best_bid) / max(best_bid, 1e-12)
-        max_spread = (MAX_SPREAD_BP_SOFT if soft else MAX_SPREAD_BP_STRICT)/10000.0
-        max_impact = (MAX_IMPACT_BP_SOFT if soft else MAX_IMPACT_BP_STRICT)/10000.0
-        if spread > max_spread:
-            logging.info(f"⏸ OB guard: spread {spread*100:.2f}% > {max_spread*100:.2f}%")
+        if spread > MAX_SPREAD_BP/10000.0:
+            logging.info(f"[{sym}] ⏸ OB guard: spread {spread*100:.2f}% > {MAX_SPREAD_BP/100:.2f}%")
             return False
         if side.lower() == "buy":
             need = qty_base; cost = 0.0
@@ -243,22 +267,32 @@ def orderbook_ok(sym: str, side: str, qty_base: float, ref_price: float, *, soft
                 take = min(need, q); cost += take * px; need -= take
                 if need <= 1e-15: break
             if need > 0:
-                logging.info("⏸ OB guard: shallow depth for buy")
+                logging.info(f"[{sym}] ⏸ OB guard: shallow depth for buy")
                 return False
             vwap = cost/qty_base
             impact = (vwap - ref_price)/max(ref_price, 1e-12)
-            if impact > max_impact:
-                logging.info(f"⏸ OB guard: impact {impact*100:.2f}% > {max_impact*100:.2f}%")
+            if impact > MAX_IMPACT_BP/10000.0:
+                logging.info(f"[{sym}] ⏸ OB guard: impact {impact*100:.2f}% > {MAX_IMPACT_BP/100:.2f}%")
                 return False
         return True
     except Exception as e:
-        logging.info(f"orderbook check error: {e}")
-        return True  # на ошибках сети не блокируем
+        logging.info(f"[{sym}] orderbook check error: {e} (skip guard)")
+        return True
 
 # ============ QTY / GUARD ============
 def budget_qty(sym: str, price: float, avail_usdt: float) -> float:
     if sym not in LIMITS: return 0.0
     lm = LIMITS[sym]; budget = min(avail_usdt, MAX_TRADE_USDT)
+    if budget <= 0: return 0.0
+    q = round_step(budget / price, lm["qty_step"])
+    if q < lm["min_qty"] or q*price < lm["min_amt"]: return 0.0
+    return q
+
+def budget_qty_bypass(sym: str, price: float, avail_usdt: float) -> float:
+    """Малый слот для volume-bypass."""
+    if sym not in LIMITS: return 0.0
+    lm = LIMITS[sym]
+    budget = min(avail_usdt, BYPASS_SLOT_USDT)
     if budget <= 0: return 0.0
     q = round_step(budget / price, lm["qty_step"])
     if q < lm["min_qty"] or q*price < lm["min_amt"]: return 0.0
@@ -276,17 +310,6 @@ def can_place_sell(sym: str, q_net: float, price: float, coin_bal_now: float) ->
     lm = LIMITS[sym]
     if q_net < lm["min_qty"] or q_net*price < lm["min_amt"]: return False
     return q_net <= coin_bal_now + 1e-12
-
-# сколько НЕТ‑количества нужно продать, чтобы получить net>=target_usd
-def qty_for_min_net(buy_price: float, price: float, target_usd: float, step: float) -> float:
-    # net per 1 (net) = price*(1-fee) - buy_price/(1-fee)
-    per_unit = price*(1-TAKER_FEE) - buy_price/(1-TAKER_FEE)
-    if per_unit <= 0: return 0.0
-    q = target_usd / per_unit
-    # округляем вверх к шагу
-    mul = 1/step if step>0 else 1.0
-    q = math.ceil(q*mul)/mul
-    return q
 
 # ============ PNL ============
 def append_pos(sym, price, qty_gross, tp):
@@ -361,6 +384,7 @@ def restore_positions():
 
 # ============ ORDER HELPERS ============
 def _attempt_buy(sym: str, qty_base: float) -> bool:
+    """Маркет BUY количеством базовой монеты (marketUnit="baseCoin")."""
     lm = LIMITS[sym]
     qty = round_step(qty_base, lm["qty_step"])
     tries = 4
@@ -429,7 +453,7 @@ def trade_cycle():
                 dd = (avg_entry - price)/avg_entry
                 if dd > state["max_drawdown"]: state["max_drawdown"] = dd
 
-            # ===== SELL / TP / SL (profit-only + partial TP) =====
+            # ===== SELL / TP / SL (только profit) =====
             new_pos = []
             for p in state["positions"]:
                 b   = p["buy_price"]
@@ -437,112 +461,83 @@ def trade_cycle():
                 tp  = p["tp"]
                 q_g = p.get("buy_qty_gross", q_n/(1-TAKER_FEE))
 
-                if q_n <= 0:
+                if not can_place_sell(sym, q_n, price, coin_bal):
+                    new_pos.append(p)
+                    logging.info(f"[{sym}] 🔸Hold: нельзя продать — ниже лимитов")
                     continue
 
                 pnl  = net_pnl(price, b, q_n, q_g)
-                need_full = min_net_required(price, q_n)  # требование, если продавать ВСЮ позицию
+                need = min_net_required(price, q_n)
+                ok_to_sell = (pnl >= need) if PROFIT_ONLY else (pnl >= MIN_NET_ABS_USD)
 
-                # сколько (нет) нужно продать, чтобы заработать MIN_NET_ABS_USD
-                q_need_for_1p5 = qty_for_min_net(b, price, MIN_NET_ABS_USD, lm["qty_step"])
-                q_need_for_1p5 = min(q_n, q_need_for_1p5)
-
-                # SL: продаём только если есть положительный net
                 if price <= b*(1-STOP_LOSS_PCT):
-                    # проверяем возможность частичной продажи
-                    if PROFIT_ONLY:
-                        if q_need_for_1p5 > 0 and can_place_sell(sym, q_need_for_1p5, price, coin_bal):
-                            _attempt_sell(sym, q_need_for_1p5)
-                            net1 = net_pnl(price, b, q_need_for_1p5, q_need_for_1p5/(1-TAKER_FEE))
-                            logging.info(f"🟠 SL PART SELL {sym} @ {price:.6f}, qty={q_need_for_1p5:.8f}, netPnL={net1:.2f}")
-                            state["pnl"] += net1
-                            p["qty"] = round_step(q_n - q_need_for_1p5, lm["qty_step"])
-                            coin_bal = coin_balance(get_wallet(True), sym)
-                            if p["qty"] > 0: new_pos.append(p)
-                            continue
-                        else:
-                            logging.info(f"[{sym}] ⏸ Skip SL: нет гарантированного +{MIN_NET_ABS_USD}$")
+                    if ok_to_sell:
+                        _attempt_sell(sym, q_n)
+                        logging.info(f"🟠 SL SELL {sym} @ {price:.6f}, qty={q_n:.8f}, netPnL={pnl:.2f}")
+                        state["pnl"] += pnl
+                        state["last_sell_price"] = price
+                        state["avg_count"] = 0
+                        coins = get_wallet(True); coin_bal = coin_balance(coins, sym)
+                        continue
                     else:
-                        if can_place_sell(sym, q_n, price, coin_bal):
-                            _attempt_sell(sym, q_n)
-                            logging.info(f"🟠 SL SELL {sym} @ {price:.6f}, qty={q_n:.8f}, netPnL={pnl:.2f}")
-                            state["pnl"] += pnl
-                            state["avg_count"] = 0
-                            coin_bal = coin_balance(get_wallet(True), sym)
-                            continue
+                        logging.info(f"[{sym}] ⏸ Skip SL: netPnL={pnl:.2f} < need={need:.2f}")
 
-                # TP: если вся позиция даёт нужный net — продаём полностью
-                if pnl >= need_full and can_place_sell(sym, q_n, price, coin_bal):
+                if price >= tp and ok_to_sell:
                     _attempt_sell(sym, q_n)
                     logging.info(f"✅ TP SELL {sym} @ {price:.6f}, qty={q_n:.8f}, netPnL={pnl:.2f}")
                     state["pnl"] += pnl
                     state["last_sell_price"] = price
                     state["avg_count"] = 0
-                    coin_bal = coin_balance(get_wallet(True), sym)
+                    coins = get_wallet(True); coin_bal = coin_balance(coins, sym)
                 else:
-                    # пробуем частичный TP на $1.5 net
-                    if PROFIT_ONLY and q_need_for_1p5 > 0 and can_place_sell(sym, q_need_for_1p5, price, coin_bal):
-                        _attempt_sell(sym, q_need_for_1p5)
-                        net1 = net_pnl(price, b, q_need_for_1p5, q_need_for_1p5/(1-TAKER_FEE))
-                        logging.info(f"✅ PART TP {sym} @ {price:.6f}, qty={q_need_for_1p5:.8f}, netPnL={net1:.2f}")
-                        state["pnl"] += net1
-                        p["qty"] = round_step(q_n - q_need_for_1p5, lm["qty_step"])
-                        coin_bal = coin_balance(get_wallet(True), sym)
-                        if p["qty"] > 0:
-                            # обновим трейлинг
-                            new_tp = max(tp, price + TRAIL_MULTIPLIER*atr)
-                            p["tp"] = new_tp
-                            new_pos.append(p)
-                    else:
-                        # обновляем трейлинг
-                        new_tp = max(tp, price + TRAIL_MULTIPLIER*atr)
-                        if new_tp != tp:
-                            logging.info(f"[{sym}] 📈 Trail TP: {tp:.6f} → {new_tp:.6f}")
-                        p["tp"] = new_tp
-                        new_pos.append(p)
-
+                    new_tp = max(tp, price + TRAIL_MULTIPLIER*atr)
+                    if new_tp != tp:
+                        logging.info(f"[{sym}] 📈 Trail TP: {tp:.6f} → {new_tp:.6f}")
+                    p["tp"] = new_tp
+                    new_pos.append(p)
             state["positions"] = new_pos
 
             # ===== BUY / AVERAGE =====
-            if sig == "buy":
-                # усреднение — объёмный фильтр НЕ мешает, стакан — soft
+            vol_pass = _volume_pass(df, sym)
+            if sig == "buy" and (vol_pass or allow_volume_bypass(sym)):
+                # выбор размера слота: обычный или мелкий (при байпасе)
+                use_bypass_size = not vol_pass and USE_VOLUME_FILTER
                 if state["positions"] and state["avg_count"] < MAX_AVERAGES:
                     total_q = sum(x["qty"] for x in state["positions"])
-                    avg_price = sum(x["qty"]*x["buy_price"] for x in state["positions"]) / total_q
+                    avg_price = sum(x["qty"]*x["buy_price"] for x in state["positions"]) / max(total_q, 1e-12)
                     dd = (price - avg_price)/avg_price
                     if dd < 0 and abs(dd) <= MAX_DRAWDOWN:
-                        q_gross = budget_qty(sym, price, avail)
-                        if q_gross > 0 and orderbook_ok(sym, "buy", q_gross, price, soft=True) and can_place_buy(sym, q_gross, price, usdt):
+                        q_gross = (budget_qty_bypass if use_bypass_size else budget_qty)(sym, price, avail)
+                        if q_gross > 0 and orderbook_ok(sym, "buy", q_gross, price) and can_place_buy(sym, q_gross, price, usdt):
                             if _attempt_buy(sym, q_gross):
                                 tp = price + TRAIL_MULTIPLIER*atr
                                 append_pos(sym, price, q_gross, tp)
                                 state["count"] += 1; state["avg_count"] += 1
-                                send_tg(f"🟢 BUY(avg) {sym} @ {price:.6f}, qty_net={q_gross*(1-TAKER_FEE):.8f} | dd={dd:.4f}")
+                                logging.info(f"[{sym}] 🟢 BUY(avg){' (bypass)' if use_bypass_size else ''} @ {price:.6f}, "
+                                             f"qty_net={q_gross*(1-TAKER_FEE):.8f}")
                                 coins = get_wallet(True); usdt = usdt_balance(coins); avail = max(0.0, usdt-RESERVE_BALANCE)
                         else:
                             logging.info(f"[{sym}] ❌ Skip avg: бюджет/лимиты/OB/баланс")
                     else:
                         logging.info(f"[{sym}] 🔸Skip avg: dd={dd:.4f} вне (-{MAX_DRAWDOWN:.2f})")
-                # первый вход — объёмный фильтр ДЕЙСТВУЕТ, стакан strict
                 elif not state["positions"]:
-                    if not volume_ok(df, for_average=False):
-                        logging.info(f"[{sym}] ⏸ Skip buy: volume guard")
-                    elif state["last_sell_price"] and abs(price - state["last_sell_price"])/price < 0.003:
+                    if state["last_sell_price"] and abs(price - state["last_sell_price"])/price < 0.003:
                         logging.info(f"[{sym}] 🔸Skip buy: близко к последней продаже")
                     else:
-                        q_gross = budget_qty(sym, price, avail)
-                        if q_gross > 0 and orderbook_ok(sym, "buy", q_gross, price, soft=False) and can_place_buy(sym, q_gross, price, usdt):
+                        q_gross = (budget_qty_bypass if use_bypass_size else budget_qty)(sym, price, avail)
+                        if q_gross > 0 and orderbook_ok(sym, "buy", q_gross, price) and can_place_buy(sym, q_gross, price, usdt):
                             if _attempt_buy(sym, q_gross):
                                 tp = price + TRAIL_MULTIPLIER*atr
                                 append_pos(sym, price, q_gross, tp)
                                 state["count"] += 1
-                                send_tg(f"🟢 BUY {sym} @ {price:.6f}, qty_net={q_gross*(1-TAKER_FEE):.8f}")
+                                logging.info(f"[{sym}] 🟢 BUY{' (bypass)' if use_bypass_size else ''} @ {price:.6f}, "
+                                             f"qty_net={q_gross*(1-TAKER_FEE):.8f}")
                                 coins = get_wallet(True); usdt = usdt_balance(coins); avail = max(0.0, usdt-RESERVE_BALANCE)
                         else:
                             logging.info(f"[{sym}] ❌ Skip buy: бюджет/лимиты/OB/баланс")
             else:
                 if not state["positions"]:
-                    logging.info(f"[{sym}] 🔸No buy: signal={sig}")
+                    logging.info(f"[{sym}] 🔸No buy: signal={sig} (vol_pass={vol_pass})")
 
         except Exception as e:
             tb = traceback.format_exc(limit=2)
@@ -554,25 +549,25 @@ def trade_cycle():
 
     _save_state()
 
-    # daily report, 1 раз в день после DAILY_REPORT_MINUTE
+    # Daily report (фикс опечатки)
     now = datetime.datetime.now()
-    if (now.hour == DAILY_REPORT_HOUR and
-        now.minute >= DAILY_REPORT_MINUTE and
-        (LAST_REPORT_DATE is None or LAST_REPORT_DATE != now.date())):
+    global LAST_REPORT_DATE
+    if now.hour == DAILY_REPORT_HOUR and now.minute >= DAILY_REPORT_MINUTE and LAST_REPORT_DATE != now.date():
         daily_report()
-        globals()['LAST_REPORT_DATE'] = now.date()
+        LAST_REPORT_DATE = now.date()
 
 # ============ RUN ============
 if __name__ == "__main__":
-    log_event("🚀 Bot starting (v3.redis + softer volume/OB + partial TP; net>=1.5)")
+    log_event("🚀 Bot starting (v3.redis + soft volume/orderbook guards; net>=1.5)")
     init_state()
     load_symbol_limits()
     restore_positions()
     send_tg(f"⚙️ Params: TAKER={TAKER_FEE}, MAX_TRADE={MAX_TRADE_USDT}, "
             f"TRAILx={TRAIL_MULTIPLIER}, SL={STOP_LOSS_PCT*100:.1f}%, DD={MAX_DRAWDOWN*100:.0f}%, "
-            f"ProfitOnly={PROFIT_ONLY}, Redis={'ON' if rds else 'OFF'}, "
-            f"VolFilter={'ON' if USE_VOLUME_FILTER else 'OFF'}({VOL_FACTOR_MIN}×MA/${MIN_CANDLE_NOTIONAL}), "
-            f"OBGuard={'ON' if USE_ORDERBOOK_GUARD else 'OFF'}, MinNet=${MIN_NET_ABS_USD}")
+            f"ProfitOnly={PROFIT_ONLY}, Redis={'ON' if rds else 'OFF'}, SlipBuf={SLIP_BUFFER*100:.2f}%, "
+            f"Vol={'ON' if USE_VOLUME_FILTER else 'OFF'}({VOL_FACTOR_MIN}*MA/${MIN_CANDLE_NOTIONAL}), "
+            f"OB={'ON' if USE_ORDERBOOK_GUARD else 'OFF'}(spr {MAX_SPREAD_BP}bp, imp {MAX_IMPACT_BP}bp), "
+            f"BYPASS series={VOL_BLOCK_SERIES_MAX} slot=${BYPASS_SLOT_USDT}, MinNet=${MIN_NET_ABS_USD}")
 
     while True:
         try:
