@@ -1,9 +1,8 @@
 # -*- coding: utf-8 -*-
-# One-off seeder for BTC position into bot's state (Redis + state.json)
+# One-off BTC seeder -> пишет позицию в Redis + state.json в формате бота
 
-import os, json, math, argparse, logging, traceback
+import os, json, math, logging, traceback, requests
 from dotenv import load_dotenv
-import requests
 from pybit.unified_trading import HTTP
 import pandas as pd
 from ta.volatility import AverageTrueRange
@@ -17,17 +16,17 @@ CHAT_ID    = os.getenv("CHAT_ID") or ""
 REDIS_URL  = os.getenv("REDIS_URL") or ""
 STATE_FILE = "state.json"
 
-# те же параметры, что в боте
-TAKER_FEE = 0.0018
+# === ДАННЫЕ СО СКРИНА (жёстко) ===
+SYMBOL     = "BTCUSDT"
+QTY_GROSS  = 0.06296745        # баланс кошелька BTC
+AVG_PRICE  = 121472.27         # средняя/спот цена входа (USD за 1 BTC)
+
+# === Параметры как в боте ===
+TAKER_FEE        = 0.0018
 TRAIL_MULTIPLIER = 1.5
-INTERVAL = "1"  # 1m kline
+INTERVAL         = "1"         # 1m для ATR
 
-# --- FALLBACK DEFAULTS (твои текущие) ---
-FALLBACK_SYMBOL = os.getenv("SEED_SYMBOL", "BTCUSDT")
-FALLBACK_QTY    = float(os.getenv("SEED_BTC_QTY", 0.06296745))
-FALLBACK_AVG    = float(os.getenv("SEED_BTC_AVG", 121472.27))
-
-# Redis
+# Redis (если есть)
 try:
     import redis
     rds = redis.from_url(REDIS_URL, decode_responses=True) if REDIS_URL else None
@@ -42,14 +41,18 @@ def send_tg(msg: str):
     except Exception as e:
         logging.error(f"TG send failed: {e}")
 
-def state_key(): return "bybit_spot_state_v3_ob"
+def state_key():
+    return "bybit_spot_state_v3_ob"   # тот же ключ, что у бота
 
 def load_state():
+    # 1) Redis
     if rds:
         try:
             raw = rds.get(state_key())
             if raw: return json.loads(raw)
-        except Exception: pass
+        except Exception:
+            pass
+    # 2) файл
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
@@ -59,10 +62,13 @@ def load_state():
 def save_state(state: dict):
     raw = json.dumps(state, ensure_ascii=False)
     if rds:
-        try: rds.set(state_key(), raw)
-        except Exception as e: logging.error(f"Redis save error: {e}")
+        try:
+            rds.set(state_key(), raw)
+        except Exception as e:
+            logging.error(f"Redis save error: {e}")
     try:
-        with open(STATE_FILE, "w", encoding="utf-8") as f: f.write(raw)
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            f.write(raw)
     except Exception as e:
         logging.error(f"File save error: {e}")
 
@@ -82,11 +88,11 @@ def fetch_limits(session: HTTP, symbol: str):
         if it.get("symbol") == symbol:
             f = it.get("lotSizeFilter", {})
             return {
-                "min_qty": float(f.get("minOrderQty", 0.0)),
-                "qty_step": float(f.get("qtyStep", 1.0)),
-                "min_amt": float(it.get("minOrderAmt", 10.0)),
+                "min_qty":  float(f.get("minOrderQty", 0.0)),
+                "qty_step": float(f.get("qtyStep",     1.0)),
+                "min_amt":  float(it.get("minOrderAmt",10.0)),
             }
-    return {"min_qty": 0.0, "qty_step": 1.0, "min_amt": 10.0}
+    return {"min_qty":0.0, "qty_step":1.0, "min_amt":10.0}
 
 def fetch_atr(session: HTTP, symbol: str) -> float:
     r = session.get_kline(category="spot", symbol=symbol, interval=INTERVAL, limit=100)
@@ -96,66 +102,51 @@ def fetch_atr(session: HTTP, symbol: str) -> float:
     atr = AverageTrueRange(df["h"], df["l"], df["c"], 14).average_true_range().iloc[-1]
     return float(atr)
 
-def resolve_inputs():
-    parser = argparse.ArgumentParser(description="Seed single position into bot state")
-    parser.add_argument("--symbol", help="e.g. BTCUSDT")
-    parser.add_argument("--qty", type=float, help="gross/base qty on wallet (e.g. 0.06296745)")
-    parser.add_argument("--avg", type=float, help="average entry price in USDT")
-    parser.add_argument("--fee", type=float, default=float(os.getenv("TAKER_FEE", TAKER_FEE)))
-    parser.add_argument("--trailx", type=float, default=float(os.getenv("TRAIL_MULTIPLIER", TRAIL_MULTIPLIER)))
-    args = parser.parse_args()
-
-    symbol = (args.symbol or os.getenv("SEED_SYMBOL") or FALLBACK_SYMBOL).upper()
-    qty_gross = args.qty if args.qty is not None else \
-                (float(os.getenv("SEED_BTC_QTY")) if os.getenv("SEED_BTC_QTY") else FALLBACK_QTY)
-    buy_price = args.avg if args.avg is not None else \
-                (float(os.getenv("SEED_BTC_AVG")) if os.getenv("SEED_BTC_AVG") else FALLBACK_AVG)
-    return symbol, float(qty_gross), float(buy_price), float(args.fee), float(args.trailx)
-
 def main():
-    symbol, qty_gross, buy_price, taker, trailx = resolve_inputs()
-    if qty_gross <= 0 or buy_price <= 0:
-        raise SystemExit(f"qty/avg must be > 0; got qty={qty_gross}, avg={buy_price}")
+    if QTY_GROSS <= 0 or AVG_PRICE <= 0:
+        raise SystemExit("Неверные константы QTY_GROSS/AVG_PRICE")
 
     session = HTTP(api_key=API_KEY, api_secret=API_SECRET, recv_window=15000)
 
-    limits = fetch_limits(session, symbol)
+    limits = fetch_limits(session, SYMBOL)
     qty_step = limits["qty_step"]; min_qty = limits["min_qty"]
 
-    qty_gross = round_step(qty_gross, qty_step)
+    qty_gross = round_step(QTY_GROSS, qty_step)
     if qty_gross < max(min_qty, 1e-12):
         raise SystemExit(f"Provided qty {qty_gross} < min_qty {min_qty}")
 
-    qty_net = qty_gross * (1.0 - taker)
+    qty_net = qty_gross * (1.0 - TAKER_FEE)
 
-    try: atr = fetch_atr(session, symbol)
-    except Exception: atr = 0.0
-    tp = buy_price + trailx * (atr if atr > 0 else max(1e-6, buy_price * 0.001))
+    try:
+        atr = fetch_atr(session, SYMBOL)
+    except Exception:
+        atr = 0.0
+
+    tp = AVG_PRICE + TRAIL_MULTIPLIER * (atr if atr > 0 else max(1e-6, AVG_PRICE * 0.001))
 
     state = load_state()
-    state.setdefault(symbol, {
+    state.setdefault(SYMBOL, {
         "positions": [],
         "pnl": 0.0, "count": 0, "avg_count": 0,
         "last_sell_price": 0.0, "max_drawdown": 0.0
     })
-    state[symbol]["positions"] = [{
-        "buy_price": buy_price,
+
+    state[SYMBOL]["positions"] = [{
+        "buy_price": AVG_PRICE,
         "qty": qty_net,
         "buy_qty_gross": qty_gross,
         "tp": tp
     }]
-    state[symbol]["avg_count"] = 0
-    state[symbol]["last_sell_price"] = 0.0
-    state[symbol]["max_drawdown"] = 0.0
+    state[SYMBOL]["avg_count"] = 0
+    state[SYMBOL]["last_sell_price"] = 0.0
+    state[SYMBOL]["max_drawdown"] = 0.0
 
     save_state(state)
 
-    msg = (
-        f"♻️ Seeded position\n"
-        f"{symbol}: qty_gross={qty_gross:.8f}, qty_net={qty_net:.8f}\n"
-        f"avg={buy_price:.2f}, start TP={tp:.2f} (ATR-based)\n"
-        f"fee={taker:.4f}, trailx={trailx}"
-    )
+    msg = (f"♻️ Seeded BTC position\n"
+           f"{SYMBOL}: qty_gross={qty_gross:.8f}, qty_net={qty_net:.8f}\n"
+           f"avg={AVG_PRICE:.2f}, start TP={tp:.2f} (ATR-based)\n"
+           f"fee={TAKER_FEE:.4f}, trailx={TRAIL_MULTIPLIER}")
     print(msg); send_tg(msg)
 
 if __name__ == "__main__":
@@ -165,4 +156,5 @@ if __name__ == "__main__":
     except SystemExit as e:
         print(e)
     except Exception as e:
-        print("ERROR:", e); print(traceback.format_exc())
+        print("ERROR:", e)
+        print(traceback.format_exc())
