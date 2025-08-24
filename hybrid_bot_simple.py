@@ -1,40 +1,33 @@
 # -*- coding: utf-8 -*-
 # One-off seeder for a spot position into the bot's state (Redis + state.json)
-# Совместим с твоим форматом состояния: ключ bybit_spot_state_v3_ob, поля positions/qty/tp/…
-# Аккуратно работает с Decimal и "кривыми" лимитами Bybit unified.
+# Совместим с форматом состояния вашего бота (ключ Redis: bybit_spot_state_v3_ob)
 
-import os, json, argparse, logging, traceback
-from decimal import Decimal, ROUND_DOWN, InvalidOperation, getcontext
-
+import os, json, math, argparse, logging, traceback, decimal, re
+from decimal import Decimal, ROUND_DOWN
 from dotenv import load_dotenv
 import requests
 import pandas as pd
-from pybit.unified_trading import HTTP
+
 from ta.volatility import AverageTrueRange
+from pybit.unified_trading import HTTP
 
-# --------------------------------------------------------------------------
-# Настройка точности Decimal
-getcontext().prec = 28
-getcontext().rounding = ROUND_DOWN
-D = Decimal
-
-# --------------------------------------------------------------------------
 load_dotenv()
 
-API_KEY    = os.getenv("BYBIT_API_KEY") or ""
-API_SECRET = os.getenv("BYBIT_API_SECRET") or ""
-TG_TOKEN   = os.getenv("TG_TOKEN") or ""
-CHAT_ID    = os.getenv("CHAT_ID") or ""
-REDIS_URL  = os.getenv("REDIS_URL") or ""
-STATE_FILE = os.getenv("STATE_FILE", "state.json")
+# === ENV ===
+API_KEY     = os.getenv("BYBIT_API_KEY", "")
+API_SECRET  = os.getenv("BYBIT_API_SECRET", "")
+TG_TOKEN    = os.getenv("TG_TOKEN", "")
+CHAT_ID     = os.getenv("CHAT_ID", "")
+REDIS_URL   = os.getenv("REDIS_URL", "")
+STATE_FILE  = "state.json"
 
-# те же параметры, что использует бот (можно переопределить из .env)
-TAKER_FEE       = D(os.getenv("TAKER_FEE", "0.0018"))
-TRAIL_MULTIPLIER= D(os.getenv("TRAIL_MULTIPLIER", "1.5"))
-INTERVAL        = os.getenv("INTERVAL", "1")   # 1m для ATR
+# Базовые параметры как в боте
+DEFAULT_TAKER_FEE    = float(os.getenv("TAKER_FEE", "0.0018"))
+DEFAULT_TRAILX       = float(os.getenv("TRAIL_MULTIPLIER", "1.5"))
+INTERVAL             = "1"   # 1m kline
+STATE_KEY            = "bybit_spot_state_v3_ob"
 
-# --------------------------------------------------------------------------
-# Redis (если есть)
+# --- Redis (если доступен) ---
 try:
     import redis
     rds = redis.from_url(REDIS_URL, decode_responses=True) if REDIS_URL else None
@@ -42,7 +35,7 @@ except Exception:
     rds = None
 
 def send_tg(msg: str):
-    if not TG_TOKEN or not CHAT_ID: 
+    if not TG_TOKEN or not CHAT_ID:
         return
     try:
         requests.post(
@@ -52,20 +45,14 @@ def send_tg(msg: str):
     except Exception as e:
         logging.error(f"TG send failed: {e}")
 
-def state_key() -> str:
-    # тот же ключ, что у бота
-    return "bybit_spot_state_v3_ob"
-
 def load_state() -> dict:
-    # 1) Redis
     if rds:
         try:
-            raw = rds.get(state_key())
+            raw = rds.get(STATE_KEY)
             if raw:
                 return json.loads(raw)
         except Exception:
             pass
-    # 2) файл
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
@@ -74,191 +61,157 @@ def load_state() -> dict:
 
 def save_state(state: dict):
     raw = json.dumps(state, ensure_ascii=False)
-    # Redis
     if rds:
         try:
-            rds.set(state_key(), raw)
+            rds.set(STATE_KEY, raw)
         except Exception as e:
             logging.error(f"Redis save error: {e}")
-    # file
     try:
         with open(STATE_FILE, "w", encoding="utf-8") as f:
             f.write(raw)
     except Exception as e:
         logging.error(f"File save error: {e}")
 
-# --------------------------------------------------------------------------
-# Безопасный парсер Decimal
-def Dsafe(x, default="0"):
-    try:
-        return D(str(x))
-    except (InvalidOperation, TypeError):
-        return D(default)
+# --- утилиты чисел ---
+def _to_decimal(x) -> Decimal:
+    if isinstance(x, Decimal):
+        return x
+    if isinstance(x, (float, int)):
+        return Decimal(str(x))
+    s = str(x).strip().replace(",", ".")
+    # удалить пробелы в числе и скрытые символы
+    s = re.sub(r"[^\d\.\-eE]", "", s)
+    return Decimal(s)
 
-# Определяем минимальный «разумный» шаг количества
-def choose_step(min_qty: D, qty_step: D, base_prec: D) -> D:
-    """
-    Бывает, что Bybit unified возвращает qty_step=1 (или вообще некорректно).
-    Логика:
-      1) если qty_step > 0 и qty_step < 1  -> используем qty_step
-      2) иначе, если base_prec > 0 -> берём шаг = 10^(-base_prec)
-      3) иначе, если min_qty > 0 -> берём шаг = ближайший порядок min_qty (<= min_qty)
-      4) иначе fallback = 1e-6
-    """
-    if qty_step is None or qty_step <= 0:
-        qty_step = D("0")
-    if min_qty is None or min_qty <= 0:
-        min_qty = D("0")
-    if base_prec is None or base_prec < 0:
-        base_prec = D("0")
+def _count_decimals(d: Decimal) -> int:
+    tup = d.normalize().as_tuple()
+    return max(0, -tup.exponent)
 
-    if qty_step > 0 and qty_step < 1:
-        return qty_step
-
-    if base_prec > 0:
-        # base_prec – это количество знаков после запятой
-        # если прислали десятичное, округляем до целого
-        try:
-            bp = int(base_prec)
-            if bp > 0:
-                return D("1") / (D("10") ** bp)
-        except Exception:
-            pass
-
-    if min_qty > 0:
-        # берём порядок min_qty
-        # например, 0.000011 -> шаг 0.000001
-        s = format(min_qty, 'f').rstrip('0')
-        if '.' in s:
-            decimals = len(s.split('.')[1])
-            return D("1") / (D("10") ** decimals)
-        else:
-            # min_qty целое -> шаг 1
-            return D("1")
-
-    # запасной вариант
-    return D("0.000001")
-
-def floor_to_step(qty: D, step: D) -> D:
-    """Обрезаем qty вниз к сетке шага step с Decimal, без сюрпризов."""
-    if step <= 0:
+def _round_down_to_step(qty: Decimal, step: Decimal) -> Decimal:
+    if step == 0:
         return qty
-    return (qty // step) * step
+    # Количество знаков – по step
+    places = _count_decimals(step)
+    scale = Decimal(10) ** places
+    return ( (qty * scale).to_integral_value(rounding=ROUND_DOWN) / scale ).quantize(step, rounding=ROUND_DOWN)
 
-def fetch_limits(session: HTTP, symbol: str):
+# --- Bybit helpers ---
+def fetch_limits(session: HTTP, symbol: str) -> dict:
     """
-    Тянем инструменты и аккуратно читаем:
-      - minOrderQty
-      - qtyStep
-      - basePrecision
-      - minOrderAmt (не обязателен для seed, но покажем в логах)
+    Возвращает min_qty, qty_step, min_amt для символа.
+    На некоторых символах Bybit может отдать qty_step=1.
+    Тогда подхватываем precision из min_qty.
     """
     data = session.get_instruments_info(category="spot")["result"]["list"]
     for it in data:
-        if it.get("symbol") != symbol:
-            continue
-        f = it.get("lotSizeFilter", {}) or {}
-        min_qty   = Dsafe(f.get("minOrderQty"), "0")
-        qty_step  = Dsafe(f.get("qtyStep"), "0")
-        base_prec = Dsafe(it.get("basePrecision"), "0")  # иногда бывает строкой цифры
-        min_amt   = Dsafe(it.get("minOrderAmt"), "0")
-        step = choose_step(min_qty, qty_step, base_prec)
-        return {
-            "min_qty": min_qty,
-            "qty_step_raw": qty_step,
-            "base_precision": base_prec,
-            "min_amt": min_amt,
-            "step": step
-        }
-    # если не нашли символ:
-    return {
-        "min_qty": D("0"),
-        "qty_step_raw": D("0"),
-        "base_precision": D("0"),
-        "min_amt": D("0"),
-        "step": D("0.000001"),
-    }
+        if it.get("symbol") == symbol:
+            f = it.get("lotSizeFilter", {}) or {}
+            min_qty = _to_decimal(f.get("minOrderQty", "0"))
+            qty_step = _to_decimal(f.get("qtyStep", "1"))
+            min_amt = _to_decimal(it.get("minOrderAmt", "10"))
+            # фиксим странный qty_step=1
+            if qty_step == 1:
+                # берём точность по min_qty
+                decs = max( _count_decimals(min_qty), 1 )
+                qty_step = Decimal(1) / (Decimal(10) ** decs)
+            return {
+                "min_qty": min_qty,
+                "qty_step": qty_step,
+                "min_amt": min_amt
+            }
+    # fallback
+    return {"min_qty": Decimal("0"), "qty_step": Decimal("1"), "min_amt": Decimal("10")}
 
-def fetch_atr(session: HTTP, symbol: str) -> D:
-    try:
-        r = session.get_kline(category="spot", symbol=symbol, interval=INTERVAL, limit=100)
-        df = pd.DataFrame(r["result"]["list"], columns=["ts","o","h","l","c","vol","turn"])
-        if df.empty:
-            return D("0")
-        df[["o","h","l","c"]] = df[["o","h","l","c"]].astype(float)
-        atr = AverageTrueRange(df["h"], df["l"], df["c"], 14).average_true_range().iloc[-1]
-        return D(str(atr))
-    except Exception:
-        return D("0")
+def fetch_atr(session: HTTP, symbol: str) -> float:
+    r = session.get_kline(category="spot", symbol=symbol, interval=INTERVAL, limit=100)
+    df = pd.DataFrame(r["result"]["list"], columns=["ts","o","h","l","c","vol","turn"])
+    if df.empty:
+        return 0.0
+    df[["o","h","l","c"]] = df[["o","h","l","c"]].astype(float)
+    atr = AverageTrueRange(df["h"], df["l"], df["c"], 14).average_true_range().iloc[-1]
+    return float(atr)
 
-# --------------------------------------------------------------------------
-def main():
-    parser = argparse.ArgumentParser(description="Seed a single spot position into the bot state (Redis + file)")
-    parser.add_argument("--symbol", default=os.getenv("SEED_SYMBOL", "").strip(), help="e.g. BTCUSDT")
-    parser.add_argument("--qty",    type=str, default=os.getenv("SEED_QTY", "").strip(), help="gross/base qty on wallet (e.g. 0.06296745)")
-    parser.add_argument("--avg",    type=str, default=os.getenv("SEED_AVG", "").strip(), help="average entry price in USDT")
-    parser.add_argument("--fee",    type=str, default=os.getenv("SEED_FEE", str(TAKER_FEE)))
-    parser.add_argument("--trailx", type=str, default=os.getenv("SEED_TRAILX", str(TRAIL_MULTIPLIER)))
-    args = parser.parse_args()
+def parse_inputs_from_env_and_args() -> tuple[str, Decimal, Decimal, float, float]:
+    """
+    Сбор входных параметров:
+      - CLI (--symbol/--qty/--avg/--fee/--trailx)
+      - ENV (SEED_SYMBOL, SEED_QTY, SEED_AVG, SEED_FEE, SEED_TRAILX)
+    Если нет ни там, ни там — подставим ваши btc‑значения со скрина (разовый дефолт).
+    """
+    p = argparse.ArgumentParser(description="Seed single spot position into bot state")
+    p.add_argument("--symbol", type=str, default=os.getenv("SEED_SYMBOL", "").strip())
+    p.add_argument("--qty",    type=str, default=os.getenv("SEED_QTY", "").strip())
+    p.add_argument("--avg",    type=str, default=os.getenv("SEED_AVG", "").strip())
+    p.add_argument("--fee",    type=str, default=os.getenv("SEED_FEE", str(DEFAULT_TAKER_FEE)))
+    p.add_argument("--trailx", type=str, default=os.getenv("SEED_TRAILX", str(DEFAULT_TRAILX)))
+    args = p.parse_args()
 
-    symbol   = (args.symbol or "").upper()
-    qty_raw  = Dsafe(args.qty)
-    avg      = Dsafe(args.avg)
-    taker    = Dsafe(args.fee, str(TAKER_FEE))
-    trailx   = Dsafe(args.trailx, str(TRAIL_MULTIPLIER))
+    symbol = (args.symbol or "").upper()
 
-    # Валидация входов
+    # если символ/кол-во/средняя пустые — используем ваши данные (BTCUSDT)
     if not symbol:
-        raise SystemExit("Missing symbol. Provide --symbol BTCUSDT (или SEED_SYMBOL в .env)")
-    if qty_raw <= 0 or avg <= 0:
-        raise SystemExit("Missing/invalid qty/avg. Используй --qty --avg ИЛИ SEED_QTY/SEED_AVG.")
+        symbol = "BTCUSDT"
+    qty_raw = _to_decimal(args.qty or "0")
+    avg = _to_decimal(args.avg or "0")
+
+    if qty_raw == 0 or avg == 0:
+        # дефолт — ПОД ВАШ СЛУЧАЙ СО СКРИНА
+        qty_raw = _to_decimal("0.06296745")
+        avg     = _to_decimal("121472.27")
+
+    fee = float(str(args.fee).replace(",", "."))
+    trailx = float(str(args.trailx).replace(",", "."))
+
+    logging.info(f"[INPUT] symbol={symbol}, qty(raw)={qty_raw}, avg={avg}, fee={fee}, trailx={trailx}")
+    return symbol, qty_raw, avg, fee, trailx
+
+def main():
+    if not API_KEY or not API_SECRET:
+        raise SystemExit("No BYBIT_API_KEY / BYBIT_API_SECRET in env")
+
+    symbol, qty_raw, buy_price, taker, trailx = parse_inputs_from_env_and_args()
 
     session = HTTP(api_key=API_KEY, api_secret=API_SECRET, recv_window=15000)
 
-    # Лимиты
-    lim = fetch_limits(session, symbol)
-    step     = lim["step"]
-    min_qty  = lim["min_qty"]
-    qty_step_raw = lim["qty_step_raw"]
-    base_prec    = lim["base_precision"]
+    # лимиты и аккуратное округление
+    limits = fetch_limits(session, symbol)
+    min_qty  = limits["min_qty"]
+    qty_step = limits["qty_step"]
 
-    logging.info(f"[LIMITS] {symbol} -> "
-                 f"min_qty={min_qty}, qty_step_raw={qty_step_raw}, base_precision={base_prec}, "
-                 f"chosen_step={step}, min_amt={lim['min_amt']}")
+    logging.info(f"[LIMITS] {symbol} -> {{'min_qty': {min_qty}, 'qty_step': {qty_step}}}")
 
-    # Приводим количество к сетке шага
-    qty_gross = floor_to_step(qty_raw, step)
+    if qty_raw <= 0 or buy_price <= 0:
+        raise SystemExit(f"Invalid qty/avg: qty={qty_raw}, avg={buy_price}")
 
-    if qty_gross <= 0:
-        raise SystemExit(f"Provided qty {qty_raw} -> {qty_gross} (rounded) <= 0. "
-                         f"Check step={step}. Попробуй задать SEED_QTY чуть больше или уменьши шаг вручную.")
+    # округляем к шагу
+    qty_gross = _round_down_to_step(qty_raw, qty_step)
+    if qty_gross < min_qty:
+        raise SystemExit(f"Provided qty {qty_gross} < min_qty {min_qty}")
 
-    if min_qty > 0 and qty_gross < min_qty:
-        raise SystemExit(f"Rounded qty {qty_gross} < min_qty {min_qty}. "
-                         f"Увеличь SEED_QTY или уменьшай шаг (если уверен), см. chosen_step={step}.")
+    # как в боте: сохраняем qty нетто
+    qty_net = (qty_gross * Decimal(str(1 - taker))).quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
 
-    # Пересчёт нетто (как в боте)
-    qty_net = (D("1") - taker) * qty_gross
+    try:
+        atr = fetch_atr(session, symbol)
+    except Exception:
+        atr = 0.0
 
-    # Стартовый TP от ATR
-    atr = fetch_atr(session, symbol)
-    if atr <= 0:
-        # fallback: 0.1% от цены
-        atr = avg * D("0.001")
-    tp  = avg + trailx * atr
+    # стартовый TP вокруг buy_price + trailx*ATR (если ATR нет — небольшой процент)
+    tp = float(buy_price) + trailx * (atr if atr > 0 else float(buy_price) * 0.001)
 
-    # Загружаем и модифицируем состояние
+    # грузим и дополняем состояние
     state = load_state()
     state.setdefault(symbol, {
         "positions": [],
         "pnl": 0.0, "count": 0, "avg_count": 0,
         "last_sell_price": 0.0, "max_drawdown": 0.0
     })
+
     state[symbol]["positions"] = [{
-        "buy_price": float(avg),                 # хранение как float как в твоём коде
-        "qty":       float(qty_net),
+        "buy_price": float(buy_price),
+        "qty": float(qty_net),
         "buy_qty_gross": float(qty_gross),
-        "tp":        float(tp)
+        "tp": float(tp)
     }]
     state[symbol]["avg_count"] = 0
     state[symbol]["last_sell_price"] = 0.0
@@ -266,17 +219,15 @@ def main():
 
     save_state(state)
 
-    # Резюме
     msg = (
         "♻️ Seeded position\n"
-        f"{symbol}: qty_raw={qty_raw} → qty_gross={qty_gross} → qty_net={qty_net}\n"
-        f"avg={avg}, ATR={atr}, start TP={tp}\n"
-        f"step={step}, min_qty={min_qty}, fee={taker}, trailx={trailx}"
+        f"{symbol}: qty_gross={qty_gross}, qty_net={qty_net}\n"
+        f"avg={buy_price}, start TP={Decimal(str(tp)).quantize(Decimal('0.01'))}\n"
+        f"fee={taker}, trailx={trailx}"
     )
     print(msg)
     send_tg(msg)
 
-# --------------------------------------------------------------------------
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
     try:
