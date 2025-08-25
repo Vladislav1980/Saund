@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-Bybit Spot Bot — v3 + NetPnL‑трейлинг + Unified Averaging
+Bybit Spot Bot — v3 + NetPnL‑трейлинг + Unified Averaging + State Comparison
 Сохраняет весь оригинальный функционал, добавляет фиксацию прибыли ≥ $1.5,
 с trailing‑exit при снижении netPnL на ≥ $0.6 от пикового значения,
-усреднение ≤ 2 покупок и объединено в одну позицию.
+усреднение ≤ 2 покупок, объединено в одну позицию, и сравнение позиции до/после усреднения.
 """
 
 import os, time, math, logging, datetime, json, traceback
@@ -48,7 +48,7 @@ MIN_NET_PROFIT = 1.50
 MIN_NET_ABS_USD = 1.50
 
 SLIP_BUFFER = 0.006
-PROFIT_ONLY = False  # продажи с убытком разрешены при SL
+PROFIT_ONLY = False
 
 USE_VOLUME_FILTER = True
 VOL_MA_WINDOW = 20
@@ -78,9 +78,8 @@ REQUEST_BACKOFF = 2.5
 REQUEST_BACKOFF_MAX = 30.0
 TG_ERR_COOLDOWN = 90.0
 
-# Новые параметры NetPnL‑трейлинга
-TRAIL_PNL_TRIGGER = 1.5  # USD, старт трейлинга
-TRAIL_PNL_GAP = 0.6      # USD, падение от пика для фиксации
+TRAIL_PNL_TRIGGER = 1.5
+TRAIL_PNL_GAP = 0.6
 
 logging.basicConfig(
     level=logging.INFO,
@@ -302,7 +301,6 @@ def append_or_update_position(sym, price, qty_gross, tp):
     qty_net = qty_gross * (1 - TAKER_FEE)
     state = STATE[sym]
     if not state["positions"]:
-        # Первая покупка
         state["positions"] = [{
             "buy_price": price,
             "qty": qty_net,
@@ -311,7 +309,6 @@ def append_or_update_position(sym, price, qty_gross, tp):
             "max_pnl": 0.0
         }]
     else:
-        # Усреднение: объединяемувеличиваем позицию, пересчитываем среднюю цену
         p = state["positions"][0]
         total_qty = p["qty"] + qty_net
         new_price = (p["qty"] * p["buy_price"] + qty_net * price) / total_qty
@@ -534,7 +531,7 @@ def trade_cycle():
                         dd_now = max(0.0, (avg_entry - price) / max(avg_entry, 1e-12))
                         state["max_drawdown"] = max(state.get("max_drawdown", 0.0), dd_now)
 
-            # ===== SELL / TP / SL / NetPnL trailing =====
+            # SELL / TP / SL / NetPnL trailing
             new_pos = []
             for p in state["positions"]:
                 b = p["buy_price"]
@@ -557,7 +554,7 @@ def trade_cycle():
                 need = min_net_required(price, sell_cap_q)
                 ok_to_sell = pnl >= need
 
-                # SL
+                # Stop Loss
                 if price <= b * (1 - STOP_LOSS_PCT) and ok_to_sell:
                     _attempt_sell(sym, sell_cap_q)
                     msg = f"🟠 SL SELL {sym} @ {price:.6f}, qty={sell_cap_q:.8f}, netPnL={pnl:.2f}"
@@ -572,7 +569,7 @@ def trade_cycle():
                     coins = get_wallet(True); coin_bal = coin_balance(coins, sym)
                     continue
 
-                # NetPnL trailing logic
+                # NetPnL trailing
                 p["max_pnl"] = max(p.get("max_pnl", 0.0), pnl)
                 if p["max_pnl"] >= TRAIL_PNL_TRIGGER and (p["max_pnl"] - pnl) >= TRAIL_PNL_GAP:
                     _attempt_sell(sym, sell_cap_q)
@@ -588,7 +585,7 @@ def trade_cycle():
                     coins = get_wallet(True); coin_bal = coin_balance(coins, sym)
                     continue
 
-                # Profit sell when ≥ need
+                # Profit sell
                 if ok_to_sell:
                     _attempt_sell(sym, sell_cap_q)
                     msg = f"✅ PROFIT SELL {sym} @ {price:.6f}, qty={sell_cap_q:.8f}, netPnL={pnl:.2f}"
@@ -612,7 +609,7 @@ def trade_cycle():
 
             state["positions"] = new_pos
 
-            # ===== BUY / AVERAGING =====
+            # BUY / AVERAGING with state comparison
             if sig == "buy" and volume_ok(df):
                 if state["positions"] and state["avg_count"] < (MAX_AVERAGES - 1):
                     total_q = sum(x["qty"] for x in state["positions"])
@@ -622,14 +619,16 @@ def trade_cycle():
                         q_gross = budget_qty(sym, price, avail)
                         ob_ok, ob_info = orderbook_ok(sym, "buy", q_gross, price)
                         if q_gross > 0 and ob_ok and can_place_buy(sym, q_gross, price, usdt):
+                            before = json.dumps(state["positions"], indent=2, ensure_ascii=False)
                             if _attempt_buy(sym, q_gross):
-                                tp = price + TRAIL_MULTIPLIER * atr
                                 append_or_update_position(sym, price, q_gross, tp)
+                                after = json.dumps(state["positions"], indent=2, ensure_ascii=False)
                                 state["count"] += 1
                                 state["avg_count"] += 1
                                 qty_net = q_gross * (1 - TAKER_FEE)
                                 msg = f"🟢 BUY(avg) {sym} @ {price:.6f}, qty_net={qty_net:.8f} | dd={dd:.4f}, {ob_info}"
                                 logging.info(msg); tg_event(msg)
+                                tg_event(f"📊 AVG {sym} POSITION UPDATE\nДо:\n{before}\nПосле:\n{after}")
                                 coins = get_wallet(True); usdt = usdt_balance(coins); avail = max(0.0, usdt - RESERVE_BALANCE)
                         else:
                             logging.info(f"[{sym}] ❌ Skip avg: бюджет/лимиты/OB/баланс")
@@ -642,13 +641,15 @@ def trade_cycle():
                         q_gross = budget_qty(sym, price, avail)
                         ob_ok, ob_info = orderbook_ok(sym, "buy", q_gross, price)
                         if q_gross > 0 and ob_ok and can_place_buy(sym, q_gross, price, usdt):
+                            before = json.dumps(state["positions"], indent=2, ensure_ascii=False)
                             if _attempt_buy(sym, q_gross):
-                                tp = price + TRAIL_MULTIPLIER * atr
                                 append_or_update_position(sym, price, q_gross, tp)
+                                after = json.dumps(state["positions"], indent=2, ensure_ascii=False)
                                 state["count"] += 1
                                 qty_net = q_gross * (1 - TAKER_FEE)
                                 msg = f"🟢 BUY {sym} @ {price:.6f}, qty_net={qty_net:.8f} | {ob_info}"
                                 logging.info(msg); tg_event(msg)
+                                tg_event(f"📊 NEW {sym} POSITION\nДо:\n{before}\nПосле:\n{after}")
                                 coins = get_wallet(True); usdt = usdt_balance(coins); avail = max(0.0, usdt - RESERVE_BALANCE)
                         else:
                             logging.info(f"[{sym}] ❌ Skip buy: бюджет/лимиты/OB/баланс")
@@ -671,8 +672,8 @@ def trade_cycle():
         globals()['LAST_REPORT_DATE'] = now.date()
 
 if __name__ == "__main__":
-    logging.info("🚀 Bot starting with NetPnL‑trailing + Unified Averaging")
-    tg_event("🚀 Bot starting with NetPnL‑trailing + Unified Averaging")
+    logging.info("🚀 Bot starting with NetPnL‑trailing + Unified Averaging + State Comparison")
+    tg_event("🚀 Bot starting with NetPnL‑trailing + Unified Averaging + State Comparison")
     init_state()
     load_symbol_limits()
     restore_positions()
