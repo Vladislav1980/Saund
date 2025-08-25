@@ -233,4 +233,4 @@ if __name__ == "__main__":
             if now - _last_err_ts > TG_ERR_COOLDOWN:
                 tg_event(f"Global error: {e}")
                 _last_err_ts = now
-        time.sleep(LOOP_SLEEP)
+        time.sleep(LOOP_SLEEP) 
