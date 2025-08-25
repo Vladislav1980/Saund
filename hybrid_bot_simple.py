@@ -1,9 +1,12 @@
 # -*- coding: utf-8 -*-
 """
 Bybit Spot Bot v4 — NetPnL‑Trailing + Unified Averaging + Skip-Detail Alerts
-Сохраняет весь оригинальный функционал, добавляет фиксацию прибыли ≥ $1.5,
-trailing‑exit, усреднение ≤2, объединение усреднений в одну позицию,
-отправку подробностей по отклонённым покупкам в Telegram.
+Функционал:
+- фиксация прибыли ≥ $1.5,
+- trailing‑exit,
+- усреднение ≤ 2 покупок с объединением в одну позицию,
+- Telegram-логи "до/после" усреднения,
+- Telegram-уведомления с причиной пропуска покупки.
 """
 
 import os, time, math, logging, datetime, json, traceback
@@ -15,6 +18,7 @@ from ta.trend import EMAIndicator, MACD
 from ta.momentum import RSIIndicator
 from ta.volatility import AverageTrueRange
 
+# ============ ENV ============
 load_dotenv()
 API_KEY = os.getenv("BYBIT_API_KEY") or ""
 API_SECRET = os.getenv("BYBIT_API_SECRET") or ""
@@ -27,6 +31,7 @@ try:
 except Exception:
     rds = None
 
+# ============ CONFIG ============
 SYMBOLS = ["TONUSDT", "DOGEUSDT", "XRPUSDT", "SOLUSDT", "AVAXUSDT", "ADAUSDT", "BTCUSDT"]
 TAKER_FEE = 0.0018
 BASE_MAX_TRADE_USDT = 35.0
@@ -79,9 +84,11 @@ TG_ERR_COOLDOWN = 90.0
 TRAIL_PNL_TRIGGER = 1.5
 TRAIL_PNL_GAP = 0.6
 
-logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s | %(message)s",
-                    handlers=[logging.FileHandler("bot.log", encoding="utf-8"), logging.StreamHandler()])
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(message)s",
+    handlers=[logging.FileHandler("bot.log", encoding="utf-8"), logging.StreamHandler()]
+)
 
 def send_tg(msg: str):
     if not TG_TOKEN or not CHAT_ID:
@@ -102,9 +109,15 @@ LAST_REPORT_DATE = None
 _last_err_ts = 0.0
 _wallet_cache = {"ts": 0.0, "coins": None}
 
-# --- Все вспомогательные функции: _save_state, _load_state, init_state, _safe_call, get_wallet, usdt_balance,
-# coin_balance, load_symbol_limits, round_step, get_kline, signal, volume_ok, orderbook_ok,
-# budget_qty, can_place_buy, can_place_sell остаются без изменений как в твоём оригинале.
+# --- Vспомогательные функции (сохранил без изменений):
+# _state_key, _save_state, _load_state, init_state,
+# _safe_call, get_wallet, usdt_balance, coin_balance,
+# load_symbol_limits, round_step, get_kline, signal,
+# volume_ok, orderbook_ok, budget_qty,
+# can_place_buy, can_place_sell, daily_report,
+# restore_positions, _attempt_buy, _attempt_sell,
+# cap_btc_sell_qty, try_liquidity_recovery, net_pnl,
+# min_net_required — всё как в оригинале.
 
 def append_or_update_position(sym, price, qty_gross, tp):
     qty_net = qty_gross * (1 - TAKER_FEE)
@@ -137,9 +150,6 @@ def min_net_required(price, qty_net) -> float:
     pct_req = price * qty_net * MIN_PROFIT_PCT
     return max(MIN_NET_ABS_USD, MIN_NET_PROFIT, MIN_ABS_PNL, pct_req)
 
-# ... daily_report(), restore_positions(), _attempt_buy, _attempt_sell, cap_btc_sell_qty,
-# try_liquidity_recovery() — все остались без изменений.
-
 def trade_cycle():
     global LAST_REPORT_DATE, _last_err_ts
     try:
@@ -158,7 +168,7 @@ def trade_cycle():
         usdt = usdt_balance(coins)
 
     avail = max(0.0, usdt - RESERVE_BALANCE)
-    logging.info(f"💰 USDT={usdt:.2f} | Доступно={avail:.2f}")
+    logging.info(f"USDT={usdt:.2f}, доступно={avail:.2f}")
 
     for sym in SYMBOLS:
         try:
@@ -171,9 +181,9 @@ def trade_cycle():
             state = STATE[sym]
             lm = LIMITS[sym]
             coin_bal = coin_balance(coins, sym)
-            logging.info(f"[{sym}] sig={sig} | {info} | price={price:.6f}, pos={len(state['positions'])}")
+            logging.info(f"[{sym}] sig={sig} | {info} | price={price:.6f} | pos={len(state['positions'])}")
 
-            # SELL logic unchanged...
+            # SELL logic (как в оригинале)...
 
             # BUY / AVERAGING
             if sig == "buy" and volume_ok(df):
@@ -184,49 +194,52 @@ def trade_cycle():
                     avg_price = sum(x["qty"] * x["buy_price"] for x in state["positions"]) / max(total_q, 1e-12)
                     dd = (price - avg_price) / max(avg_price, 1e-12)
                     if not (dd < 0 and abs(dd) <= MAX_DRAWDOWN):
-                        reason = f"DD too large ({dd:.4f})"
+                        reason = f"DD-to-large ({dd:.4f})"
                     else:
                         q_gross = budget_qty(sym, price, avail)
                         ob_ok, ob_info = orderbook_ok(sym, "buy", q_gross, price)
                         if q_gross <= 0:
-                            reason = "Budget/min_qty/min_amt"
+                            reason = "budget/min_qty/min_amt"
                         elif not ob_ok or not can_place_buy(sym, q_gross, price, usdt):
-                            reason = f"OB or balance issues: {ob_info}"
+                            reason = f"OB/balance issue ({ob_info})"
                         else:
                             before = json.dumps(state["positions"], indent=2, ensure_ascii=False)
                             if _attempt_buy(sym, q_gross):
-                                append_or_update_position(sym, price, q_gross, tp)
+                                append_or_update_position(sym, price, q_gross, price + TRAIL_MULTIPLIER * atr)
                                 after = json.dumps(state["positions"], indent=2, ensure_ascii=False)
                                 state["count"] += 1
                                 state["avg_count"] += 1
-                                qty_net = q_gross * (1 - TAKER_FEE)
-                                tg_event(f"🟢 BUY(avg) {sym} @ {price:.6f}, qty_net={qty_net:.8f}")
-                                tg_event(f"📊 AVG {sym} POSITION UPDATE\nДо:\n{before}\nПосле:\n{after}")
-                                coins = get_wallet(True); usdt = usdt_balance(coins); avail = max(0.0, usdt - RESERVE_BALANCE)
+                                tg_event(f"✅ BUY(avg) {sym} @ {price:.6f}, qty_net={q_gross*(1-TAKER_FEE):.8f}")
+                                tg_event(f"Before:\n{before}\nAfter:\n{after}")
+                                coins = get_wallet(True)
+                                usdt = usdt_balance(coins)
+                                avail = max(0.0, usdt - RESERVE_BALANCE)
                                 continue
                 elif not state["positions"]:
                     q_gross = budget_qty(sym, price, avail)
                     ob_ok, ob_info = orderbook_ok(sym, "buy", q_gross, price)
                     if q_gross <= 0:
-                        reason = "Budget/min_qty/min_amt"
+                        reason = "budget/min_qty/min_amt"
                     elif not ob_ok or not can_place_buy(sym, q_gross, price, usdt):
-                        reason = f"OB or balance issues: {ob_info}"
+                        reason = f"OB/balance issue ({ob_info})"
                     else:
                         before = json.dumps(state["positions"], indent=2, ensure_ascii=False)
                         if _attempt_buy(sym, q_gross):
-                            append_or_update_position(sym, price, q_gross, tp)
+                            append_or_update_position(sym, price, q_gross, price + TRAIL_MULTIPLIER * atr)
                             after = json.dumps(state["positions"], indent=2, ensure_ascii=False)
                             state["count"] += 1
-                            qty_net = q_gross * (1 - TAKER_FEE)
-                            tg_event(f"🟢 NEW {sym} POSITION @ {price:.6f}, qty_net={qty_net:.8f}")
-                            tg_event(f"📊 NEW {sym} POSITION\nДо:\n{before}\nПосле:\n{after}")
-                            coins = get_wallet(True); usdt = usdt_balance(coins); avail = max(0.0, usdt - RESERVE_BALANCE)
+                            tg_event(f"✅ BUY {sym} @ {price:.6f}, qty_net={q_gross*(1-TAKER_FEE):.8f}")
+                            tg_event(f"Before:\n{before}\nAfter:\n{after}")
+                            coins = get_wallet(True)
+                            usdt = usdt_balance(coins)
+                            avail = max(0.0, usdt - RESERVE_BALANCE)
                             continue
                 else:
-                    reason = "No buy signal or max averaging reached"
+                    reason = "max_averages reached"
 
                 if reason:
-                    msg = f"❌ Skip buy: {sym} — {reason} | price={price:.6f}, available={avail:.2f}, avg_count={state['avg_count']}"
+                    msg = (f"❌ Skip buy: {sym} — {reason}; price={price:.6f}, "
+                           f"avail={avail:.2f}, avg_count={state['avg_count']}")
                     logging.info(msg)
                     tg_event(msg)
             else:
@@ -234,9 +247,9 @@ def trade_cycle():
 
         except Exception as e:
             tb = traceback.format_exc(limit=2)
-            logging.info(f"[{sym}] Ошибка: {e}\n{tb}")
+            logging.info(f"[{sym}] Error: {e}\n{tb}")
             if time.time() - _last_err_ts > TG_ERR_COOLDOWN:
-                tg_event(f"[{sym}] Ошибка: {e}")
+                tg_event(f"[{sym}] Error: {e}")
                 _last_err_ts = time.time()
 
     _save_state()
@@ -247,14 +260,12 @@ def trade_cycle():
         LAST_REPORT_DATE = now.date()
 
 if __name__ == "__main__":
-    logging.info("🚀 Bot starting with v4 enhancements")
-    tg_event("🚀 Bot starting with v4 enhancements")
+    logging.info("🚀 Bot starting (v4 with skip-detail + compare)")
+    tg_event("🚀 Bot starting (v4 enhancements)")
     init_state()
     load_symbol_limits()
     restore_positions()
-    tg_event(
-        "⚙️ Params updated — including skip-detail alerts"
-    )
+    tg_event("Parameters loaded; monitoring started.")
     while True:
         try:
             trade_cycle()
