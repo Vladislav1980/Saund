@@ -22,6 +22,7 @@ API_SECRET = os.getenv("BYBIT_API_SECRET") or ""
 TG_TOKEN   = os.getenv("TG_TOKEN") or ""
 CHAT_ID    = os.getenv("CHAT_ID") or ""
 REDIS_URL  = os.getenv("REDIS_URL") or ""
+
 try:
     import redis
     rds = redis.from_url(REDIS_URL, decode_responses=True) if REDIS_URL else None
@@ -33,8 +34,7 @@ SYMBOLS = ["TONUSDT", "DOGEUSDT", "XRPUSDT", "SOLUSDT", "AVAXUSDT", "ADAUSDT", "
 TAKER_FEE = 0.0018
 BASE_MAX_TRADE_USDT = 35.0
 MAX_TRADE_OVERRIDES = {"TONUSDT": 70.0, "AVAXUSDT": 70.0, "ADAUSDT": 60.0}
-def max_trade_for(sym: str) -> float:
-    return float(MAX_TRADE_OVERRIDES.get(sym, BASE_MAX_TRADE_USDT))
+def max_trade_for(sym): return float(MAX_TRADE_OVERRIDES.get(sym, BASE_MAX_TRADE_USDT))
 
 RESERVE_BALANCE = 1.0
 TRAIL_MULTIPLIER = 1.5
@@ -87,16 +87,15 @@ logging.basicConfig(
     handlers=[logging.FileHandler("bot.log", encoding="utf-8"), logging.StreamHandler()]
 )
 
-def send_tg(msg: str):
-    if not TG_TOKEN or not CHAT_ID:
-        return
+def send_tg(msg):
+    if not TG_TOKEN or not CHAT_ID: return
     try:
         requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
                       data={"chat_id": CHAT_ID, "text": msg})
     except Exception as e:
         logging.error(f"TG send failed: {e}")
 
-def tg_event(msg: str):
+def tg_event(msg):
     send_tg(msg)
 
 session = HTTP(api_key=API_KEY, api_secret=API_SECRET, recv_window=15000)
@@ -107,13 +106,12 @@ _last_err_ts = 0.0
 _wallet_cache = {"ts": 0.0, "coins": None}
 
 def _state_key(): return "bybit_spot_state_v3"
+
 def _save_state():
     s = json.dumps(STATE, ensure_ascii=False)
     if rds:
-        try:
-            rds.set(_state_key(), s)
-        except Exception as e:
-            logging.error(f"Redis save error: {e}")
+        try: rds.set(_state_key(), s)
+        except Exception as e: logging.error(f"Redis save error: {e}")
     try:
         with open(STATE_FILE, "w", encoding="utf-8") as f:
             f.write(s)
@@ -159,8 +157,8 @@ def _safe_call(func, *args, **kwargs):
             return func(*args, **kwargs)
         except Exception as e:
             msg = str(e)
-            if any(x in msg for x in ["rate", "403", "10006"]):
-                logging.info(f"Rate-limit/backoff {delay:.1f}s: {msg}")
+            if any(code in msg for code in ["rate", "403", "10006"]):
+                logging.info(f"Rate/backoff {delay:.1f}s: {msg}")
                 time.sleep(delay)
                 delay = min(REQUEST_BACKOFF_MAX, delay * 1.7)
                 continue
@@ -171,7 +169,7 @@ def _safe_call(func, *args, **kwargs):
             raise
 
 def get_wallet(force=False):
-    if not force and _wallet_cache["coins"] is not None and time.time() - _wallet_cache["ts"] < WALLET_CACHE_TTL:
+    if not force and _wallet_cache["coins"] and time.time() - _wallet_cache["ts"] < WALLET_CACHE_TTL:
         return _wallet_cache["coins"]
     resp = _safe_call(session.get_wallet_balance, accountType="UNIFIED")
     coins = resp["result"]["list"][0]["coin"]
@@ -197,12 +195,12 @@ def load_symbol_limits():
             }
     logging.info(f"Loaded limits: {LIMITS}")
 
-def round_step(qty, step):
+def round_step(q, step):
     try:
         exp = int(f"{float(step):e}".split("e")[-1])
-        return math.floor(qty * 10**abs(exp)) / 10**abs(exp)
+        return math.floor(q * 10**abs(exp)) / 10**abs(exp)
     except Exception:
-        return qty
+        return q
 
 def get_kline(sym):
     r = _safe_call(session.get_kline, category="spot", symbol=sym, interval=INTERVAL, limit=100)
@@ -220,8 +218,7 @@ def signal(df):
     macd = MACD(close=df["c"])
     df["macd"], df["sig"] = macd.macd(), macd.macd_signal()
     last = df.iloc[-1]
-    info = (f"EMA9={last['ema9']:.5f},EMA21={last['ema21']:.5f},"
-            f"RSI={last['rsi']:.2f},MACD={last['macd']:.5f},SIG={last['sig']:.5f}")
+    info = f"EMA9={last['ema9']:.5f},EMA21={last['ema21']:.5f},RSI={last['rsi']:.2f},MACD={last['macd']:.5f},SIG={last['sig']:.5f}"
     if last["ema9"] > last["ema21"] and last["rsi"] > 50 and last["macd"] > last["sig"]:
         return "buy", float(atr), info
     if last["ema9"] < last["ema21"] and last["rsi"] < 50 and last["macd"] < last["sig"]:
@@ -252,12 +249,12 @@ def orderbook_ok(sym, side, qty_base, ref_price):
         return True, "ob=off"
     try:
         ob = _safe_call(session.get_orderbook, category="spot", symbol=sym, limit=OB_LIMIT_DEPTH)["result"]
-        best_ask = float(ob["a"][0][0]); best_bid = float(ob["b"][0][0])
+        best_ask, best_bid = float(ob["a"][0][0]), float(ob["b"][0][0])
         spread = (best_ask - best_bid) / max(best_bid, 1e-12)
         if spread > MAX_SPREAD_BP/10000:
             return False, f"ob=spread {spread*100:.2f}%>{MAX_SPREAD_BP/100:.2f}%"
         if side.lower() == "buy":
-            need = qty_base; cost = 0.0
+            need, cost = qty_base, 0.0
             for px, q in ob["a"]:
                 px, q = float(px), float(q)
                 take = min(need, q); cost += take * px; need -= take
@@ -270,8 +267,7 @@ def orderbook_ok(sym, side, qty_base, ref_price):
             if impact > MAX_IMPACT_BP/10000:
                 return False, f"ob=impact {impact*100:.2f}%>{MAX_IMPACT_BP/100:.2f}%"
             return True, f"ob=ok(spread={spread*100:.2f}%,impact={impact*100:.2f}%)"
-        else:
-            return True, f"ob=ok(spread={spread*100:.2f}%)"
+        return True, f"ob=ok(spread={spread*100:.2f}%)"
     except Exception as e:
         return True, f"ob=err({e})"
 
@@ -296,13 +292,13 @@ def can_place_buy(sym, q, price, usdt_free):
     needed = q * price * (1 + TAKER_FEE + SLIP_BUFFER)
     return needed <= max(0.0, usdt_free - RESERVE_BALANCE + 1e-9)
 
-def can_place_sell(sym, q, price, coin_bal_now):
+def can_place_sell(sym, q, price, coin_bal):
     if q <= 0:
         return False
     lm = LIMITS[sym]
     if q < lm["min_qty"] or q * price < lm["min_amt"]:
         return False
-    return q <= coin_bal_now + 1e-12
+    return q <= coin_bal + 1e-12
 
 def aggregate_position(sym):
     entries = STATE[sym]["position_entries"]
@@ -329,17 +325,260 @@ def create_new_entry(sym, buy_price, qty_gross):
     })
     _save_state()
 
-# daily_report, restore_positions, cap_btc_sell_qty, try_liquidity_recovery, trade_cycle, and __main__...
-# — остаются без изменений, с сохранённой логикой из предыдущего варианта
-# Только убедись, что везде используется aggregate_position, net_pnl, position_entries, как ранее.
+def restore_positions():
+    """Восстанавливает позиции из баланса в position_entries при запуске."""
+    try:
+        balances = get_wallet(True)
+        for sym in SYMBOLS:
+            bal = coin_balance(balances, sym)
+            if bal > 0:
+                # Используем текущую цену как цену входа
+                ticker = _safe_call(session.get_ticker, category="spot", symbol=sym)["result"]["list"][0]
+                mark_price = float(ticker["lastPrice"])
+                STATE[sym]["position_entries"] = [{
+                    "qty": bal,
+                    "buy_price": mark_price,
+                    "buy_qty_gross": bal / (1 - TAKER_FEE)
+                }]
+                logging.info(f"🔄 Restored {sym}: qty={bal:.8f} @ {mark_price:.6f}")
+        _save_state()
+    except Exception as e:
+        logging.error(f"restore_positions() failed: {e}")
+
+def daily_report():
+    try:
+        coins = get_wallet(True)
+        by = {c["coin"]: float(c["walletBalance"]) for c in coins}
+        lines = [f"📊 Daily Report {datetime.date.today()}", f"USDT: {by.get('USDT',0.0):.2f}"]
+        for sym in SYMBOLS:
+            base = sym.replace("USDT", "")
+            bal = by.get(base, 0.0)
+            price = float(get_kline(sym)["c"].iloc[-1])
+            val = bal * price
+            state = STATE[sym]
+            total_qty, _ = aggregate_position(sym)
+            lines.append(
+                f"{sym}: balance={bal:.6f} (~{val:.2f}), trades={state['count']}, pnl={state['pnl']:.2f}, "
+                f"maxDD={state['max_drawdown']*100:.2f}%, curPosQty={total_qty:.6f}"
+            )
+        tg_event("\n".join(lines))
+    except Exception as e:
+        logging.error(f"daily_report error: {e}")
+
+def cap_btc_sell_qty(sym, q, price, coin_bal):
+    if sym != BTC_SYMBOL:
+        return q
+    cap_fraction = coin_bal * BTC_MAX_SELL_FRACTION_TRADE
+    keep_floor = 0.0
+    if BTC_MIN_KEEP_USD > 0:
+        keep_floor = max(0.0, (coin_bal*price - BTC_MIN_KEEP_USD) / max(price, 1e-12))
+    allowed = max(0.0, min(q, cap_fraction, keep_floor if keep_floor > 0 else q))
+    if allowed <= 0:
+        allowed = min(q, cap_fraction)
+    return max(0.0, allowed)
+
+def try_liquidity_recovery(coins, usdt):
+    if not LIQUIDITY_RECOVERY:
+        return
+    avail = max(0.0, usdt - RESERVE_BALANCE)
+    if avail >= LIQ_RECOVERY_USDT_MIN:
+        return
+    target = LIQ_RECOVERY_USDT_TARGET - avail
+    if target <= 0:
+        return
+    logging.info(f"💧 LiquidityRecovery: need +{target:.2f} USDT (avail={avail:.2f})")
+    candidates = []
+    for sym in SYMBOLS:
+        entries = STATE[sym]["position_entries"]
+        if entries:
+            price = float(get_kline(sym)["c"].iloc[-1])
+            lm = LIMITS[sym]
+            coin_bal = coin_balance(coins, sym)
+            pnl = net_pnl(sym, price)
+            total_qty, _ = aggregate_position(sym)
+            if pnl > MIN_NET_ABS_USD and can_place_sell(sym, total_qty, price, coin_bal):
+                sell_try = total_qty * 0.2
+                if sym == BTC_SYMBOL:
+                    sell_try = cap_btc_sell_qty(sym, sell_try, price, coin_bal)
+                if sell_try <= 0:
+                    continue
+                est_usd = price * sell_try * (1 - TAKER_FEE)
+                candidates.append((sym, price, sell_try, est_usd, pnl, coin_bal, lm))
+    candidates.sort(key=lambda x: (x[4]/max(x[3],1e-9)), reverse=True)
+    for sym, price, sell_q, est, pnl, coin_bal, lm in candidates:
+        if target <= 0:
+            break
+        sell_q = min(sell_q, round_step(target / max(price*(1-TAKER_FEE), 1e-9), lm["qty_step"]))
+        if sell_q < lm["min_qty"] or sell_q*price < lm["min_amt"]:
+            continue
+        if not can_place_sell(sym, sell_q, price, coin_bal):
+            continue
+        try:
+            _safe_call(session.place_order, category="spot", symbol=sym,
+                       side="Sell", orderType="Market", qty=str(sell_q))
+            tg_event(f"🟠 RECOVERY SELL {sym} @ {price:.6f}, qty={sell_q:.8f}")
+            entries = STATE[sym]["position_entries"]
+            new_entries, rem = [], sell_q
+            for e in entries:
+                if rem <= 0:
+                    new_entries.append(e)
+                    continue
+                take = min(e["qty"], rem)
+                ratio = take / e["qty"]
+                e["qty"] -= take
+                e["buy_qty_gross"] *= (1 - ratio)
+                rem -= take
+                if e["qty"] > 0:
+                    new_entries.append(e)
+            STATE[sym]["position_entries"] = new_entries
+            STATE[sym]["pnl"] += pnl
+            _save_state()
+            target -= price * sell_q * (1 - TAKER_FEE)
+            coins = get_wallet(True)
+        except Exception as e:
+            logging.error(f"[{sym}] recovery sell error: {e}")
+
+def trade_cycle():
+    global LAST_REPORT_DATE, _last_err_ts
+    try:
+        coins = get_wallet(True)
+        usdt = usdt_balance(coins)
+    except Exception as e:
+        now = time.time()
+        if now - _last_err_ts > TG_ERR_COOLDOWN:
+            tg_event(f"Balance error: {e}")
+            _last_err_ts = now
+        return
+
+    if LIQUIDITY_RECOVERY:
+        try_liquidity_recovery(coins, usdt)
+        coins = get_wallet(True)
+        usdt = usdt_balance(coins)
+
+    avail = max(0.0, usdt - RESERVE_BALANCE)
+    logging.info(f"💰 USDT={usdt:.2f} | Available={avail:.2f}")
+
+    for sym in SYMBOLS:
+        try:
+            df = get_kline(sym)
+            if df.empty:
+                logging.info(f"[{sym}] no candles — skip")
+                continue
+
+            sig, atr, info = signal(df)
+            price = df["c"].iloc[-1]
+            state = STATE[sym]
+            lm = LIMITS[sym]
+            coin_bal = coin_balance(coins, sym)
+            total_qty, avg_price = aggregate_position(sym)
+            logging.info(f"[{sym}] sig={sig} | {info} | price={price:.6f}, qty={total_qty:.6f}, avg_price={avg_price:.6f}")
+
+            # Max drawdown tracking
+            if total_qty > 0:
+                dd = max(0.0, (avg_price - price) / max(avg_price, 1e-12))
+                state["max_drawdown"] = max(state["max_drawdown"], dd)
+
+            pnl = net_pnl(sym, price)
+
+            # SELL logic: SL, trail, profit
+            if total_qty > 0:
+                sell_q = cap_btc_sell_qty(sym, total_qty, price, coin_bal)
+                need = max(MIN_NET_ABS_USD, MIN_NET_PROFIT, price * sell_q * MIN_PROFIT_PCT)
+                ok_sell = pnl >= need
+
+                if price <= avg_price * (1 - STOP_LOSS_PCT) and ok_sell:
+                    _safe_call(session.place_order, category="spot", symbol=sym,
+                               side="Sell", orderType="Market", qty=str(sell_q))
+                    msg = f"🟠 SL SELL {sym} @ {price:.6f}, qty={sell_q:.8f}, pnl={pnl:.2f}"
+                    logging.info(msg); tg_event(msg)
+                    state["pnl"] += pnl; state["avg_count"] = 0; state["last_sell_price"] = price
+                    state["position_entries"] = []
+                else:
+                    max_pnl = max(e.get("max_pnl", 0.0) for e in state["position_entries"])
+                    for e in state["position_entries"]:
+                        e["max_pnl"] = max(e.get("max_pnl", 0.0), pnl)
+                    if max_pnl >= TRAIL_PNL_TRIGGER and (max_pnl - pnl) >= TRAIL_PNL_GAP:
+                        _safe_call(session.place_order, category="spot", symbol=sym,
+                                   side="Sell", orderType="Market", qty=str(sell_q))
+                        msg = f"✅ TRAIL SELL {sym} @ {price:.6f}, qty={sell_q:.8f}, pnl={pnl:.2f}, peak={max_pnl:.2f}"
+                        logging.info(msg); tg_event(msg)
+                        state["pnl"] += pnl; state["avg_count"] = 0; state["last_sell_price"] = price
+                        state["position_entries"] = []
+                    elif ok_sell:
+                        _safe_call(session.place_order, category="spot", symbol=sym,
+                                   side="Sell", orderType="Market", qty=str(sell_q))
+                        msg = f"✅ PROFIT SELL {sym} @ {price:.6f}, qty={sell_q:.8f}, pnl={pnl:.2f}"
+                        logging.info(msg); tg_event(msg)
+                        state["pnl"] += pnl; state["avg_count"] = 0; state["last_sell_price"] = price
+                        state["position_entries"] = []
+                    else:
+                        logging.info(f"[{sym}] skip sell: pnl {pnl:.2f} < need {need:.2f}")
+
+            # BUY / averaging logic
+            if sig == "buy" and volume_ok(df):
+                if total_qty > 0:
+                    diff_pct = (avg_price - price) / avg_price if avg_price > 0 else 0.0
+                    if state["avg_count"] < MAX_AVERAGES and diff_pct >= MIN_AVG_DIFF_PCT:
+                        q_gross = budget_qty(sym, price, avail)
+                        ob_ok, ob_info = orderbook_ok(sym, "buy", q_gross, price)
+                        if q_gross > 0 and ob_ok and can_place_buy(sym, q_gross, price, usdt):
+                            _safe_call(session.place_order, category="spot", symbol=sym,
+                                       side="Buy", orderType="Market", timeInForce="IOC",
+                                       marketUnit="baseCoin", qty=str(q_gross))
+                            create_new_entry(sym, price, q_gross)
+                            state["count"] += 1; state["avg_count"] += 1
+                            qty_net = q_gross * (1 - TAKER_FEE)
+                            msg = f"🟢 BUY(avg) {sym} @ {price:.6f}, qty_net={qty_net:.8f}, diff_pct={diff_pct:.4f}, {ob_info}"
+                            logging.info(msg); tg_event(msg)
+                            coins = get_wallet(True); usdt = usdt_balance(coins); avail = max(0.0, usdt - RESERVE_BALANCE)
+                        else:
+                            logging.info(f"[{sym}] skip avg buy")
+                    else:
+                        logging.info(f"[{sym}] skip avg: avg_count={state['avg_count']}, diff_pct={diff_pct:.4f}")
+                else:
+                    if state["last_sell_price"] and abs(price - state["last_sell_price"]) / price < 0.003:
+                        logging.info(f"[{sym}] skip buy: too close to last sell")
+                    else:
+                        q_gross = budget_qty(sym, price, avail)
+                        ob_ok, ob_info = orderbook_ok(sym, "buy", q_gross, price)
+                        if q_gross > 0 and ob_ok and can_place_buy(sym, q_gross, price, usdt):
+                            _safe_call(session.place_order, category="spot", symbol=sym,
+                                       side="Buy", orderType="Market", timeInForce="IOC",
+                                       marketUnit="baseCoin", qty=str(q_gross))
+                            create_new_entry(sym, price, q_gross)
+                            state["count"] += 1
+                            qty_net = q_gross * (1 - TAKER_FEE)
+                            msg = f"🟢 BUY {sym} @ {price:.6f}, qty_net={qty_net:.8f}, {ob_info}"
+                            logging.info(msg); tg_event(msg)
+                            coins = get_wallet(True); usdt = usdt_balance(coins); avail = max(0.0, usdt - RESERVE_BALANCE)
+                        else:
+                            logging.info(f"[{sym}] skip buy: budget/limits/OB/balance")
+            else:
+                if total_qty == 0:
+                    logging.info(f"[{sym}] no buy: sig={sig}")
+
+        except Exception as e:
+            tb = traceback.format_exc(limit=2)
+            logging.error(f"[{sym}] trade_cycle error: {e}\n{tb}")
+            now = time.time()
+            if now - _last_err_ts > TG_ERR_COOLDOWN:
+                tg_event(f"[{sym}] trade_cycle error: {e}")
+                _last_err_ts = now
+
+    _save_state()
+
+    now = datetime.datetime.now()
+    if now.hour == DAILY_REPORT_HOUR and now.minute >= DAILY_REPORT_MINUTE and LAST_REPORT_DATE != now.date():
+        daily_report()
+        globals()['LAST_REPORT_DATE'] = now.date()
 
 if __name__ == "__main__":
-    logging.info("🚀 Bot starting with Redis-safe initialization + aggregated position logic")
-    tg_event("🚀 Bot starting with Redis-safe initialization + aggregated position logic")
+    logging.info("🚀 Bot starting with Redis-safe initialization, aggregated positioning, controlled averaging")
+    tg_event("🚀 Bot starting with Redis-safe initialization, aggregated positioning, controlled averaging")
     init_state()
     load_symbol_limits()
     restore_positions()
-    # ... rest of startup message
+    tg_event(f"⚙️ Params: MaxAverages={MAX_AVERAGES}, MinAvgDiffPct={MIN_AVG_DIFF_PCT:.3f}, TAKER={TAKER_FEE}, SL={STOP_LOSS_PCT*100:.1f}%")
     while True:
         try:
             trade_cycle()
