@@ -143,7 +143,8 @@ def init_state():
         STATE.setdefault(s, {"positions": [], "pnl": 0.0, "count": 0, "avg_count": 0,
                               "last_sell_price": 0.0, "max_drawdown": 0.0})
     _save_state()
- def trade_cycle():
+
+def trade_cycle():
     global LAST_REPORT_DATE, _last_err_ts
     try:
         coins = get_wallet(True)
