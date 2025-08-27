@@ -141,8 +141,16 @@ def init_state():
     logging.info(f"🚀 Бот стартует. Состояние: {src}")
     tg_event(f"🚀 Бот стартует. Состояние: {src}")
     for s in SYMBOLS:
-        STATE.setdefault(s, {"positions": [], "pnl": 0.0, "count": 0, "avg_count": 0,
-                              "last_sell_price": 0.0, "max_drawdown": 0.0})
+        STATE.setdefault(s, {
+            "positions": [],
+            "pnl": 0.0,
+            "count": 0,
+            "avg_count": 0,
+            "last_sell_price": 0.0,
+            "max_drawdown": 0.0,
+            # снапшот для расчёта прироста в daily_report
+            "snap": {"value": 0.0, "qty": 0.0, "ts": None}
+        })
     _save_state()
 
 def _safe_call(func, *args, **kwargs):
@@ -328,22 +336,60 @@ def min_net_required(price, qty_net) -> float:
     pct_req = price * qty_net * MIN_PROFIT_PCT
     return max(MIN_NET_ABS_USD, MIN_NET_PROFIT, MIN_ABS_PNL, pct_req)
 
+# ====== ОБНОВЛЁННЫЙ DAILY REPORT С ПРИРОСТОМ ======
 def daily_report():
     try:
         coins = get_wallet(True)
         by = {c["coin"]: float(c["walletBalance"]) for c in coins}
-        lines = ["📊 Daily Report " + str(datetime.date.today()), f"USDT: {by.get('USDT',0.0):.2f}"]
+        today_str = str(datetime.date.today())
+
+        lines = ["📊 Daily Report " + today_str, f"USDT: {by.get('USDT',0.0):.2f}"]
+
         for sym in SYMBOLS:
             base = sym.replace("USDT", "")
-            bal = by.get(base, 0.0)
-            price = float(get_kline(sym)["c"].iloc[-1])
-            val = price * bal
+            bal_qty = by.get(base, 0.0)
+            df = get_kline(sym)
+            price = float(df["c"].iloc[-1]) if not df.empty else 0.0
+            cur_value = price * bal_qty
+
+            # unrealized PnL по суммарной позиции
             s = STATE[sym]
-            cur_q = sum(p["qty"] for p in s["positions"]) if s["positions"] else 0.0
-            lines.append(f"{sym}: balance={bal:.6f} (~{val:.2f} USDT), trades={s['count']}, pnl={s['pnl']:.2f}, maxDD={s['max_drawdown']*100:.2f}%, curPosQty={cur_q:.6f}")
+            if s["positions"]:
+                p = s["positions"][0]
+                q_n = float(p.get("qty", 0.0))
+                if q_n > 0:
+                    q_g = float(p.get("buy_qty_gross", q_n / (1 - TAKER_FEE)))
+                    unreal_usd = net_pnl(price, float(p["buy_price"]), q_n, q_g)
+                    base_cost = float(p["buy_price"]) * q_g
+                    unreal_pct = (unreal_usd / base_cost * 100.0) if base_cost > 0 else 0.0
+                else:
+                    unreal_usd = 0.0
+                    unreal_pct = 0.0
+            else:
+                unreal_usd = 0.0
+                unreal_pct = 0.0
+
+            # прирост со снапшота
+            snap = s.get("snap", {}) or {}
+            prev_value = float(snap.get("value", 0.0))
+            growth_abs = cur_value - prev_value
+            growth_pct = (growth_abs / prev_value * 100.0) if prev_value > 0 else 0.0
+
+            lines.append(
+                f"{sym}: qty={bal_qty:.6f}, value={cur_value:.2f}, "
+                f"Δ={growth_abs:+.2f} ({growth_pct:+.2f}%), "
+                f"unrealPnL={unreal_usd:+.2f} ({unreal_pct:+.2f}%), "
+                f"realized={s['pnl']:.2f}"
+            )
+
+            # обновляем снапшот
+            s["snap"] = {"value": cur_value, "qty": bal_qty, "ts": today_str}
+
+        _save_state()
         tg_event("\n".join(lines))
     except Exception as e:
         logging.info(f"daily_report error: {e}")
+# ====== /ОБНОВЛЁННЫЙ DAILY REPORT ======
 
 def restore_positions():
     restored = []
@@ -697,4 +743,3 @@ if __name__ == "__main__":
                 tg_event(f"Global error: {e}")
                 _last_err_ts = now
         time.sleep(LOOP_SLEEP)
-
