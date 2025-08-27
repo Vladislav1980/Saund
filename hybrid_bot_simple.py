@@ -4,6 +4,10 @@ Bybit Spot Bot — v3 + NetPnL-трейлинг + Unified Averaging + State Comp
 Сохраняет весь оригинальный функционал, добавляет фиксацию прибыли ≥ $1.5,
 с trailing-exit при снижении netPnL на ≥ $0.6 от пикового значения,
 усреднение ≤ 2 покупок, объединено в одну позицию, и сравнение позиции до/после усреднения.
+
+Дополнения:
+1) REVERSAL SELL — быстрый выход «как можно ближе к пику» при признаках разворота и netPnL ≥ $1.50.
+2) В ежедневном отчёте отдельная строка «Сегодня заработано: +X USDT» + realized_today по каждой монете.
 """
 
 import os, time, math, logging, datetime, json, traceback
@@ -81,6 +85,10 @@ TG_ERR_COOLDOWN = 90.0
 TRAIL_PNL_TRIGGER = 1.5
 TRAIL_PNL_GAP = 0.6
 
+# Быстрый выход по развороту (чистая прибыль не ниже минимума)
+REVERSAL_EXIT = True
+REVERSAL_EXIT_MIN_USD = 1.50
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(message)s",
@@ -148,8 +156,11 @@ def init_state():
             "avg_count": 0,
             "last_sell_price": 0.0,
             "max_drawdown": 0.0,
-            # снапшот для расчёта прироста в daily_report
-            "snap": {"value": 0.0, "qty": 0.0, "ts": None}
+            # снапшот стоимости для daily_report (прирост value)
+            "snap": {"value": 0.0, "qty": 0.0, "ts": None},
+            # снапшот реализованной прибыли на начало дня
+            "pnl_today_snap": 0.0,
+            "pnl_today_date": None,
         })
     _save_state()
 
@@ -228,6 +239,35 @@ def signal(df):
     if last["ema9"] < last["ema21"] and last["rsi"] < 50 and last["macd"] < last["sig"]:
         return "sell", float(atr), info
     return "none", float(atr), info
+
+def is_bearish_reversal(df: pd.DataFrame) -> bool:
+    """
+    Разворот вниз, если выполняются >= 2 условий:
+    - EMA9 пересекает EMA21 сверху вниз,
+    - MACD пересекает сигнальную сверху вниз,
+    - RSI падает на ≥3 пункта и < 55.
+    """
+    if df is None or len(df) < 30:
+        return False
+    # гарантируем нужные столбцы
+    need_cols = {"ema9","ema21","macd","sig","rsi"}
+    if not need_cols.issubset(set(df.columns)):
+        df = df.copy()
+        df["ema9"]  = EMAIndicator(df["c"], 9).ema_indicator()
+        df["ema21"] = EMAIndicator(df["c"], 21).ema_indicator()
+        macd_obj = MACD(close=df["c"])
+        df["macd"], df["sig"] = macd_obj.macd(), macd_obj.macd_signal()
+        df["rsi"] = RSIIndicator(df["c"], 9).rsi()
+
+    last  = df.iloc[-1]
+    prev  = df.iloc[-2]
+
+    ema_cross_dn  = (prev["ema9"] >= prev["ema21"]) and (last["ema9"] < last["ema21"])
+    macd_cross_dn = (prev["macd"] >= prev["sig"])   and (last["macd"] < last["sig"])
+    rsi_drop      = (last["rsi"] < prev["rsi"] - 3.0) and (last["rsi"] < 55.0)
+
+    score = int(ema_cross_dn) + int(macd_cross_dn) + int(rsi_drop)
+    return score >= 2
 
 def volume_ok(df):
     if not USE_VOLUME_FILTER:
@@ -336,13 +376,14 @@ def min_net_required(price, qty_net) -> float:
     pct_req = price * qty_net * MIN_PROFIT_PCT
     return max(MIN_NET_ABS_USD, MIN_NET_PROFIT, MIN_ABS_PNL, pct_req)
 
-# ====== ОБНОВЛЁННЫЙ DAILY REPORT С ПРИРОСТОМ ======
+# ====== ОБНОВЛЁННЫЙ DAILY REPORT С ПРИРОСТОМ И «СЕГОДНЯ ЗАРАБОТАНО» ======
 def daily_report():
     try:
         coins = get_wallet(True)
         by = {c["coin"]: float(c["walletBalance"]) for c in coins}
         today_str = str(datetime.date.today())
 
+        total_today = 0.0
         lines = ["📊 Daily Report " + today_str, f"USDT: {by.get('USDT',0.0):.2f}"]
 
         for sym in SYMBOLS:
@@ -352,8 +393,17 @@ def daily_report():
             price = float(df["c"].iloc[-1]) if not df.empty else 0.0
             cur_value = price * bal_qty
 
-            # unrealized PnL по суммарной позиции
             s = STATE[sym]
+
+            # переключение дневного снапшота реализованной прибыли
+            if s.get("pnl_today_date") != today_str:
+                s["pnl_today_snap"] = float(s.get("pnl", 0.0))
+                s["pnl_today_date"] = today_str
+
+            pnl_today = float(s.get("pnl", 0.0)) - float(s.get("pnl_today_snap", 0.0))
+            total_today += pnl_today
+
+            # нереализованный по текущей суммарной позиции
             if s["positions"]:
                 p = s["positions"][0]
                 q_n = float(p.get("qty", 0.0))
@@ -369,7 +419,7 @@ def daily_report():
                 unreal_usd = 0.0
                 unreal_pct = 0.0
 
-            # прирост со снапшота
+            # прирост стоимости с прошлого снапшота баланса
             snap = s.get("snap", {}) or {}
             prev_value = float(snap.get("value", 0.0))
             growth_abs = cur_value - prev_value
@@ -379,11 +429,13 @@ def daily_report():
                 f"{sym}: qty={bal_qty:.6f}, value={cur_value:.2f}, "
                 f"Δ={growth_abs:+.2f} ({growth_pct:+.2f}%), "
                 f"unrealPnL={unreal_usd:+.2f} ({unreal_pct:+.2f}%), "
-                f"realized={s['pnl']:.2f}"
+                f"realized_total={s['pnl']:.2f}, realized_today={pnl_today:+.2f}"
             )
 
-            # обновляем снапшот
+            # обновляем снапшот балансовой стоимости
             s["snap"] = {"value": cur_value, "qty": bal_qty, "ts": today_str}
+
+        lines.insert(1, f"🧾 Сегодня заработано: {total_today:+.2f} USDT")
 
         _save_state()
         tg_event("\n".join(lines))
@@ -562,6 +614,7 @@ def trade_cycle():
 
             sig, atr, info = signal(df)
             price = df["c"].iloc[-1]
+            tp_new = price + TRAIL_MULTIPLIER * atr  # TP для новых/усреднённых входов (фикс баг c unbound 'tp')
             state = STATE[sym]
             lm = LIMITS[sym]
             coin_bal = coin_balance(coins, sym)
@@ -600,7 +653,23 @@ def trade_cycle():
                 need = min_net_required(price, sell_cap_q)
                 ok_to_sell = pnl >= need
 
-                # Stop Loss
+                # Быстрый выход по развороту рынка (минимум чистой прибыли)
+                if REVERSAL_EXIT and pnl >= REVERSAL_EXIT_MIN_USD and is_bearish_reversal(df):
+                    _attempt_sell(sym, sell_cap_q)
+                    msg = (f"✅ REVERSAL SELL {sym} @ {price:.6f}, "
+                           f"qty={sell_cap_q:.8f}, netPnL={pnl:.2f}")
+                    logging.info(msg); tg_event(msg)
+                    state["pnl"] += pnl; state["last_sell_price"] = price; state["avg_count"] = 0
+                    left = q_n - sell_cap_q
+                    if left > 0:
+                        ratio = sell_cap_q / max(q_n, 1e-12)
+                        p["qty"] = left
+                        p["buy_qty_gross"] = max(0.0, p["buy_qty_gross"] * (1.0 - ratio))
+                        new_pos.append(p)
+                    coins = get_wallet(True); coin_bal = coin_balance(coins, sym)
+                    continue
+
+                # Stop Loss (только если уже набран нужный минимум прибыли по политике ok_to_sell)
                 if price <= b * (1 - STOP_LOSS_PCT) and ok_to_sell:
                     _attempt_sell(sym, sell_cap_q)
                     msg = f"🟠 SL SELL {sym} @ {price:.6f}, qty={sell_cap_q:.8f}, netPnL={pnl:.2f}"
@@ -667,8 +736,6 @@ def trade_cycle():
                         if q_gross > 0 and ob_ok and can_place_buy(sym, q_gross, price, usdt):
                             before = json.dumps(state["positions"], indent=2, ensure_ascii=False)
                             if _attempt_buy(sym, q_gross):
-                                # FIX: tp всегда задан при усреднении
-                                tp_new = max(state["positions"][0].get("tp", 0.0), price + TRAIL_MULTIPLIER * atr)
                                 append_or_update_position(sym, price, q_gross, tp_new)
                                 after = json.dumps(state["positions"], indent=2, ensure_ascii=False)
                                 state["count"] += 1
@@ -691,8 +758,6 @@ def trade_cycle():
                         if q_gross > 0 and ob_ok and can_place_buy(sym, q_gross, price, usdt):
                             before = json.dumps(state["positions"], indent=2, ensure_ascii=False)
                             if _attempt_buy(sym, q_gross):
-                                # FIX: tp всегда задан при создании позиции
-                                tp_new = price + TRAIL_MULTIPLIER * atr
                                 append_or_update_position(sym, price, q_gross, tp_new)
                                 after = json.dumps(state["positions"], indent=2, ensure_ascii=False)
                                 state["count"] += 1
@@ -734,7 +799,8 @@ if __name__ == "__main__":
         f"VolFilter={'ON' if USE_VOLUME_FILTER else 'OFF'}, "
         f"OBGuard={'ON' if USE_ORDERBOOK_GUARD else 'OFF'} (spread≤{MAX_SPREAD_BP/100:.2f}%, impact≤{MAX_IMPACT_BP/100:.2f}%), "
         f"LiqRecovery={'ON' if LIQUIDITY_RECOVERY else 'OFF'} (min={LIQ_RECOVERY_USDT_MIN}, target={LIQ_RECOVERY_USDT_TARGET}), "
-        f"NetPnL-Trailing={'ON' if TRAIL_PNL_TRIGGER else 'OFF'} (trigger=${TRAIL_PNL_TRIGGER}, gap=${TRAIL_PNL_GAP})"
+        f"NetPnL-Trailing={'ON' if TRAIL_PNL_TRIGGER else 'OFF'} (trigger=${TRAIL_PNL_TRIGGER}, gap=${TRAIL_PNL_GAP}), "
+        f"ReversalExit={'ON' if REVERSAL_EXIT else 'OFF'} (min=${REVERSAL_EXIT_MIN_USD})"
     )
     while True:
         try:
