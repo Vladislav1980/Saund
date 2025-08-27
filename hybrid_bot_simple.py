@@ -667,7 +667,9 @@ def trade_cycle():
                         if q_gross > 0 and ob_ok and can_place_buy(sym, q_gross, price, usdt):
                             before = json.dumps(state["positions"], indent=2, ensure_ascii=False)
                             if _attempt_buy(sym, q_gross):
-                                append_or_update_position(sym, price, q_gross, tp)
+                                # FIX: tp всегда задан при усреднении
+                                tp_new = max(state["positions"][0].get("tp", 0.0), price + TRAIL_MULTIPLIER * atr)
+                                append_or_update_position(sym, price, q_gross, tp_new)
                                 after = json.dumps(state["positions"], indent=2, ensure_ascii=False)
                                 state["count"] += 1
                                 state["avg_count"] += 1
@@ -689,7 +691,9 @@ def trade_cycle():
                         if q_gross > 0 and ob_ok and can_place_buy(sym, q_gross, price, usdt):
                             before = json.dumps(state["positions"], indent=2, ensure_ascii=False)
                             if _attempt_buy(sym, q_gross):
-                                append_or_update_position(sym, price, q_gross, tp)
+                                # FIX: tp всегда задан при создании позиции
+                                tp_new = price + TRAIL_MULTIPLIER * atr
+                                append_or_update_position(sym, price, q_gross, tp_new)
                                 after = json.dumps(state["positions"], indent=2, ensure_ascii=False)
                                 state["count"] += 1
                                 qty_net = q_gross * (1 - TAKER_FEE)
