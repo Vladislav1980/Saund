@@ -6,5 +6,6 @@ ta>=0.10.2
 ccxt
 schedule
 redis
+matplotlib
 
 
