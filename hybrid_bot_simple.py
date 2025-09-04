@@ -1,16 +1,25 @@
 # -*- coding: utf-8 -*-
 """
 Bybit Spot Bot — v3 + NetPnL-трейлинг + Unified Averaging + State Comparison
-Сохраняет весь оригинальный функционал, добавляет фиксацию прибыли ≥ $1.5,
-с trailing-exit при снижении netPnL на ≥ $0.6 от пикового значения,
-усреднение ≤ 2 покупок, объединено в одну позицию, и сравнение позиции до/после усреднения.
+Сохраняет весь оригинальный функционал и формат, добавляет:
+- читаемые логи (без JSON) + подробные причины пропуска сделок,
+- фиксацию чистой прибыли ≥ 1.50 USDT (после комиссий),
+- trailing-exit при снижении netPnL на ≥ $0.6 от пика,
+- REVERSAL SELL: быстрый выход «как можно ближе к пику» при признаках разворота
+  и netPnL ≥ $1.50,
+- опциональное восстановление позиции по заданной цене из .env:
+  RESTORE_<SYMBOL>_QTY, RESTORE_<SYMBOL>_PRICE (например, RESTORE_BTCUSDT_QTY/PRICE).
 
-Дополнения:
-1) REVERSAL SELL — быстрый выход «как можно ближе к пику» при признаках разворота и netPnL ≥ $1.50.
-2) В ежедневном отчёте отдельная строка «Сегодня заработано: +X USDT» + realized_today по каждой монете.
+Все расчёты прибыли **net** уже учитывают TAKER_FEE.
 """
 
-import os, time, math, logging, datetime, json, traceback
+import os
+import time
+import math
+import logging
+import datetime
+import json
+import traceback
 import pandas as pd
 import requests
 from dotenv import load_dotenv
@@ -19,7 +28,7 @@ from ta.trend import EMAIndicator, MACD
 from ta.momentum import RSIIndicator
 from ta.volatility import AverageTrueRange
 
-# ============ ENV ============
+# ================= ENV =================
 load_dotenv()
 API_KEY    = os.getenv("BYBIT_API_KEY") or ""
 API_SECRET = os.getenv("BYBIT_API_SECRET") or ""
@@ -32,24 +41,31 @@ try:
 except Exception:
     rds = None
 
-# ============ CONFIG ============
+# ================= CONFIG =================
+# Биржа: BYBIT SPOT, комиссии учтены в TAKER_FEE
 SYMBOLS = ["TONUSDT", "DOGEUSDT", "XRPUSDT", "SOLUSDT", "AVAXUSDT", "ADAUSDT", "BTCUSDT"]
-TAKER_FEE = 0.0018
+
+TAKER_FEE = 0.0018  # 0.18% — как в твоём коде
 BASE_MAX_TRADE_USDT = 35.0
-MAX_TRADE_OVERRIDES = {"TONUSDT": 70.0, "AVAXUSDT": 70.0, "ADAUSDT": 60.0}
+MAX_TRADE_OVERRIDES = {
+    "TONUSDT": 70.0,
+    "AVAXUSDT": 70.0,
+    "ADAUSDT": 60.0,
+    "BTCUSDT": 90.0,  # по твоим словам "70–90$ за сделку": берём верхнюю границу
+}
 def max_trade_for(sym: str) -> float:
     return float(MAX_TRADE_OVERRIDES.get(sym, BASE_MAX_TRADE_USDT))
 
-RESERVE_BALANCE = 1.0
+RESERVE_BALANCE = 1.0  # небольшой остаток, чтобы не утыкаться в нули
 TRAIL_MULTIPLIER = 1.5
 MAX_DRAWDOWN = 0.10
 MAX_AVERAGES = 2
 STOP_LOSS_PCT = 0.03
 
-MIN_PROFIT_PCT = 0.005
+MIN_PROFIT_PCT = 0.005  # минимальный % профита, но ниже мы всегда берём максимум с 1.50$
 MIN_ABS_PNL = 0.0
 MIN_NET_PROFIT = 1.50
-MIN_NET_ABS_USD = 1.50
+MIN_NET_ABS_USD = 1.50  # итоговое требование чистой прибыли после комиссий
 
 SLIP_BUFFER = 0.006
 PROFIT_ONLY = False
@@ -69,10 +85,10 @@ LIQ_RECOVERY_USDT_MIN = 20.0
 LIQ_RECOVERY_USDT_TARGET = 60.0
 
 BTC_SYMBOL = "BTCUSDT"
-BTC_MAX_SELL_FRACTION_TRADE = 0.18
-BTC_MIN_KEEP_USD = 3000.0
+BTC_MAX_SELL_FRACTION_TRADE = 0.18  # продаём не больше 18% от остатка BTC за раз
+BTC_MIN_KEEP_USD = 3000.0           # «неснижаемый остаток» по BTC в USD
 
-INTERVAL = "1"
+INTERVAL = "1"  # 1m
 STATE_FILE = "state.json"
 LOOP_SLEEP = 60
 DAILY_REPORT_HOUR = 22
@@ -89,24 +105,36 @@ TRAIL_PNL_GAP = 0.6
 REVERSAL_EXIT = True
 REVERSAL_EXIT_MIN_USD = 1.50
 
+# ============ Читаемые логи (возврат к старому стилю) ============
+# И в файл, и в консоль. Никакого JSON-формата — на Railway снова читаемо.
+LOG_FORMAT = "%(asctime)s | %(levelname)s | %(message)s"
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(message)s",
-    handlers=[logging.FileHandler("bot.log", encoding="utf-8"), logging.StreamHandler()]
+    format=LOG_FORMAT,
+    handlers=[
+        logging.FileHandler("bot.log", encoding="utf-8"),
+        logging.StreamHandler()
+    ]
 )
 
+# ============ Telegram ============
 def send_tg(msg: str):
     if not TG_TOKEN or not CHAT_ID:
         return
     try:
-        requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage", data={"chat_id": CHAT_ID, "text": msg})
+        requests.post(
+            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+            data={"chat_id": CHAT_ID, "text": msg})
     except Exception as e:
         logging.error(f"TG send failed: {e}")
 
 def tg_event(msg: str):
     send_tg(msg)
 
+# ============ API session ============
 session = HTTP(api_key=API_KEY, api_secret=API_SECRET, recv_window=15000)
+
+# ============ State ============
 STATE = {}
 LIMITS = {}
 LAST_REPORT_DATE = None
@@ -114,10 +142,12 @@ _last_err_ts = 0.0
 _wallet_cache = {"ts": 0.0, "coins": None}
 
 def _state_key(): return "bybit_spot_state_v3"
+
 def _save_state():
     s = json.dumps(STATE, ensure_ascii=False)
     try:
-        if rds: rds.set(_state_key(), s)
+        if rds:
+            rds.set(_state_key(), s)
     except Exception:
         pass
     try:
@@ -156,13 +186,13 @@ def init_state():
             "avg_count": 0,
             "last_sell_price": 0.0,
             "max_drawdown": 0.0,
-            # снапшот стоимости для daily_report (прирост value)
-            "snap": {"value": 0.0, "qty": 0.0, "ts": None},
-            # снапшот реализованной прибыли на начало дня
+            "snap": {"value": 0.0, "qty": 0.0, "ts": None},  # для daily report
             "pnl_today_snap": 0.0,
             "pnl_today_date": None,
         })
     _save_state()
+
+# ============ helpers ============
 
 def _safe_call(func, *args, **kwargs):
     delay = REQUEST_BACKOFF
@@ -207,7 +237,7 @@ def load_symbol_limits():
                 "qty_step": float(f.get("qtyStep", 1.0)),
                 "min_amt": float(item.get("minOrderAmt", 10.0))
             }
-    logging.info(f"Loaded limits: {LIMITS}")
+    logging.info(f"Загружены лимиты: {LIMITS}")
 
 def round_step(qty: float, step: float) -> float:
     try:
@@ -222,12 +252,12 @@ def get_kline(sym):
     df[["o","h","l","c","vol"]] = df[["o","h","l","c","vol"]].astype(float)
     return df
 
-def signal(df):
+def signal(df: pd.DataFrame):
     if df.empty or len(df) < 50:
         return "none", 0.0, ""
-    df["ema9"] = EMAIndicator(df["c"], 9).ema_indicator()
+    df["ema9"]  = EMAIndicator(df["c"], 9).ema_indicator()
     df["ema21"] = EMAIndicator(df["c"], 21).ema_indicator()
-    df["rsi"] = RSIIndicator(df["c"], 9).rsi()
+    df["rsi"]   = RSIIndicator(df["c"], 9).rsi()
     atr = AverageTrueRange(df["h"], df["l"], df["c"], 14).average_true_range().iloc[-1]
     macd = MACD(close=df["c"])
     df["macd"], df["sig"] = macd.macd(), macd.macd_signal()
@@ -249,7 +279,6 @@ def is_bearish_reversal(df: pd.DataFrame) -> bool:
     """
     if df is None or len(df) < 30:
         return False
-    # гарантируем нужные столбцы
     need_cols = {"ema9","ema21","macd","sig","rsi"}
     if not need_cols.issubset(set(df.columns)):
         df = df.copy()
@@ -269,26 +298,26 @@ def is_bearish_reversal(df: pd.DataFrame) -> bool:
     score = int(ema_cross_dn) + int(macd_cross_dn) + int(rsi_drop)
     return score >= 2
 
-def volume_ok(df):
+def volume_ok(df: pd.DataFrame):
     if not USE_VOLUME_FILTER:
-        return True
+        return True, "vol=off"
     if len(df) < max(VOL_MA_WINDOW, 20):
-        return True
+        return True, "vol=warmup"
     vol_ma = df["vol"].rolling(VOL_MA_WINDOW).mean().iloc[-2]
     last_vol = df["vol"].iloc[-1]
     last_close = df["c"].iloc[-1]
     notional = last_vol * last_close
     if vol_ma is None or pd.isna(vol_ma):
-        return True
+        return True, "vol=ma_na"
     if last_vol < VOL_FACTOR_MIN * vol_ma:
-        logging.info(f"⏸ Volume guard: last_vol<{VOL_FACTOR_MIN:.2f}*MA")
-        return False
+        logging.info(f"⏸ Volume guard: last_vol<{VOL_FACTOR_MIN:.2f}*MA (last={last_vol:.4f}, ma={vol_ma:.4f})")
+        return False, f"vol_guard: last<{VOL_FACTOR_MIN:.2f}*MA"
     if notional < MIN_CANDLE_NOTIONAL:
         logging.info(f"⏸ Volume guard: notional {notional:.2f} < ${MIN_CANDLE_NOTIONAL:.2f}")
-        return False
-    return True
+        return False, f"vol_guard: notion<{MIN_CANDLE_NOTIONAL}"
+    return True, "vol=ok"
 
-def orderbook_ok(sym: str, side: str, qty_base: float, ref_price: float) -> (bool, str):
+def orderbook_ok(sym: str, side: str, qty_base: float, ref_price: float):
     if not USE_ORDERBOOK_GUARD:
         return True, "ob=off"
     try:
@@ -302,8 +331,7 @@ def orderbook_ok(sym: str, side: str, qty_base: float, ref_price: float) -> (boo
             for px, q in ob["a"]:
                 px = float(px); q = float(q)
                 take = min(need, q); cost += take * px; need -= take
-                if need <= 1e-15:
-                    break
+                if need <= 1e-15: break
             if need > 0:
                 return False, "ob=depth shallow"
             vwap = cost/qty_base
@@ -328,16 +356,19 @@ def budget_qty(sym: str, price: float, avail_usdt: float) -> float:
         return 0.0
     return q
 
-def can_place_buy(sym: str, q: float, price: float, usdt_free: float) -> bool:
+def can_place_buy(sym: str, q: float, price: float, usdt_free: float) -> (bool, str):
     if q <= 0:
-        return False
+        return False, "q<=0"
     lm = LIMITS[sym]
     if q < lm["min_qty"] or q * price < lm["min_amt"]:
-        return False
+        return False, f"below_limits(min_qty={lm['min_qty']}, min_amt={lm['min_amt']})"
     need = q * price * (1 + TAKER_FEE + SLIP_BUFFER)
-    return need <= max(0.0, usdt_free - RESERVE_BALANCE + 1e-9)
+    ok = need <= max(0.0, usdt_free - RESERVE_BALANCE + 1e-9)
+    if not ok:
+        return False, f"need {need:.2f} > free {max(0.0, usdt_free-RESERVE_BALANCE):.2f}"
+    return True, f"ok need={need:.2f}"
 
-def can_place_sell(sym: str, q_net: float, price: float, coin_bal_now: float) -> bool:
+def can_place_sell(sym: str, q_net: float, price: float, coin_bal_now: float):
     if q_net <= 0:
         return False
     lm = LIMITS[sym]
@@ -368,6 +399,7 @@ def append_or_update_position(sym, price, qty_gross, tp):
     _save_state()
 
 def net_pnl(price, buy_price, qty_net, buy_qty_gross) -> float:
+    # Выручка по продаже минус полная стоимость покупки (с комиссиями уже учтёнными в qty_net/buy_qty_gross)
     cost = buy_price * buy_qty_gross
     proceeds = price * qty_net * (1 - TAKER_FEE)
     return proceeds - cost
@@ -376,7 +408,7 @@ def min_net_required(price, qty_net) -> float:
     pct_req = price * qty_net * MIN_PROFIT_PCT
     return max(MIN_NET_ABS_USD, MIN_NET_PROFIT, MIN_ABS_PNL, pct_req)
 
-# ====== ОБНОВЛЁННЫЙ DAILY REPORT С ПРИРОСТОМ И «СЕГОДНЯ ЗАРАБОТАНО» ======
+# ====== DAILY REPORT с приростом и "Сегодня заработано" ======
 def daily_report():
     try:
         coins = get_wallet(True)
@@ -395,7 +427,7 @@ def daily_report():
 
             s = STATE[sym]
 
-            # переключение дневного снапшота реализованной прибыли
+            # Снапшот реализованной прибыли на начало дня
             if s.get("pnl_today_date") != today_str:
                 s["pnl_today_snap"] = float(s.get("pnl", 0.0))
                 s["pnl_today_date"] = today_str
@@ -403,7 +435,7 @@ def daily_report():
             pnl_today = float(s.get("pnl", 0.0)) - float(s.get("pnl_today_snap", 0.0))
             total_today += pnl_today
 
-            # нереализованный по текущей суммарной позиции
+            # Нереализованный PnL по текущей позиции
             if s["positions"]:
                 p = s["positions"][0]
                 q_n = float(p.get("qty", 0.0))
@@ -419,7 +451,7 @@ def daily_report():
                 unreal_usd = 0.0
                 unreal_pct = 0.0
 
-            # прирост стоимости с прошлого снапшота баланса
+            # Прирост стоимости с прошлого снапшота
             snap = s.get("snap", {}) or {}
             prev_value = float(snap.get("value", 0.0))
             growth_abs = cur_value - prev_value
@@ -432,7 +464,7 @@ def daily_report():
                 f"realized_total={s['pnl']:.2f}, realized_today={pnl_today:+.2f}"
             )
 
-            # обновляем снапшот балансовой стоимости
+            # Обновляем снапшот баланса
             s["snap"] = {"value": cur_value, "qty": bal_qty, "ts": today_str}
 
         lines.insert(1, f"🧾 Сегодня заработано: {total_today:+.2f} USDT")
@@ -441,7 +473,20 @@ def daily_report():
         tg_event("\n".join(lines))
     except Exception as e:
         logging.info(f"daily_report error: {e}")
-# ====== /ОБНОВЛЁННЫЙ DAILY REPORT ======
+# ====== /DAILY REPORT ======
+
+# ====== Восстановление позиций ======
+def _env_restore_pair(sym: str):
+    # Позволяет восстановить позицию по цене покупки из .env
+    # Переменные: RESTORE_<SYMBOL>_QTY, RESTORE_<SYMBOL>_PRICE
+    q = os.getenv(f"RESTORE_{sym}_QTY")
+    p = os.getenv(f"RESTORE_{sym}_PRICE")
+    if q and p:
+        try:
+            return float(q), float(p)
+        except:
+            return None
+    return None
 
 def restore_positions():
     restored = []
@@ -450,22 +495,42 @@ def restore_positions():
             df = get_kline(sym)
             if df.empty:
                 continue
-            price = df["c"].iloc[-1]
+            price_now = df["c"].iloc[-1]
             coins = get_wallet(True)
             bal = coin_balance(coins, sym)
             lm = LIMITS.get(sym, {})
-            if price and bal * price >= lm.get("min_amt", 0.0) and bal >= lm.get("min_qty", 0.0):
-                q_net = round_step(bal, lm["qty_step"])
+            # если в .env задана пара qty/price — используем её
+            env_pair = _env_restore_pair(sym)
+            if env_pair:
+                qty_from_env, price_from_env = env_pair
+                if qty_from_env > 0 and price_from_env > 0:
+                    q_net = round_step(qty_from_env, lm.get("qty_step", 1.0))
+                    if q_net >= lm.get("min_qty", 0.0) and q_net * price_from_env >= lm.get("min_amt", 0.0):
+                        atr = AverageTrueRange(df["h"], df["l"], df["c"], 14).average_true_range().iloc[-1]
+                        tp = price_now + TRAIL_MULTIPLIER * atr
+                        STATE[sym]["positions"] = [{
+                            "buy_price": price_from_env,
+                            "qty": q_net,
+                            "buy_qty_gross": q_net / (1 - TAKER_FEE),
+                            "tp": tp,
+                            "max_pnl": 0.0
+                        }]
+                        restored.append(f"{sym}: qty={q_net:.8f} @ {price_from_env:.6f} (env)")
+                        continue  # к следующему симу
+
+            # иначе — по фактическому балансу
+            if price_now and bal * price_now >= lm.get("min_amt", 0.0) and bal >= lm.get("min_qty", 0.0):
+                q_net = round_step(bal, lm.get("qty_step", 1.0))
                 atr = AverageTrueRange(df["h"], df["l"], df["c"], 14).average_true_range().iloc[-1]
-                tp = price + TRAIL_MULTIPLIER * atr
+                tp = price_now + TRAIL_MULTIPLIER * atr
                 STATE[sym]["positions"] = [{
-                    "buy_price": price,
+                    "buy_price": price_now,
                     "qty": q_net,
                     "buy_qty_gross": q_net / (1 - TAKER_FEE),
                     "tp": tp,
                     "max_pnl": 0.0
                 }]
-                restored.append(f"{sym}: qty={q_net:.8f} @ {price:.6f}")
+                restored.append(f"{sym}: qty={q_net:.8f} @ {price_now:.6f}")
         except Exception as e:
             logging.info(f"[{sym}] restore error: {e}")
     _save_state()
@@ -474,6 +539,7 @@ def restore_positions():
     else:
         tg_event("ℹ️ Позиции не найдены для восстановления.")
 
+# ====== Ордеры ======
 def _attempt_buy(sym: str, qty_base: float) -> bool:
     lm = LIMITS[sym]
     qty = round_step(qty_base, lm["qty_step"])
@@ -496,8 +562,7 @@ def _attempt_buy(sym: str, qty_base: float) -> bool:
                 time.sleep(0.3)
                 continue
             if "x-bapi-limit-reset-timestamp" in msg:
-                time.sleep(0.8)
-                continue
+                time.sleep(0.8); continue
             raise
     return False
 
@@ -522,6 +587,7 @@ def cap_btc_sell_qty(sym: str, q_net: float, price: float, coin_bal_now: float) 
         allowed = min(q_net, cap_by_fraction)
     return max(0.0, allowed)
 
+# ====== Временное высвобождение ликвидности ======
 def try_liquidity_recovery(coins, usdt):
     if not LIQUIDITY_RECOVERY:
         return
@@ -568,8 +634,7 @@ def try_liquidity_recovery(coins, usdt):
             newpos = []
             for p in STATE[sym]["positions"]:
                 if rest <= 0:
-                    newpos.append(p)
-                    continue
+                    newpos.append(p); continue
                 take = min(p["qty"], rest)
                 ratio = take / max(p["qty"], 1e-12)
                 p["qty"] -= take
@@ -585,6 +650,7 @@ def try_liquidity_recovery(coins, usdt):
         except Exception as e:
             logging.info(f"[{sym}] recovery sell failed: {e}")
 
+# ====== Основной цикл ======
 def trade_cycle():
     global LAST_REPORT_DATE, _last_err_ts
     try:
@@ -614,7 +680,7 @@ def trade_cycle():
 
             sig, atr, info = signal(df)
             price = df["c"].iloc[-1]
-            tp_new = price + TRAIL_MULTIPLIER * atr  # TP для новых/усреднённых входов (фикс баг c unbound 'tp')
+            tp_new = price + TRAIL_MULTIPLIER * atr
             state = STATE[sym]
             lm = LIMITS[sym]
             coin_bal = coin_balance(coins, sym)
@@ -646,14 +712,14 @@ def trade_cycle():
 
                 if sell_cap_q < lm["min_qty"] or sell_cap_q * price < lm["min_amt"]:
                     new_pos.append(p)
-                    logging.info(f"[{sym}] 🔸Hold: ниже лимитов/кап-по BTC")
+                    logging.info(f"[{sym}] 🔸Hold: ниже лимитов/кап-по BTC (sell_cap={sell_cap_q:.8f}, min_qty={lm['min_qty']}, min_amt={lm['min_amt']})")
                     continue
 
                 pnl = net_pnl(price, b, sell_cap_q, q_g * (sell_cap_q / max(q_n, 1e-12)))
                 need = min_net_required(price, sell_cap_q)
                 ok_to_sell = pnl >= need
 
-                # Быстрый выход по развороту рынка (минимум чистой прибыли)
+                # Быстрый выход по развороту
                 if REVERSAL_EXIT and pnl >= REVERSAL_EXIT_MIN_USD and is_bearish_reversal(df):
                     _attempt_sell(sym, sell_cap_q)
                     msg = (f"✅ REVERSAL SELL {sym} @ {price:.6f}, "
@@ -669,7 +735,7 @@ def trade_cycle():
                     coins = get_wallet(True); coin_bal = coin_balance(coins, sym)
                     continue
 
-                # Stop Loss (только если уже набран нужный минимум прибыли по политике ok_to_sell)
+                # Stop Loss (только если ok_to_sell уже достигнут)
                 if price <= b * (1 - STOP_LOSS_PCT) and ok_to_sell:
                     _attempt_sell(sym, sell_cap_q)
                     msg = f"🟠 SL SELL {sym} @ {price:.6f}, qty={sell_cap_q:.8f}, netPnL={pnl:.2f}"
@@ -703,7 +769,7 @@ def trade_cycle():
                 # Profit sell
                 if ok_to_sell:
                     _attempt_sell(sym, sell_cap_q)
-                    msg = f"✅ PROFIT SELL {sym} @ {price:.6f}, qty={sell_cap_q:.8f}, netPnL={pnl:.2f}"
+                    msg = f"✅ PROFIT SELL {sym} @ {price:.6f}, qty={sell_cap_q:.8f}, netPnL={pnl:.2f} (need≥{need:.2f})"
                     logging.info(msg); tg_event(msg)
                     state["pnl"] += pnl; state["last_sell_price"] = price; state["avg_count"] = 0
                     left = q_n - sell_cap_q
@@ -725,7 +791,8 @@ def trade_cycle():
             state["positions"] = new_pos
 
             # BUY / AVERAGING with state comparison
-            if sig == "buy" and volume_ok(df):
+            vol_ok, vol_info = volume_ok(df)
+            if sig == "buy" and vol_ok:
                 if state["positions"] and state["avg_count"] < (MAX_AVERAGES - 1):
                     total_q = sum(x["qty"] for x in state["positions"])
                     avg_price = sum(x["qty"] * x["buy_price"] for x in state["positions"]) / max(total_q, 1e-12)
@@ -733,7 +800,8 @@ def trade_cycle():
                     if dd < 0 and abs(dd) <= MAX_DRAWDOWN:
                         q_gross = budget_qty(sym, price, avail)
                         ob_ok, ob_info = orderbook_ok(sym, "buy", q_gross, price)
-                        if q_gross > 0 and ob_ok and can_place_buy(sym, q_gross, price, usdt):
+                        can_buy, why_buy = can_place_buy(sym, q_gross, price, usdt)
+                        if q_gross > 0 and ob_ok and can_buy:
                             before = json.dumps(state["positions"], indent=2, ensure_ascii=False)
                             if _attempt_buy(sym, q_gross):
                                 append_or_update_position(sym, price, q_gross, tp_new)
@@ -741,35 +809,46 @@ def trade_cycle():
                                 state["count"] += 1
                                 state["avg_count"] += 1
                                 qty_net = q_gross * (1 - TAKER_FEE)
-                                msg = f"🟢 BUY(avg) {sym} @ {price:.6f}, qty_net={qty_net:.8f} | dd={dd:.4f}, {ob_info}"
+                                msg = f"🟢 BUY(avg) {sym} @ {price:.6f}, qty_net={qty_net:.8f} | dd={dd:.4f}, {ob_info}, {vol_info}"
                                 logging.info(msg); tg_event(msg)
                                 tg_event(f"📊 AVG {sym} POSITION UPDATE\nДо:\n{before}\nПосле:\n{after}")
                                 coins = get_wallet(True); usdt = usdt_balance(coins); avail = max(0.0, usdt - RESERVE_BALANCE)
                         else:
-                            logging.info(f"[{sym}] ❌ Skip avg: бюджет/лимиты/OB/баланс")
+                            logging.info(f"[{sym}] ❌ Skip avg: budget/limits/OB/balance — "
+                                         f"q_gross={q_gross:.8f}, {ob_info}, can_buy={can_buy}({why_buy}), "
+                                         f"free={usdt:.2f}, avail={avail:.2f}, {vol_info}")
                     else:
                         logging.info(f"[{sym}] 🔸Skip avg: dd={dd:.4f} вне (-{MAX_DRAWDOWN:.2f})")
                 elif not state["positions"]:
                     if state["last_sell_price"] and abs(price - state["last_sell_price"]) / price < 0.003:
-                        logging.info(f"[{sym}] 🔸Skip buy: слишком близко к последней продаже")
+                        logging.info(f"[{sym}] 🔸Skip buy: слишком близко к последней продаже "
+                                     f"(price={price:.6f}, last_sell={state['last_sell_price']:.6f})")
                     else:
                         q_gross = budget_qty(sym, price, avail)
                         ob_ok, ob_info = orderbook_ok(sym, "buy", q_gross, price)
-                        if q_gross > 0 and ob_ok and can_place_buy(sym, q_gross, price, usdt):
+                        can_buy, why_buy = can_place_buy(sym, q_gross, price, usdt)
+                        if q_gross > 0 and ob_ok and can_buy:
                             before = json.dumps(state["positions"], indent=2, ensure_ascii=False)
                             if _attempt_buy(sym, q_gross):
                                 append_or_update_position(sym, price, q_gross, tp_new)
                                 after = json.dumps(state["positions"], indent=2, ensure_ascii=False)
                                 state["count"] += 1
                                 qty_net = q_gross * (1 - TAKER_FEE)
-                                msg = f"🟢 BUY {sym} @ {price:.6f}, qty_net={qty_net:.8f} | {ob_info}"
+                                msg = f"🟢 BUY {sym} @ {price:.6f}, qty_net={qty_net:.8f} | {ob_info}, {vol_info}"
                                 logging.info(msg); tg_event(msg)
                                 tg_event(f"📊 NEW {sym} POSITION\nДо:\n{before}\nПосле:\n{after}")
                                 coins = get_wallet(True); usdt = usdt_balance(coins); avail = max(0.0, usdt - RESERVE_BALANCE)
                         else:
-                            logging.info(f"[{sym}] ❌ Skip buy: бюджет/лимиты/OB/баланс")
+                            logging.info(f"[{sym}] ❌ Skip buy: бюджет/лимиты/OB/баланс — "
+                                         f"q_gross={q_gross:.8f}, {ob_info}, can_buy={can_buy}({why_buy}), "
+                                         f"free={usdt:.2f}, avail={avail:.2f}, {vol_info}")
                 else:
-                    logging.info(f"[{sym}] 🔸No buy: sig={sig}")
+                    logging.info(f"[{sym}] 🔸No buy: sig={sig} ({vol_info})")
+            else:
+                if sig == "buy" and not vol_ok:
+                    logging.info(f"[{sym}] ⏸ Volume guard блокирует покупку: {vol_info}")
+                else:
+                    logging.info(f"[{sym}] 🔸No action: sig={sig}, {vol_info}")
 
         except Exception as e:
             tb = traceback.format_exc(limit=2)
@@ -786,6 +865,7 @@ def trade_cycle():
         daily_report()
         globals()['LAST_REPORT_DATE'] = now.date()
 
+# ====== Main ======
 if __name__ == "__main__":
     logging.info("🚀 Bot starting with NetPnL-trailing + Unified Averaging + State Comparison")
     tg_event("🚀 Bot starting with NetPnL-trailing + Unified Averaging + State Comparison")
