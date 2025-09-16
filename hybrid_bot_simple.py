@@ -640,7 +640,6 @@ def try_liquidity_recovery(coins, usdt):
             usdt = usdt_balance(coins)
         except Exception as e:
             logging.info(f"[{sym}] recovery sell failed: {e}")
-
 # ====== Основной цикл ======
 def trade_cycle():
     global LAST_REPORT_DATE, _last_err_ts
