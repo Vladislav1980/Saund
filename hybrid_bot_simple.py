@@ -1,13 +1,14 @@
 # -*- coding: utf-8 -*-
 """
 Bybit Spot Bot — v3 + NetPnL-трейлинг + USD-усреднение + REVERSAL SELL
-Оригинальный функционал сохранён. Добавлено:
-- фиксация net-прибыли ≥ $1.50 (после комиссий) НЕ мгновенно: запускаем трейлинг,
-  выходим по просадке от пика ≥ $0.60 либо по REVERSAL SELL;
-- усреднение только при ощутимой просадке в $ (или %) и только ниже цены последней продажи;
-- первый AVG не раньше $5 просадки (по умолчанию), второй — ещё ниже ($5×2), и т.д.
-
-Все расчёты прибыли уже учитывают TAKER_FEE.
+Правила из ТЗ:
+- Фиксация net-прибыли не мгновенно при достижении $1.5. Сначала включаем трейлинг.
+- Трейлинг активируется только после netPnL ≥ 1.50$ и закрывает по просадке от пика ≥ 0.60$,
+  при этом текущая прибыль на момент выхода должна оставаться ≥ 1.50$.
+- REVERSAL SELL возможен только при netPnL ≥ 1.50$.
+- Повторный вход запрещён выше цены последней продажи (ре-энтри только ≤ last_sell_price).
+- Усреднение: только при ощутимой просадке ($5 первая, $10 вторая и т.д.) и только ниже цены
+  последней продажи. Все расчёты прибыли учитывают TAKER_FEE.
 """
 
 import os
@@ -42,7 +43,7 @@ except Exception:
 # Биржа: BYBIT SPOT, комиссии учтены в TAKER_FEE
 SYMBOLS = ["TONUSDT", "DOGEUSDT", "XRPUSDT", "SOLUSDT", "AVAXUSDT", "ADAUSDT", "BTCUSDT"]
 
-TAKER_FEE = 0.0018  # 0.18% — как в твоём коде
+TAKER_FEE = 0.0018  # 0.18%
 BASE_MAX_TRADE_USDT = 35.0
 MAX_TRADE_OVERRIDES = {
     "TONUSDT": 70.0,
@@ -54,23 +55,23 @@ def max_trade_for(sym: str) -> float:
     return float(MAX_TRADE_OVERRIDES.get(sym, BASE_MAX_TRADE_USDT))
 
 RESERVE_BALANCE = 1.0
-TRAIL_MULTIPLIER = 1.5
+TRAIL_MULTIPLIER = 1.5          # ATR множитель для обновления TP (информативно)
 STOP_LOSS_PCT = 0.03
 
 # ====== PROFIT rules ======
-MIN_PROFIT_PCT = 0.005           # страховочный % минимум
-MIN_NET_PROFIT = 1.50            # основной порог net-прибыли
-MIN_NET_ABS_USD = 1.50           # порог в $ (после комиссий)
-TRAIL_PNL_TRIGGER = 1.5          # старт трейлинга по netPnL
-TRAIL_PNL_GAP = 0.6              # просадка от пика для выхода
+MIN_PROFIT_PCT = 0.005          # страховочный % (не используется для мгновенной фиксации)
+MIN_NET_PROFIT = 1.50           # основной порог net-прибыли ($)
+MIN_NET_ABS_USD = 1.50
+TRAIL_PNL_TRIGGER = 1.5         # старт трейлинга по netPnL (pik/netPnL)
+TRAIL_PNL_GAP = 0.6             # просадка от пика для выхода
 REVERSAL_EXIT = True
 REVERSAL_EXIT_MIN_USD = 1.50
 
-# ====== AVERAGING rules (НОВОЕ) ======
-MAX_AVERAGES = 2                 # максимум усреднений поверх начальной позиции
-AVG_MIN_DRAWDOWN_USD = 5.0       # минимальная просадка в $ на 1 единицу актива (первое усреднение)
-AVG_MIN_DRAWDOWN_PCT = 0.0       # можно 0.03 (=3%). Используется максимум из $ и %
-AVG_REQUIRE_BELOW_LAST_SELL = True  # усреднять только если цена ниже последней продажи
+# ====== AVERAGING rules ======
+MAX_AVERAGES = 2                # максимум усреднений
+AVG_MIN_DRAWDOWN_USD = 5.0      # первая ступень ($5), вторая — $10 и т.д.
+AVG_MIN_DRAWDOWN_PCT = 0.0      # можно задействовать %, если нужен гибрид
+AVG_REQUIRE_BELOW_LAST_SELL = True
 AVG_EPS = 1e-9
 
 # ====== Фильтры ======
@@ -398,7 +399,7 @@ def append_or_update_position(sym, price, qty_gross, tp):
     _save_state()
 
 def net_pnl(price, buy_price, qty_net, buy_qty_gross) -> float:
-    # Выручка по продаже минус полная стоимость покупки (с комиссиями уже учтёнными в qty_net/buy_qty_gross)
+    # Выручка по продаже минус стоимость покупки (комиссии учтены)
     cost = buy_price * buy_qty_gross
     proceeds = price * qty_net * (1 - TAKER_FEE)
     return proceeds - cost
@@ -640,6 +641,7 @@ def try_liquidity_recovery(coins, usdt):
             usdt = usdt_balance(coins)
         except Exception as e:
             logging.info(f"[{sym}] recovery sell failed: {e}")
+
 # ====== Основной цикл ======
 def trade_cycle():
     global LAST_REPORT_DATE, _last_err_ts
@@ -709,7 +711,7 @@ def trade_cycle():
                 need = min_net_required(price, sell_cap_q)
                 ok_to_sell = pnl >= need
 
-                # Быстрый выход по развороту (только если уже ≥ $1.5)
+                # Быстрый выход по развороту (ТОЛЬКО если уже ≥ $1.5)
                 if REVERSAL_EXIT and pnl >= REVERSAL_EXIT_MIN_USD and is_bearish_reversal(df):
                     _attempt_sell(sym, sell_cap_q)
                     msg = (f"✅ REVERSAL SELL {sym} @ {price:.6f}, "
@@ -740,9 +742,10 @@ def trade_cycle():
                     coins = get_wallet(True); coin_bal = coin_balance(coins, sym)
                     continue
 
-                # NetPnL trailing: копим пик, продаём ТОЛЬКО при падении от пика ≥ $0.6
+                # NetPnL trailing — пик только после достижения $1.5, выход при падении ≥ $0.6 и при текущем pnl ≥ $1.5
                 p["max_pnl"] = max(p.get("max_pnl", 0.0), pnl)
-                if p["max_pnl"] >= TRAIL_PNL_TRIGGER and (p["max_pnl"] - pnl) >= TRAIL_PNL_GAP:
+                # >>> СТРОГОЕ УСЛОВИЕ ТРЕЙЛИНГА (исправлено):
+                if (p["max_pnl"] >= TRAIL_PNL_TRIGGER) and (pnl >= MIN_NET_PROFIT) and ((p["max_pnl"] - pnl) >= TRAIL_PNL_GAP):
                     _attempt_sell(sym, sell_cap_q)
                     msg = f"✅ TRAIL SELL {sym} @ {price:.6f}, qty={sell_cap_q:.8f}, netPnL={pnl:.2f}, peak={p['max_pnl']:.2f}"
                     logging.info(msg); tg_event(msg)
@@ -756,9 +759,8 @@ def trade_cycle():
                     coins = get_wallet(True); coin_bal = coin_balance(coins, sym)
                     continue
 
-                # ВАЖНО: НЕ продаём просто потому что pnl ≥ need — ждём трейлинг/разворот
+                # НЕ продаём просто потому, что pnl ≥ need — ждём трейлинг/разворот
                 if ok_to_sell:
-                    # фиксация пика и обновление TP, но без продажи
                     new_tp = max(tp, price + TRAIL_MULTIPLIER * atr)
                     if new_tp != tp:
                         logging.info(f"[{sym}] 📈 Trail TP: {tp:.6f} → {new_tp:.6f}")
@@ -774,11 +776,10 @@ def trade_cycle():
 
             state["positions"] = new_pos
 
-            # BUY / AVERAGING (НОВОЕ: по $-просадке и ниже последней продажи)
+            # BUY / AVERAGING
             vol_ok, vol_info = volume_ok(df)
 
             def avg_trigger_usd(avg_price: float) -> float:
-                # требуемая просадка для текущего номера усреднения
                 step_usd = AVG_MIN_DRAWDOWN_USD if AVG_MIN_DRAWDOWN_USD > 0 else 0.0
                 step_pct_usd = (avg_price * AVG_MIN_DRAWDOWN_PCT) if AVG_MIN_DRAWDOWN_PCT > 0 else 0.0
                 base = max(step_usd, step_pct_usd)
@@ -788,7 +789,7 @@ def trade_cycle():
                 if state["positions"] and state["avg_count"] < MAX_AVERAGES:
                     total_q = sum(x["qty"] for x in state["positions"])
                     avg_price = sum(x["qty"] * x["buy_price"] for x in state["positions"]) / max(total_q, 1e-12)
-                    dd_usd = max(0.0, avg_price - price)  # просадка в $ на 1 ед.
+                    dd_usd = max(0.0, avg_price - price)  # просадка $ на 1 ед.
                     need_dd = avg_trigger_usd(avg_price)
 
                     below_last_sell = True
@@ -824,8 +825,9 @@ def trade_cycle():
                         if not below_last_sell: reason.append("price>=last_sell")
                         logging.info(f"[{sym}] 🔸Skip avg: {', '.join(reason)} | avg={avg_price:.6f}, price={price:.6f}, dd_usd={dd_usd:.2f}")
                 elif not state["positions"]:
-                    if state["last_sell_price"] and abs(price - state["last_sell_price"]) / price < 0.003:
-                        logging.info(f"[{sym}] 🔸Skip buy: слишком близко к последней продаже "
+                    # >>> ЖЁСТКИЙ ЗАПРЕТ НА РЕ-ЭНТРИ ВЫШЕ ПОСЛЕДНЕЙ ПРОДАЖИ (исправлено):
+                    if state["last_sell_price"] and price > state["last_sell_price"] - AVG_EPS:
+                        logging.info(f"[{sym}] ❌ Skip buy: цена выше последней продажи "
                                      f"(price={price:.6f}, last_sell={state['last_sell_price']:.6f})")
                     else:
                         q_gross = budget_qty(sym, price, avail)
