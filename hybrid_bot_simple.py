@@ -224,7 +224,8 @@ def usdt_balance(coins):
 def coin_balance(coins, sym):
     base = sym.replace("USDT", "")
     return float(next((c["walletBalance"] for c in coins if c["coin"] == base), 0.0))
- def load_symbol_limits():
+
+def load_symbol_limits():
     data = session.get_instruments_info(category="spot")["result"]["list"]
     for item in data:
         if item["symbol"] in SYMBOLS:
