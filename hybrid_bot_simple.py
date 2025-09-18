@@ -11,6 +11,9 @@ Bybit Spot Bot — v3 + NetPnL-трейлинг + USD-усреднение + REV
   последней продажи. Все расчёты прибыли учитывают TAKER_FEE.
 - Доп. условие: ре-энтри (и усреднение при активной позиции при включённом AVG_REQUIRE_BELOW_LAST_SELL)
   разрешены только если текущая цена ≤ last_sell_price * (1 - 0.03) — минимум на 3% ниже последней продажи.
+- Мягкий трейлинг прибыли (дополнительно к правилам выше): после достижения netPnL ≥ 1.50$,
+  фиксируем прибыль при снижении цены от локального пика на ≥ 1.5% (SOFT_TRAIL_DROP_PCT),
+  при этом текущая net-прибыль остаётся ≥ 1.50$.
 """
 
 import os
@@ -75,7 +78,11 @@ AVG_MIN_DRAWDOWN_USD = 5.0      # первая ступень ($5), вторая
 AVG_MIN_DRAWDOWN_PCT = 0.0      # можно задействовать %, если нужен гибрид
 AVG_REQUIRE_BELOW_LAST_SELL = True
 AVG_EPS = 1e-9
-REENTRY_DISCOUNT_PCT = 0.03     # <<< ДОБАВЛЕНО: ре-энтри/усреднение только если цена <= last_sell_price * (1 - 3%)
+REENTRY_DISCOUNT_PCT = 0.03     # ре-энтри/усреднение только если цена <= last_sell_price * (1 - 3%)
+
+# ====== Soft trailing (добавлено) ======
+SOFT_TRAIL_DROP_PCT = 0.015     # фиксируем прибыль при снижении цены от локального пика на ≥ 1.5%
+SOFT_TRAIL_ENABLE_AFTER_USD = MIN_NET_PROFIT  # мягкий трейлинг активен только если текущий pnl ≥ 1.50$
 
 # ====== Фильтры ======
 SLIP_BUFFER = 0.006
@@ -169,7 +176,7 @@ def _load_state():
             pass
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
-            STATE = json.load(f)
+        STATE = json.load(f)
             return "FILE"
     except Exception:
         STATE = {}
@@ -387,7 +394,8 @@ def append_or_update_position(sym, price, qty_gross, tp):
             "buy_qty_gross": qty_gross,
             "tp": tp,
             "max_pnl": 0.0,
-            "peak": 0.0
+            "peak": 0.0,
+            "peak_price": 0.0  # добавлено поле для мягкого трейлинга по цене
         }]
     else:
         p = state["positions"][0]
@@ -398,6 +406,8 @@ def append_or_update_position(sym, price, qty_gross, tp):
         p["buy_qty_gross"] += qty_gross
         p["tp"] = tp
         p["max_pnl"] = 0.0
+        # при усреднении сбрасывать peak_price не нужно, но можно обновить, если текущая цена выше
+        p["peak_price"] = max(float(p.get("peak_price", 0.0) or 0.0), float(price))
         p["peak"] = 0.0
     _save_state()
 
@@ -449,7 +459,7 @@ def daily_report():
                     unreal_usd = 0.0
                     unreal_pct = 0.0
             else:
-                unreal_usd = 0.0
+                unreal_usд = 0.0
                 unreal_pct = 0.0
 
             snap = s.get("snap", {}) or {}
@@ -509,7 +519,8 @@ def restore_positions():
                             "buy_qty_gross": q_net / (1 - TAKER_FEE),
                             "tp": tp,
                             "max_pnl": 0.0,
-                            "peak": 0.0
+                            "peak": 0.0,
+                            "peak_price": float(price_now)
                         }]
                         restored.append(f"{sym}: qty={q_net:.8f} @ {price_from_env:.6f} (env)")
                         continue
@@ -523,7 +534,8 @@ def restore_positions():
                     "buy_qty_gross": q_net / (1 - TAKER_FEE),
                     "tp": tp,
                     "max_pnl": 0.0,
-                    "peak": 0.0
+                    "peak": 0.0,
+                    "peak_price": float(price_now)
                 }]
                 restored.append(f"{sym}: qty={q_net:.8f} @ {price_now:.6f}")
         except Exception as e:
@@ -691,7 +703,7 @@ def trade_cycle():
                         dd_now = max(0.0, (avg_entry - price) / max(avg_entry, 1e-12))
                         state["max_drawdown"] = max(state.get("max_drawdown", 0.0), dd_now)
 
-            # SELL / TP / SL / NetPnL trailing
+            # SELL / TP / SL / NetPnL trailing / Soft trailing
             new_pos = []
             for p in state["positions"]:
                 b = p["buy_price"]
@@ -713,6 +725,16 @@ def trade_cycle():
                 pnl = net_pnl(price, b, sell_cap_q, q_g * (sell_cap_q / max(q_n, 1e-12)))
                 need = min_net_required(price, sell_cap_q)
                 ok_to_sell = pnl >= need
+
+                # Обновление пиков для трейлингов
+                p["max_pnl"] = max(p.get("max_pnl", 0.0), pnl)
+                # Мягкий пик цены активируем ТОЛЬКО когда pnl уже ≥ порога
+                if pnl >= SOFT_TRAIL_ENABLE_AFTER_USD:
+                    p["peak_price"] = max(float(p.get("peak_price", 0.0) or 0.0), float(price))
+                else:
+                    # до достижения порога не считаем пик
+                    if "peak_price" not in p or p["peak_price"] is None:
+                        p["peak_price"] = 0.0
 
                 # Быстрый выход по развороту (ТОЛЬКО если уже ≥ $1.5)
                 if REVERSAL_EXIT and pnl >= REVERSAL_EXIT_MIN_USD and is_bearish_reversal(df):
@@ -746,8 +768,6 @@ def trade_cycle():
                     continue
 
                 # NetPnL trailing — пик только после достижения $1.5, выход при падении ≥ $0.6 и при текущем pnl ≥ $1.5
-                p["max_pnl"] = max(p.get("max_pnl", 0.0), pnl)
-                # >>> СТРОГОЕ УСЛОВИЕ ТРЕЙЛИНГА (исправлено):
                 if (p["max_pnl"] >= TRAIL_PNL_TRIGGER) and (pnl >= MIN_NET_PROFIT) and ((p["max_pnl"] - pnl) >= TRAIL_PNL_GAP):
                     _attempt_sell(sym, sell_cap_q)
                     msg = f"✅ TRAIL SELL {sym} @ {price:.6f}, qty={sell_cap_q:.8f}, netPnL={pnl:.2f}, peak={p['max_pnl']:.2f}"
@@ -762,14 +782,36 @@ def trade_cycle():
                     coins = get_wallet(True); coin_bal = coin_balance(coins, sym)
                     continue
 
-                # НЕ продаём просто потому, что pnl ≥ need — ждём трейлинг/разворот
+                # Мягкий трейлинг по цене (коррекция от локального пика ≥ SOFT_TRAIL_DROP_PCT) + текущий pnl ≥ 1.50$
+                peak_price = float(p.get("peak_price", 0.0) or 0.0)
+                if peak_price > 0 and pnl >= SOFT_TRAIL_ENABLE_AFTER_USD:
+                    drop_from_peak = (peak_price - price) / max(peak_price, 1e-12)
+                    if drop_from_peak >= SOFT_TRAIL_DROP_PCT:
+                        _attempt_sell(sym, sell_cap_q)
+                        msg = (f"✅ SOFT TRAIL SELL {sym} @ {price:.6f}, "
+                               f"qty={sell_cap_q:.8f}, netPnL={pnl:.2f}, "
+                               f"peak_price={peak_price:.6f}, drop={drop_from_peak*100:.2f}%")
+                        logging.info(msg); tg_event(msg)
+                        state["pnl"] += pnl; state["last_sell_price"] = price; state["avg_count"] = 0
+                        left = q_n - sell_cap_q
+                        if left > 0:
+                            ratio = sell_cap_q / max(q_n, 1e-12)
+                            p["qty"] = left
+                            p["buy_qty_gross"] = max(0.0, p["buy_qty_gross"] * (1.0 - ratio))
+                            # если оставили хвост — обновляем peak_price относительно текущей
+                            p["peak_price"] = float(price)
+                            new_pos.append(p)
+                        coins = get_wallet(True); coin_bal = coin_balance(coins, sym)
+                        continue
+
+                # НЕ продаём просто потому, что pnl ≥ need — ждём трейлинг/разворот/мягкий трейлинг
                 if ok_to_sell:
                     new_tp = max(tp, price + TRAIL_MULTIPLIER * atr)
                     if new_tp != tp:
                         logging.info(f"[{sym}] 📈 Trail TP: {tp:.6f} → {new_tp:.6f}")
                     p["tp"] = new_tp
                     new_pos.append(p)
-                    logging.info(f"[{sym}] 🔸Hold profit: netPnL {pnl:.2f} ≥ {need:.2f}, ждём трейлинг/разворот (peak={p['max_pnl']:.2f})")
+                    logging.info(f"[{sym}] 🔸Hold profit: netPnL {pnl:.2f} ≥ {need:.2f}, ждём трейлинг/разворот (peakPnL={p['max_pnl']:.2f}, peakPrice={p.get('peak_price',0.0)})")
                 else:
                     new_tp = max(tp, price + TRAIL_MULTIPLIER * atr)
                     if new_tp != tp:
@@ -784,24 +826,24 @@ def trade_cycle():
 
             def avg_trigger_usd(avg_price: float) -> float:
                 step_usd = AVG_MIN_DRAWDOWN_USD if AVG_MIN_DRAWDOWN_USD > 0 else 0.0
-                step_pct_usd = (avg_price * AVG_MIN_DRAWDOWN_PCT) if AVG_MIN_DRAWDOWN_PCT > 0 else 0.0
-                base = max(step_usd, step_pct_usd)
+                step_pct_usд = (avg_price * AVG_MIN_DRAWDOWN_PCT) if AVG_MIN_DRAWDOWN_PCT > 0 else 0.0
+                base = max(step_usd, step_pct_usд)
                 return base * (state["avg_count"] + 1)
 
             if sig == "buy" and vol_ok:
                 if state["positions"] and state["avg_count"] < MAX_AVERAGES:
                     total_q = sum(x["qty"] for x in state["positions"])
                     avg_price = sum(x["qty"] * x["buy_price"] for x in state["positions"]) / max(total_q, 1e-12)
-                    dd_usd = max(0.0, avg_price - price)  # просадка $ на 1 ед.
+                    dd_usд = max(0.0, avg_price - price)  # просадка $ на 1 ед.
                     need_dd = avg_trigger_usd(avg_price)
 
                     below_last_sell = True
                     if AVG_REQUIRE_BELOW_LAST_SELL and state.get("last_sell_price", 0.0) > 0:
                         last_sell = state["last_sell_price"]
-                        reentry_cap = last_sell * (1.0 - REENTRY_DISCOUNT_PCT)   # <<< ДОБАВЛЕНО
-                        below_last_sell = (price + AVG_EPS) < reentry_cap       # <<< ИСПОЛЬЗУЕМ 3%
+                        reentry_cap = last_sell * (1.0 - REENTRY_DISCOUNT_PCT)
+                        below_last_sell = (price + AVG_EPS) < reentry_cap
 
-                    if price < avg_price - AVG_EPS and dd_usd >= need_dd and below_last_sell:
+                    if price < avg_price - AVG_EPS and dd_usд >= need_dd and below_last_sell:
                         q_gross = budget_qty(sym, price, avail)
                         ob_ok, ob_info = orderbook_ok(sym, "buy", q_gross, price)
                         can_buy, why_buy = can_place_buy(sym, q_gross, price, usdt)
@@ -814,30 +856,29 @@ def trade_cycle():
                                 state["avg_count"] += 1
                                 qty_net = q_gross * (1 - TAKER_FEE)
                                 msg = (f"🟢 BUY(avg) {sym} @ {price:.6f}, qty_net={qty_net:.8f} | "
-                                       f"dd_usd={dd_usd:.2f} (need≥{need_dd:.2f}), "
+                                       f"dd_usd={dd_usд:.2f} (need≥{need_dd:.2f}), "
                                        f"{ob_info}, {vol_info}")
                                 logging.info(msg); tg_event(msg)
                                 tg_event(f"📊 AVG {sym} POSITION UPDATE\nДо:\n{before}\nПосле:\n{after}")
                                 coins = get_wallet(True); usdt = usdt_balance(coins); avail = max(0.0, usdt - RESERVE_BALANCE)
                         else:
                             logging.info(f"[{sym}] ❌ Skip avg: budget/limits/OB/balance — "
-                                         f"q_gross={q_gross:.8f}, dd_usd={dd_usd:.2f}(need≥{need_dd:.2f}), "
+                                         f"q_gross={q_gross:.8f}, dd_usd={dd_usд:.2f}(need≥{need_dd:.2f}), "
                                          f"{ob_info}, can_buy={can_buy}({why_buy}), free={usdt:.2f}, avail={avail:.2f}, {vol_info}")
                     else:
                         reason = []
                         if not (price < avg_price - AVG_EPS): reason.append("price>=avg")
-                        if not (dd_usd >= need_dd): reason.append(f"dd_usд<{need_dd:.2f}")
+                        if not (dd_usд >= need_dd): reason.append(f"dd_usд<{need_dd:.2f}")
                         if AVG_REQUIRE_BELOW_LAST_SELL and state.get('last_sell_price', 0.0) > 0 and not below_last_sell:
                             reason.append(f"price>=last_sell*{1-REENTRY_DISCOUNT_PCT:.2f}")
-                        logging.info(f"[{sym}] 🔸Skip avg: {', '.join(reason)} | avg={avg_price:.6f}, price={price:.6f}, dd_usd={dd_usd:.2f}")
+                        logging.info(f"[{sym}] 🔸Skip avg: {', '.join(reason)} | avg={avg_price:.6f}, price={price:.6f}, dd_usд={dd_usд:.2f}")
                 elif not state["positions"]:
-                    # >>> ЖЁСТКИЙ ЗАПРЕТ НА РЕ-ЭНТРИ ВЫШЕ ПОРОГА last_sell_price*(1-3%)
+                    # ЖЁСТКИЙ ЗАПРЕТ НА РЕ-ЭНТРИ ВЫШЕ ПОРОГА last_sell_price*(1-3%)
                     if state["last_sell_price"]:
-                        reentry_cap = state["last_sell_price"] * (1.0 - REENTRY_DISCOUNT_PCT)  # <<< ДОБАВЛЕНО
-                        if price > reentry_cap + AVG_EPS:                                     # <<< ИСПОЛЬЗУЕМ 3%
+                        reentry_cap = state["last_sell_price"] * (1.0 - REENTRY_DISCOUNT_PCT)
+                        if price > reentry_cap + AVG_EPS:
                             logging.info(f"[{sym}] ❌ Skip buy: цена выше порога ре-энтри "
                                          f"(price={price:.6f} > {reentry_cap:.6f} = last_sell*{1-REENTRY_DISCOUNT_PCT:.2f})")
-                            # Жёсткий запрет ре-энтри — идём дальше
                         else:
                             q_gross = budget_qty(sym, price, avail)
                             ob_ok, ob_info = orderbook_ok(sym, "buy", q_gross, price)
@@ -916,6 +957,7 @@ if __name__ == "__main__":
         f"OBGuard={'ON' if USE_ORDERBOOK_GUARD else 'OFF'} (spread≤{MAX_SPREAD_BP/100:.2f}%, impact≤{MAX_IMPACT_BP/100:.2f}%), "
         f"LiqRecovery={'ON' if LIQUIDITY_RECOVERY else 'OFF'} (min={LIQ_RECOVERY_USDT_MIN}, target={LIQ_RECOVERY_USDT_TARGET}), "
         f"NetPnL-Trailing={'ON'} (trigger=${TRAIL_PNL_TRIGGER}, gap=${TRAIL_PNL_GAP}), "
+        f"SoftTrailing={'ON'} (drop≥{SOFT_TRAIL_DROP_PCT*100:.2f}%, afterPnL≥${SOFT_TRAIL_ENABLE_AFTER_USD:.2f}), "
         f"ReversalExit={'ON' if REVERSAL_EXIT else 'OFF'} (min=${REVERSAL_EXIT_MIN_USD})"
     )
     while True:
